@@ -485,6 +485,99 @@ describe('Button Event Handlers', () => {
   })
 })
 
+describe('Hint Clicks', () => {
+  it('should prevent double-triggering on LABEL tags', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    let labelClicked = false
+    const labelHint = sandbox.document.createElement('label')
+    labelHint.className = 'block-hint'
+    labelHint.id = 'forceHint'
+
+    const mockInput = sandbox.document.createElement('input')
+    mockInput.type = 'checkbox'
+    mockInput.click = () => {
+      labelClicked = true
+    }
+    elements['#force'] = mockInput
+
+    const oldQuery = sandbox.document.querySelectorAll
+    sandbox.document.querySelectorAll = (sel) => {
+      if (sel === '.block-hint') return { forEach: (cb) => cb(labelHint) }
+      return oldQuery(sel)
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    labelHint.dispatchEvent('click')
+    assert.strictEqual(labelClicked, false)
+  })
+
+  it('should call click() on checkbox inputs when a span hint is clicked', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    let clicked = false
+    const spanHint = sandbox.document.createElement('span')
+    spanHint.className = 'block-hint'
+    spanHint.id = 'forceHint'
+
+    const mockInput = sandbox.document.createElement('input')
+    mockInput.type = 'checkbox'
+    mockInput.click = () => {
+      clicked = true
+    }
+    elements['#force'] = mockInput
+
+    const oldQuery = sandbox.document.querySelectorAll
+    sandbox.document.querySelectorAll = (sel) => {
+      if (sel === '.block-hint') return { forEach: (cb) => cb(spanHint) }
+      return oldQuery(sel)
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    spanHint.dispatchEvent('click')
+    assert.strictEqual(clicked, true)
+  })
+
+  it('should call focus() on text inputs when a span hint is clicked', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    let focused = false
+    const spanHint = sandbox.document.createElement('span')
+    spanHint.className = 'block-hint'
+    spanHint.id = 'ghOwnerHint'
+
+    const mockInput = sandbox.document.createElement('input')
+    mockInput.type = 'text'
+    mockInput.focus = () => {
+      focused = true
+    }
+    elements['#ghOwner'] = mockInput
+
+    const oldQuery = sandbox.document.querySelectorAll
+    sandbox.document.querySelectorAll = (sel) => {
+      if (sel === '.block-hint') return { forEach: (cb) => cb(spanHint) }
+      return oldQuery(sel)
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    spanHint.dispatchEvent('click')
+    assert.strictEqual(focused, true)
+  })
+
+  it('should do nothing if input is not found', () => {
+    const { sandbox } = setupPopupSandbox()
+    const spanHint = sandbox.document.createElement('span')
+    spanHint.className = 'block-hint'
+    spanHint.id = 'missingHint'
+
+    const oldQuery = sandbox.document.querySelectorAll
+    sandbox.document.querySelectorAll = (sel) => {
+      if (sel === '.block-hint') return { forEach: (cb) => cb(spanHint) }
+      return oldQuery(sel)
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    spanHint.dispatchEvent('click') // Should not throw
+  })
+})
+
 describe('popup.html accessibility', () => {
   const popupHtml = fs.readFileSync(path.join(__dirname, '../popup.html'), 'utf8')
 
