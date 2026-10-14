@@ -160,6 +160,7 @@ function createMockChrome(syncStorage, localStorage, sessionStorage, listeners) 
  */
 function createMockDocument(elements, opModeButtons, radioStates) {
   return {
+    getElementById: (id) => elements[`#${id}`] || null,
     querySelector: (sel) => {
       if (sel === 'input[name="mode"]:checked') return { value: radioStates.mode }
       if (sel === 'input[name="scope"]:checked') return { value: radioStates.scope }
