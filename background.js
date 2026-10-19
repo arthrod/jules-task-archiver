@@ -451,6 +451,7 @@ const TASK = {
   STATE: 5,
   CREATE_TIME: 6,
   UPDATE_TIME: 7,
+  PLAN: 10,
   STATUS_CODE: 25,
   DISPLAY_TITLE: 26
 }
@@ -513,6 +514,7 @@ function parseTask(raw) {
     source,
     state: raw[TASK.STATE],
     statusCode: raw[TASK.STATUS_CODE],
+    planId: raw[TASK.PLAN]?.[0] || null,
     repo: isGithub ? source.slice(7) : source,
     owner,
     repoName
@@ -1210,6 +1212,152 @@ async function processRemoveSuggestionsForTab(tab, options) {
 
   addLog(`\n[${label}] TOTAL: ${totalRemoved} suggestions removed`)
   return totalRemoved
+}
+
+// =============================================================================
+// Continue Waiting Orchestrator
+// =============================================================================
+
+// ListTasks row[5] values for sessions that stopped and need the user. Taken
+// from the Jules web bundle's own state -> label map on 2026-10-19 and
+// cross-checked against row[25] (its second status enum) on 51 live tasks.
+const TASK_STATE = {
+  ERROR: 4,
+  AWAITING_PLAN_APPROVAL: 10,
+  AWAITING_USER_FEEDBACK: 12
+}
+
+// Interact (SLmX6) carries the client's experiment flags; these are the ones
+// the Jules UI sent with its own replies on 2026-10-19.
+const INTERACT_EXPERIMENT_IDS = [
+  98286823, 105606311, 105629939, 105705437, 105631223, 105732819, 105732273, 105732245, 105754330, 105703357,
+  105754824, 105739042, 105762189, 105800437
+]
+
+const DEFAULT_CONTINUE_MESSAGE =
+  'Please continue. Use your best judgment on any open questions and keep going without waiting for me.'
+const DEFAULT_ERROR_CONTINUE_MESSAGE =
+  'Your previous run stopped with an error before the task was finished. Please pick it back up: find the step ' +
+  'that failed and retry it. If it keeps failing, work around it (for example, carry on without a broken optional ' +
+  'dependency or git submodule) and note what you skipped. Then finish the original task.'
+const MAX_CONTINUE_MESSAGE_LEN = 2000
+
+function getWaitingKind(task) {
+  if (task.state === TASK_STATE.AWAITING_USER_FEEDBACK) return 'feedback'
+  if (task.state === TASK_STATE.AWAITING_PLAN_APPROVAL) return 'plan'
+  if (task.state === TASK_STATE.ERROR) return 'error'
+  return null
+}
+
+const CONTINUE_VERBS = {
+  feedback: { dry: 'reply to', done: 'Replied to' },
+  plan: { dry: 'approve plan for', done: 'Approved plan for' },
+  error: { dry: 'retry', done: 'Retried' }
+}
+
+function normalizeContinueMessage(value, fallback = DEFAULT_CONTINUE_MESSAGE) {
+  const message = typeof value === 'string' ? value.trim() : ''
+  return message ? message.slice(0, MAX_CONTINUE_MESSAGE_LEN) : fallback
+}
+
+// GetTask view 3 includes the activity log. The UI threads every reply onto
+// the newest activity, so this does the same.
+async function getLastActivityId(taskId, config) {
+  const result = await callBatchExecute('n74qPd', [taskId, 3], config)
+  const activities = result?.[0]?.[3]
+  if (!Array.isArray(activities) || activities.length === 0) return null
+  return activities[activities.length - 1]?.[0] || null
+}
+
+// [taskId, interaction, null, [experimentIds]] where interaction is
+// [_, [planId] to approve the plan, [text, null, clientMessageId] to reply,
+// lastActivityId]. Captured from the Jules UI and its plan-approval code.
+function buildInteractPayload(task, message, activityId) {
+  const interaction = new Array(4).fill(null)
+  if (getWaitingKind(task) === 'plan') {
+    interaction[1] = [task.planId]
+  } else {
+    interaction[2] = [message, null, crypto.randomUUID().toUpperCase()]
+  }
+  interaction[3] = activityId
+  return [task.id, interaction, null, [INTERACT_EXPERIMENT_IDS]]
+}
+
+// Returns false when the task was skipped. The send is not retried: a 5xx may
+// still have delivered the reply, and a re-run only finds tasks still waiting.
+async function continueTask(label, task, message, config) {
+  if (getWaitingKind(task) === 'plan' && !task.planId) {
+    addLog(`  SKIP [${label}] [${task.id}] ${task.title} (no plan id to approve)`)
+    return false
+  }
+  const activityId = await withRetry(() => getLastActivityId(task.id, config))
+  if (!activityId) {
+    addLog(`  SKIP [${label}] [${task.id}] ${task.title} (no activity to reply to)`)
+    return false
+  }
+  await callBatchExecute('SLmX6', buildInteractPayload(task, message, activityId), config)
+  return true
+}
+
+// Replies to every session awaiting the user's feedback, approves every plan
+// awaiting approval, and asks every failed session to retry.
+async function processContinueForTab(tab, options) {
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  addLog(`[${label}] Fetching tasks via API...`)
+  const tasks = await safeListTasks(label, config)
+  if (!tasks) return 0
+
+  let waiting = tasks.filter((t) => getWaitingKind(t) !== null)
+  if (options.repoFilter) {
+    waiting = waiting.filter((t) => matchesRepoFilter(options.repoFilter, t.source, t.repo))
+  }
+  const counts = { feedback: 0, plan: 0, error: 0 }
+  for (const t of waiting) counts[getWaitingKind(t)]++
+  addLog(
+    `[${label}] ${tasks.length} tasks: ${counts.feedback} awaiting your reply, ${counts.plan} awaiting plan approval, ${counts.error} failed`
+  )
+  if (waiting.length === 0) {
+    addLog(`[${label}] No tasks are waiting on you.`)
+    return 0
+  }
+
+  if (options.dryRun) {
+    for (const t of waiting) {
+      addLog(`  [DRY] Would ${CONTINUE_VERBS[getWaitingKind(t)].dry} [${label}] [${t.id}] ${t.title}`)
+    }
+    return 0
+  }
+
+  const replyMessage = normalizeContinueMessage(options.continueMessage)
+  const retryMessage = normalizeContinueMessage(options.continueErrorMessage, DEFAULT_ERROR_CONTINUE_MESSAGE)
+  state.progress.total += waiting.length
+  updateState({})
+
+  let continued = 0
+  await runInPool(waiting, PER_ACCOUNT_CONCURRENCY, async (task) => {
+    try {
+      const kind = getWaitingKind(task)
+      const message = kind === 'error' ? retryMessage : replyMessage
+      const sent = await globalLimit(() => continueTask(label, task, message, config))
+      if (sent) {
+        continued++
+        state.progress.archived++
+        addLog(`  ${CONTINUE_VERBS[kind].done} [${label}] [${task.id}] ${task.title}`)
+      } else {
+        state.progress.skipped++
+      }
+    } catch (e) {
+      state.progress.skipped++
+      addLog(`  ERROR [${label}] continuing [${task.id}] ${task.title}: ${e.message}`)
+    }
+    updateState({})
+  })
+
+  addLog(`\n[${label}] TOTAL: ${continued} tasks continued`)
+  return continued
 }
 
 // =============================================================================
@@ -1912,7 +2060,8 @@ const OP_MODE_HEADERS = {
   suggestions: '=== SUGGESTIONS MODE ===',
   agent_batch: '=== BATCH AGENT MODE ===',
   remove_suggestions: '=== REMOVE SUGGESTIONS MODE ===',
-  export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ==='
+  export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ===',
+  continue_waiting: '=== CONTINUE WAITING MODE ==='
 }
 
 function initOperationState(options) {
@@ -2001,6 +2150,8 @@ function getTabProcessor(opMode) {
       return processExportSuggestionsForTab
     case 'agent_batch':
       return processBatchAgentForTab
+    case 'continue_waiting':
+      return processContinueForTab
     default:
       return processTab
   }
@@ -2029,7 +2180,8 @@ const OP_MODE_SUMMARY = {
   suggestions: { verb: 'started', itemLabel: 'suggestions' },
   remove_suggestions: { verb: 'removed', itemLabel: 'suggestions' },
   export_suggestions: { verb: 'exported', itemLabel: 'suggestions' },
-  agent_batch: { verb: 'launched', itemLabel: 'master agent sessions' }
+  agent_batch: { verb: 'launched', itemLabel: 'master agent sessions' },
+  continue_waiting: { verb: 'continued', itemLabel: 'tasks' }
 }
 
 // Accepts the run's options (opMode) or the legacy isSuggestions boolean.

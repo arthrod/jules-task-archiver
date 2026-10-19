@@ -20,6 +20,7 @@
           <legend id="opModeLabel">Operation</legend>
           <div class="segmented" id="opMode">
             <button type="button" data-value="archive" class="active" aria-pressed="true">Archive Tasks</button>
+            <button type="button" data-value="continue_waiting" aria-pressed="false">Continue Waiting</button>
             <button type="button" data-value="suggestions" aria-pressed="false">Start (Separate)</button>
             <button type="button" data-value="agent_batch" aria-pressed="false">Batch to 1 Agent</button>
             <button type="button" data-value="remove_suggestions" aria-pressed="false">Remove</button>
@@ -70,6 +71,26 @@
           maxlength="140"
           pattern="[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+"
         />
+      </div>
+      <div id="continueMessageRow" class="setting-row hidden">
+        <label for="continueMessage">Reply</label>
+        <span class="hint block-hint" id="continueMessageHint">Sent to every session awaiting your reply. Plans awaiting approval are approved.</span>
+        <textarea
+          id="continueMessage"
+          rows="3"
+          maxlength="2000"
+          aria-describedby="continueMessageHint"
+          placeholder="Please continue. Use your best judgment on any open questions and keep going without waiting for me."
+        ></textarea>
+        <label for="continueErrorMessage" class="continue-error-label">Reply to failed sessions</label>
+        <span class="hint block-hint" id="continueErrorMessageHint">Sent to every session that stopped with an error. Leave empty for the default retry prompt.</span>
+        <textarea
+          id="continueErrorMessage"
+          rows="3"
+          maxlength="2000"
+          aria-describedby="continueErrorMessageHint"
+          placeholder="Your previous run stopped with an error. Find the step that failed, retry it or work around it, then finish the task."
+        ></textarea>
       </div>
     </section>
 

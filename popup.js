@@ -12,6 +12,8 @@ const $ = (sel) => document.querySelector(sel)
 // (devtools, extension context) and bypasses the input's typing limit.
 const MAX_OWNER_LEN = 39
 const MAX_TOKEN_LEN = 255
+// Matches #continueMessage's maxlength and the background's cap.
+const MAX_CONTINUE_MESSAGE_LEN = 2000
 
 // --- DOM refs ---
 const mainForm = $('#mainForm')
@@ -20,6 +22,9 @@ const ghTokenInput = $('#ghToken')
 const forceCheckbox = $('#force')
 const repoFilterInput = $('#repoFilter')
 const customRepoInput = $('#customRepoInput')
+const continueMessageInput = $('#continueMessage')
+const continueErrorMessageInput = $('#continueErrorMessage')
+const continueMessageRow = $('#continueMessageRow')
 const startBtn = $('#startBtn')
 const resetBtn = $('#resetBtn')
 const downloadBtn = $('#downloadBtn')
@@ -59,6 +64,8 @@ function getRunningText() {
     return '⏳ Exporting Suggestions to JSON...'
   } else if (opMode === 'agent_batch') {
     return isDry ? '⏳ Dry Running Batch Agent...' : '⏳ Launching Single Agent for All Suggestions...'
+  } else if (opMode === 'continue_waiting') {
+    return isDry ? '⏳ Dry Running Continue Waiting...' : '⏳ Continuing Waiting Tasks...'
   } else {
     return isDry ? '⏳ Dry Running Suggestions...' : '⏳ Running Suggestions...'
   }
@@ -73,6 +80,8 @@ function getStartButtonText(value, isDry) {
     return 'Export Suggestions JSON'
   } else if (value === 'agent_batch') {
     return isDry ? 'Dry Run Batch Agent' : 'Launch Batch Agent'
+  } else if (value === 'continue_waiting') {
+    return isDry ? 'Dry Run Continue Waiting' : 'Continue Waiting Tasks'
   } else {
     return isDry ? 'Dry Run Suggestions' : 'Start Suggestions'
   }
@@ -102,6 +111,7 @@ function updateOpModeUI(value) {
   if (forceCheckboxContainer) {
     forceCheckboxContainer.classList.toggle('hidden', !isArchive)
   }
+  continueMessageRow?.classList.toggle('hidden', value !== 'continue_waiting')
 
   // Context-aware start button text
   if (!startBtn.disabled) {
@@ -129,8 +139,22 @@ document.querySelectorAll('input[name="mode"]').forEach((radio) => {
 
 // --- Load saved settings & cleanup insecure storage ---
 chrome.storage.sync.get(
-  ['ghOwner', 'opMode', 'ghToken', 'schedEnabled', 'schedIntervalMin', 'schedStartSuggestions', 'schedMaxStarts'],
+  [
+    'ghOwner',
+    'opMode',
+    'ghToken',
+    'schedEnabled',
+    'schedIntervalMin',
+    'schedStartSuggestions',
+    'schedMaxStarts',
+    'continueMessage',
+    'continueErrorMessage'
+  ],
   (syncData) => {
+    if (typeof syncData.continueMessage === 'string') continueMessageInput.value = syncData.continueMessage
+    if (typeof syncData.continueErrorMessage === 'string') {
+      continueErrorMessageInput.value = syncData.continueErrorMessage
+    }
     schedEnabledInput.checked = syncData.schedEnabled === true
     if (syncData.schedIntervalMin !== undefined) schedIntervalInput.value = String(syncData.schedIntervalMin)
     schedSuggestionsInput.checked = syncData.schedStartSuggestions === true
@@ -160,6 +184,14 @@ ghOwnerInput.addEventListener('change', () => {
 })
 ghTokenInput.addEventListener('change', () => {
   chrome.storage.local.set({ ghToken: ghTokenInput.value.trim().slice(0, MAX_TOKEN_LEN) })
+})
+continueMessageInput.addEventListener('change', () => {
+  chrome.storage.sync.set({ continueMessage: continueMessageInput.value.trim().slice(0, MAX_CONTINUE_MESSAGE_LEN) })
+})
+continueErrorMessageInput.addEventListener('change', () => {
+  chrome.storage.sync.set({
+    continueErrorMessage: continueErrorMessageInput.value.trim().slice(0, MAX_CONTINUE_MESSAGE_LEN)
+  })
 })
 
 // Schedule settings persist on change; background.js's storage.onChanged
@@ -280,7 +312,9 @@ mainForm.addEventListener('submit', async (e) => {
     scope,
     activeTabId,
     opMode,
-    repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim()
+    repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim(),
+    continueMessage: (continueMessageInput.value || '').trim().slice(0, MAX_CONTINUE_MESSAGE_LEN),
+    continueErrorMessage: (continueErrorMessageInput.value || '').trim().slice(0, MAX_CONTINUE_MESSAGE_LEN)
   }
 
   // Reset UI
