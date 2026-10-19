@@ -1,3 +1,4 @@
+// Modified by tommyzed: Added repository filtering and suggestions
 importScripts('utils.js')
 /**
  * Jules Task Archiver v2 — Background Service Worker
@@ -25,6 +26,12 @@ const GLOBAL_CONCURRENCY = 12
 // Tjmm5c (ArchiveTask) accepts an array of task IDs, so archive in batches to cut
 // the request count (was 1 request per task). One batch = one batchexecute call.
 const ARCHIVE_BATCH_SIZE = 50
+// A 50-id batch can be rejected with an RPC error code (seen live: [4],
+// DEADLINE_EXCEEDED, on 2 of 147 batches) while the same ids succeed in
+// smaller chunks, so a rejected batch is retried at this size. Not anchored:
+// callBatchExecute rethrows as "batchexecute Tjmm5c failed: RPC Tjmm5c error code [4]".
+const ARCHIVE_SPLIT_SIZE = 10
+const RPC_ERROR_CODE_REGEX = /\bRPC \w+ error code \[/
 
 // ⚡ Bolt Optimization: After parsing the URL, use a fast regex test to extract
 // the account ID instead of allocating string arrays via `.split('/')`. This avoids
@@ -178,7 +185,11 @@ async function jFetch(url, options = {}) {
     const finalRedirect = token ? 'error' : rest.redirect || 'follow'
     const res = await fetch(url, { headers: safeHeaders, signal: controller.signal, ...rest, redirect: finalRedirect })
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`)
+      // Callers that need the error body (e.g. the XSRF refresh) read it here.
+      const err = new Error(`HTTP ${res.status}`)
+      err.status = res.status
+      err.response = res
+      throw err
     }
     return res
   } catch (e) {
@@ -275,18 +286,58 @@ function buildBatchRequest(rpcId, payload, config) {
   }
 }
 
-async function callBatchExecute(rpcId, payload, config) {
+function postBatchExecute(rpcId, payload, config, timeout) {
   const { url, body } = buildBatchRequest(rpcId, payload, config)
+  return jFetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      'x-same-domain': '1'
+    },
+    credentials: 'include',
+    body,
+    ...(timeout ? { timeout } : {})
+  })
+}
+
+// The XSRF token (WIZ_global_data.SNlM0e) is frozen at page load, while the
+// Jules page silently renews its own. A tab left open for hours therefore
+// hands us an expired `at`, and every batchexecute call answers HTTP 400.
+// Jules puts a replacement in the 400 body as ["xsrf","<token>"]; when it
+// doesn't, a read-only KQOO7 call sent WITHOUT `at` returns one.
+const XSRF_TOKEN_REGEX = /"xsrf","([^"]+)"/
+
+async function readXsrfToken(err) {
   try {
-    const res = await jFetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-        'x-same-domain': '1'
-      },
-      credentials: 'include',
-      body
-    })
+    const text = await err?.response?.text()
+    return XSRF_TOKEN_REGEX.exec(text || '')?.[1] || null
+  } catch {
+    return null
+  }
+}
+
+async function mintXsrfToken(config) {
+  try {
+    await postBatchExecute('KQOO7', [], { ...config, at: '' })
+    return null
+  } catch (e) {
+    return e.status === 400 ? readXsrfToken(e) : null
+  }
+}
+
+async function callBatchExecute(rpcId, payload, config, { timeout } = {}) {
+  try {
+    let res
+    try {
+      res = await postBatchExecute(rpcId, payload, config, timeout)
+    } catch (e) {
+      if (e.status !== 400) throw e
+      const fresh = (await readXsrfToken(e)) || (await mintXsrfToken(config))
+      if (!fresh) throw e
+      // Mutate the run's config so every later call reuses the fresh token.
+      config.at = fresh
+      res = await postBatchExecute(rpcId, payload, config, timeout)
+    }
     return parseResponse(await res.text(), rpcId)
   } catch (e) {
     throw new Error(`batchexecute ${rpcId} failed: ${e.message}`)
@@ -375,6 +426,9 @@ function parseResponse(text, rpcId) {
   for (let i = 0; i < outer.length; i++) {
     const entry = outer[i]
     if (!Array.isArray(entry) || entry[1] !== rpcId) continue
+    if (entry[5] && Array.isArray(entry[5])) {
+      throw new Error(`RPC ${rpcId} error code [${entry[5].join(', ')}]`)
+    }
     if (typeof entry[2] !== 'string') return null
     const innerFixed = fixJsonControlChars(entry[2])
     const inner = JSON.parse(innerFixed)
@@ -487,9 +541,14 @@ function groupTasksByRepo(tasks) {
   return map
 }
 
+// ListTasks returns every task with its full prompt in one response — 121 MB
+// and ~85 s for a 7,355-task account (measured 2026-10-19). The 30 s default
+// would abort it before the headers even arrive.
+const LIST_TASKS_TIMEOUT_MS = 5 * 60 * 1000
+
 async function listTasks(filter, config) {
   const payload = [filter, 4]
-  const result = await callBatchExecute('p1Takd', payload, config)
+  const result = await callBatchExecute('p1Takd', payload, config, { timeout: LIST_TASKS_TIMEOUT_MS })
   if (!result?.[0]) return []
 
   const arr = result[0]
@@ -546,6 +605,24 @@ async function withRetry(fn) {
 
 function archiveTasksWithRetry(taskIds, config) {
   return withRetry(() => archiveTasks(taskIds, config))
+}
+
+// Dismiss a single suggestion via sc1vFf (DismissSuggestion)
+const SC1VFF = {
+  SUGGESTION_ID: 0,
+  ACTION: 1
+}
+const SC1VFF_ACTION_DISMISS = 2
+
+async function dismissSuggestion(suggestionId, config) {
+  const payload = new Array(2).fill(null)
+  payload[SC1VFF.SUGGESTION_ID] = suggestionId
+  payload[SC1VFF.ACTION] = SC1VFF_ACTION_DISMISS
+  await callBatchExecute('sc1vFf', payload, config)
+}
+
+function dismissSuggestionWithRetry(suggestionId, config) {
+  return withRetry(() => dismissSuggestion(suggestionId, config))
 }
 
 // =============================================================================
@@ -661,11 +738,32 @@ async function listSuggestionEnabledSources(config) {
   return sources
 }
 
-async function safeListSources(label, config) {
+// Every connected GitHub source, regardless of the Suggestions toggle. Only for
+// read-only work (export, repo picker) or an explicit user-chosen repo — never
+// for bulk session starts across "all" repos.
+async function listAllSources(config) {
+  const result = await callBatchExecute('YqkSHd', [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
+  if (!result?.[0]) return []
+  const arr = result[0]
+  const sources = []
+  for (let i = 0; i < arr.length; i++) {
+    const row = arr[i]
+    if (typeof row?.[SOURCE.ID] === 'string' && row[SOURCE.ID].startsWith('github/')) {
+      sources.push(row[SOURCE.ID])
+    }
+  }
+  return sources
+}
+
+async function safeListSources(label, config, allowAll = false) {
   try {
-    const repos = await listSuggestionEnabledSources(config)
+    const repos = allowAll ? await listAllSources(config) : await listSuggestionEnabledSources(config)
     if (repos.length === 0) {
-      addLog(`[${label}] No repos have Suggestions enabled. Nothing to do.`)
+      addLog(
+        allowAll
+          ? `[${label}] No connected repos found. Nothing to do.`
+          : `[${label}] No repos have Suggestions enabled. Nothing to do.`
+      )
       return null
     }
     return repos
@@ -684,6 +782,47 @@ async function getDailySessionQuota(config) {
   const result = await callBatchExecute('KQOO7', [], config)
   if (!Array.isArray(result) || typeof result[0] !== 'number' || typeof result[2] !== 'number') return null
   return { used: result[0], limit: result[2], remaining: Math.max(0, result[2] - result[0]) }
+}
+
+// =============================================================================
+// Repository Filter
+// =============================================================================
+
+// The popup sends repoFilter as "owner/repo" (dropdown or typed); '' means all
+// repos. Sources are "github/owner/repo" ids, tasks carry both forms. Matching
+// is exact (case-insensitive): a substring match would let "owner/plate" also
+// archive or dismiss in "owner/plate-docs". A bare name matches the repo segment.
+function normalizeRepoId(value) {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/^github\//, '')
+}
+
+function matchesRepoFilter(repoFilter, ...candidates) {
+  const wanted = normalizeRepoId(repoFilter)
+  const bareName = !wanted.includes('/')
+  for (const c of candidates) {
+    if (!c) continue
+    const repo = normalizeRepoId(c)
+    if (bareName ? repo.slice(repo.lastIndexOf('/') + 1) === wanted : repo === wanted) return true
+  }
+  return false
+}
+
+// Returns the repos matching options.repoFilter, or null (after logging) when
+// nothing matches. No filter -> the input list unchanged.
+function filterReposByRepoFilter(label, repos, repoFilter) {
+  if (!repoFilter) return repos
+  const filtered = repos.filter((r) => matchesRepoFilter(repoFilter, r))
+  addLog(
+    `[${label}] Filtered repos by "${repoFilter}": keeping ${filtered.length} repo(s): ${filtered.map((r) => r.replace(/^github\//, '')).join(', ')}`
+  )
+  if (filtered.length === 0) {
+    addLog(`[${label}] No matching repos found. Nothing to do.`)
+    return null
+  }
+  return filtered
 }
 
 // =============================================================================
@@ -807,7 +946,10 @@ function buildSuggestionMetadata(suggestionId, experimentIds) {
 }
 
 function buildStartPayload(suggestion, repo, config, startConfig) {
-  const prompt = buildSuggestionPrompt(suggestion)
+  return buildRja83dPayload(buildSuggestionPrompt(suggestion), suggestion.id, repo, config, startConfig)
+}
+
+function buildRja83dPayload(prompt, suggestionId, repo, config, startConfig) {
   const modelId = config.modelId || startConfig?.modelConfig?.[1] || null
   const featureFlags = startConfig?.featureFlags || DEFAULT_FEATURE_FLAGS
   const experimentIds = startConfig?.experimentIds || []
@@ -816,7 +958,7 @@ function buildStartPayload(suggestion, repo, config, startConfig) {
   payload[RJA83D.PROMPT] = prompt
   payload[RJA83D.MODEL_CONFIG] = buildModelConfig(modelId, featureFlags)
   payload[RJA83D.REPO] = repo
-  payload[RJA83D.METADATA] = buildSuggestionMetadata(suggestion.id, experimentIds)
+  payload[RJA83D.METADATA] = buildSuggestionMetadata(suggestionId, experimentIds)
   payload[RJA83D.START_FLAG] = 1
   return payload
 }
@@ -877,9 +1019,12 @@ async function processSuggestionsForTab(tab, options) {
     `[${label}] ${repos.length} repo(s) with Suggestions enabled: ${repos.map((r) => r.replace(/^github\//, '')).join(', ')}`
   )
 
-  addLog(`\n[${label}] Fetching suggestions for ${repos.length} repos concurrently...`)
+  const targetRepos = filterReposByRepoFilter(label, repos, options.repoFilter)
+  if (!targetRepos) return 0
+
+  addLog(`\n[${label}] Fetching suggestions for ${targetRepos.length} repos concurrently...`)
   let totalDiscovered = 0
-  const allSuggestions = await runInPool(repos, PER_ACCOUNT_CONCURRENCY, (repo) => {
+  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) => {
     // ⚡ Bolt Optimization: Short-circuit network discovery if we've already
     // found enough suggestions to satisfy the daily quota limit. This prevents
     // dozens of wasteful `listSuggestions` batchexecute API calls.
@@ -979,6 +1124,325 @@ async function processSuggestionsForTab(tab, options) {
 
   addLog(`\n[${label}] TOTAL: ${totalStarted} suggestions started`)
   return totalStarted
+}
+
+// =============================================================================
+// Remove Suggestions Orchestrator
+// =============================================================================
+
+async function processRemoveSuggestionsForTab(tab, options) {
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  addLog(`[${label}] Fetching Suggestions-enabled repos...`)
+  const repos = await safeListSources(label, config)
+  if (!repos) return 0
+
+  addLog(
+    `[${label}] ${repos.length} repo(s) with Suggestions enabled: ${repos.map((r) => r.replace(/^github\//, '')).join(', ')}`
+  )
+
+  const targetRepos = filterReposByRepoFilter(label, repos, options.repoFilter)
+  if (!targetRepos) return 0
+
+  addLog(`\n[${label}] Fetching suggestions for ${targetRepos.length} repos concurrently...`)
+  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
+    globalLimit(() => listSuggestions(repo, config))
+      .then((suggestions) => ({ repo, suggestions }))
+      .catch((e) => ({ repo, error: e.message }))
+  )
+
+  const work = []
+  const discoveryLogs = []
+  for (const { repo, suggestions, error } of allSuggestions) {
+    if (error) {
+      discoveryLogs.push(`\n[${label}] ERROR fetching suggestions for ${repo}: ${error}`)
+      continue
+    }
+    if (suggestions.length === 0) {
+      discoveryLogs.push(`\n[${label}] ${repo}: No suggestions found`)
+      continue
+    }
+    discoveryLogs.push(`\n[${label}] ${repo}: Found ${suggestions.length} suggestions`)
+    for (const s of suggestions) work.push({ repo, s })
+  }
+  if (discoveryLogs.length > 0) addLog(discoveryLogs.join(''))
+
+  if (work.length === 0) {
+    addLog(`\n[${label}] TOTAL: 0 suggestions removed`)
+    return 0
+  }
+
+  if (options.dryRun) {
+    addLog(`[${label}] DRY RUN - would remove ${work.length} suggestions`)
+    for (const { s } of work) {
+      addLog(`  [DRY] Would remove [${label}] ${s.title} (${s.categorySlug})`)
+    }
+    return 0
+  }
+
+  state.progress.total += work.length
+  updateState({})
+
+  let totalRemoved = 0
+  let lastUpdate = 0
+  await runInPool(work, PER_ACCOUNT_CONCURRENCY, async ({ repo, s }) => {
+    if (state.status === 'cancelled') return
+    const now = Date.now()
+    if (now - lastUpdate > 500) {
+      updateState({ currentRepo: repo.replace(/^github\//, '') })
+      lastUpdate = now
+    }
+    try {
+      await globalLimit(() => dismissSuggestionWithRetry(s.id, config))
+      totalRemoved++
+      state.progress.archived++
+      if (Date.now() - lastUpdate > 500) {
+        updateState({})
+        lastUpdate = Date.now()
+      }
+      addLog(`  Removed [${label}] ${s.title}`)
+    } catch (err) {
+      addLog(`  [!] Failed to remove suggestion "${s.title}": ${err.message}`)
+    }
+  })
+
+  addLog(`\n[${label}] TOTAL: ${totalRemoved} suggestions removed`)
+  return totalRemoved
+}
+
+// =============================================================================
+// Batch Agent + Export Orchestrators
+// =============================================================================
+
+// A typed "owner/repo" may not be among the listed sources (e.g. its
+// Suggestions toggle is off). Export and Batch Agent then query it directly.
+// Anything that isn't a plain owner/repo pair is rejected before it reaches an
+// RPC payload.
+const EXPLICIT_REPO_REGEX = /^(?:github\/)?[\w.-]+\/[\w.-]+$/
+
+function resolveTargetRepos(label, repos, repoFilter) {
+  if (!repoFilter) {
+    addLog(`[${label}] Checking all ${repos.length} connected repositories...`)
+    return repos
+  }
+  const filtered = repos.filter((r) => matchesRepoFilter(repoFilter, r))
+  if (filtered.length > 0) {
+    addLog(`[${label}] Selected repository: ${repoFilter}`)
+    return filtered
+  }
+  const trimmed = repoFilter.trim()
+  if (!EXPLICIT_REPO_REGEX.test(trimmed)) {
+    addLog(`[${label}] Invalid repository "${repoFilter}" (expected owner/repo). Nothing to do.`)
+    return null
+  }
+  const explicitRepo = trimmed.startsWith('github/') ? trimmed : `github/${trimmed}`
+  addLog(`[${label}] Using specified repository directly: ${explicitRepo}`)
+  return [explicitRepo]
+}
+
+function notify(title, message) {
+  if (!chrome.notifications) return
+  chrome.notifications.create({ type: 'basic', iconUrl: 'icons/icon128.png', title, message })
+}
+
+function buildBatchAgentPrompt(suggestions, repo) {
+  const repoName = repo.replace(/^github\//, '')
+  let body = `# Code Review & Health Remediation Plan for ${repoName}\n\n`
+  body += `You are an elite principal engineer and code review agent (like CodeRabbit). `
+  body += `You have been provided with an audited list of ${suggestions.length} suggestions identified across this codebase.\n\n`
+  body += `## CRITICAL OPERATING INSTRUCTIONS:\n`
+  body += `1. **AWARENESS OF CODE CHANGES**: The code in the repository may have evolved since these suggestions were generated. `
+  body += `Before making any modifications, inspect the current state of each targeted file and line. If a suggestion is already resolved, obsolete, or invalid given recent refactorings, skip it and clearly state why in your notes.\n`
+  body += `2. **SYSTEMATIC SEQUENTIAL EXECUTION**: Work through the items sequentially, one by one. Do not rush or batch untested changes across unrelated files.\n`
+  body += `3. **PRESERVE ARCHITECTURAL INTEGRITY**: Maintain type safety, multiplatform boundaries (if applicable), and ensure no behavioral regressions are introduced.\n`
+  body += `4. **VERIFICATION**: Run this repository's own build, lint and test commands (see its README, package scripts, Makefile or CI config) to verify each fix before moving on to the next item.\n\n`
+  body += `## AUDITED SUGGESTIONS CHECKLIST (${suggestions.length} items):\n\n`
+
+  suggestions.forEach((s, idx) => {
+    body += `### Item ${idx + 1}: [${s.categorySlug || 'FIX'}] ${s.title}\n`
+    body += `- **Location:** \`${s.filePath}:${s.line}\`\n`
+    if (s.description) body += `- **Description:** ${s.description}\n`
+    if (s.rationale && s.rationale !== 'N/A') body += `- **Rationale:** ${s.rationale}\n`
+    if (s.codeSnippet) {
+      body += `\n\`\`\`${s.language || 'text'}\n${s.codeSnippet.trim()}\n\`\`\`\n`
+    }
+    body += `\n---\n\n`
+  })
+
+  body += `\nBegin by examining Item 1. Review the file, make the surgical fix, run verification, and proceed through the list.`
+  return body
+}
+
+// One Rja83d session per repo carrying every suggestion in a single prompt,
+// instead of one session per suggestion.
+async function processBatchAgentForTab(tab, options) {
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  const startConfig = await getStartConfig()
+
+  // Each launch is one Jules session, so the daily session quota applies
+  // exactly as it does to Start Suggestions.
+  let remaining = Number.POSITIVE_INFINITY
+  try {
+    const quota = await getDailySessionQuota(config)
+    if (quota) {
+      addLog(`[${label}] Daily sessions: ${quota.used}/${quota.limit} used, ${quota.remaining} remaining`)
+      if (quota.remaining === 0) {
+        addLog(`[${label}] Daily limit reached. Skipping Batch Agent.`)
+        return 0
+      }
+      remaining = quota.remaining
+    }
+  } catch (e) {
+    addLog(`[${label}] WARNING: Could not fetch daily quota: ${e.message}`)
+  }
+
+  // "All repositories" means the Suggestions-enabled ones, same as Start
+  // Suggestions; only an explicitly chosen repo may bypass the toggle.
+  addLog(`[${label}] Discovering target repositories for Batch Agent...`)
+  let targetRepos
+  if (options.repoFilter) {
+    const repos = await safeListSources(label, config, true)
+    if (!repos) return 0
+    targetRepos = resolveTargetRepos(label, repos, options.repoFilter)
+  } else {
+    targetRepos = await safeListSources(label, config)
+  }
+  if (!targetRepos) return 0
+
+  addLog(`[${label}] Querying suggestions across ${targetRepos.length} repo(s)...`)
+  let totalTasksLaunched = 0
+
+  for (const repo of targetRepos) {
+    if (state.status === 'cancelled') break
+    if (remaining <= 0) {
+      addLog(`[${label}] Daily limit reached. Not launching on the remaining repos.`)
+      break
+    }
+    const suggestions = await listSuggestions(repo, config)
+    if (!suggestions || suggestions.length === 0) {
+      addLog(`[${label}] ${repo}: 0 suggestions. Skipping agent launch.`)
+      continue
+    }
+
+    addLog(`[${label}] ${repo}: Assembling ${suggestions.length} suggestions into 1 Unified Master Agent task...`)
+    const batchPrompt = buildBatchAgentPrompt(suggestions, repo)
+
+    // Budget is spent before the call: a failed launch may still have
+    // consumed a session server-side.
+    remaining--
+
+    if (options.dryRun) {
+      addLog(`  [DRY] Would launch 1 Master Agent on ${repo} handling all ${suggestions.length} items.`)
+      continue
+    }
+
+    state.progress.total++
+    updateState({ currentRepo: repo.replace(/^github\//, '') })
+    const payload = buildRja83dPayload(batchPrompt, suggestions[0].id, repo, config, startConfig)
+    try {
+      await globalLimit(() => withRetry(() => callBatchExecute('Rja83d', payload, config)))
+      totalTasksLaunched++
+      state.progress.archived++
+      updateState({})
+      addLog(`  Launched Unified Agent for ${repo} with all ${suggestions.length} suggestions`)
+      notify(
+        'Jules Master Agent Dispatched',
+        `Dispatched single agent covering ${suggestions.length} suggestions on ${repo.replace(/^github\//, '')}`
+      )
+    } catch (err) {
+      addLog(`  [!] Failed to launch batch agent on ${repo}: ${err.message}`)
+    }
+  }
+
+  return totalTasksLaunched
+}
+
+async function processExportSuggestionsForTab(tab, options) {
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  // Read-only, so every connected repo is fair game — not just the
+  // Suggestions-enabled ones.
+  addLog(`[${label}] Discovering all connected repositories...`)
+  const repos = await safeListSources(label, config, true)
+  if (!repos) return 0
+
+  const targetRepos = resolveTargetRepos(label, repos, options.repoFilter)
+  if (!targetRepos) return 0
+
+  addLog(`[${label}] Querying suggestions for ${targetRepos.length} repo(s)...`)
+  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
+    globalLimit(() => listSuggestions(repo, config))
+      .then((suggestions) => ({ repo, suggestions }))
+      .catch((e) => ({ repo, error: e.message }))
+  )
+
+  const exportResults = []
+  let totalFound = 0
+  for (const { repo, suggestions, error } of allSuggestions) {
+    if (error) {
+      addLog(`[${label}] ERROR fetching suggestions for ${repo}: ${error}`)
+      continue
+    }
+    if (suggestions && suggestions.length > 0) {
+      addLog(`[${label}] ${repo}: Found ${suggestions.length} suggestions`)
+      totalFound += suggestions.length
+      exportResults.push({ repo, suggestions })
+    } else {
+      addLog(`[${label}] ${repo}: 0 suggestions`)
+    }
+  }
+
+  const exportPayload = {
+    exportedAt: new Date().toISOString(),
+    account: label,
+    totalSuggestions: totalFound,
+    repositories: exportResults
+  }
+
+  // Accounts export in parallel; fold each one into the popup's re-download
+  // instead of letting the last account overwrite the others.
+  const prev = state.exportData
+  updateState({
+    exportData: prev
+      ? {
+          exportedAt: exportPayload.exportedAt,
+          totalSuggestions: prev.totalSuggestions + totalFound,
+          accounts: [...(prev.accounts || [prev]), exportPayload]
+        }
+      : exportPayload
+  })
+  persistNow()
+  downloadExport(label, exportPayload)
+
+  addLog(`\n[${label}] TOTAL: Successfully extracted ${totalFound} suggestions across ${exportResults.length} repo(s)!`)
+  return totalFound
+}
+
+// Single download trigger from the service worker, so the file is saved even
+// if the popup closes mid-run. The popup's Download button re-saves it.
+function downloadExport(label, exportPayload) {
+  if (typeof chrome.downloads?.download !== 'function') return
+  try {
+    const dataUrl = `data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(exportPayload, null, 2))}`
+    const filename = `jules-suggestions-${new Date().toISOString().slice(0, 10)}.json`
+    chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, (downloadId) => {
+      if (chrome.runtime.lastError || !downloadId) return
+      addLog(`[${label}] Export saved: ${filename}`)
+      notify(
+        'Jules Suggestions Exported',
+        `Successfully saved ${exportPayload.totalSuggestions} suggestions to ${filename}`
+      )
+    })
+  } catch (err) {
+    console.error('Background download error:', err)
+  }
 }
 
 // =============================================================================
@@ -1328,6 +1792,41 @@ function logDryRun(label, toArchive) {
   if (dryRunLogs.length > 0) addLog(dryRunLogs.join('\n'))
 }
 
+function getTaskIds(tasks) {
+  const len = tasks.length
+  const taskIds = new Array(len)
+  for (let i = 0; i < len; i++) {
+    taskIds[i] = tasks[i].id
+  }
+  return taskIds
+}
+
+// Returns the tasks that were archived. HTTP-level failures (auth, network)
+// are not split: every chunk would fail the same way.
+async function archiveBatchWithSplit(label, batch, config) {
+  try {
+    await globalLimit(() => archiveTasksWithRetry(getTaskIds(batch), config))
+    return batch
+  } catch (e) {
+    if (batch.length <= ARCHIVE_SPLIT_SIZE || !RPC_ERROR_CODE_REGEX.test(e.message)) {
+      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+      return []
+    }
+    addLog(`  [${label}] Batch of ${batch.length} rejected (${e.message}); retrying in chunks of ${ARCHIVE_SPLIT_SIZE}`)
+  }
+  const archived = []
+  for (let i = 0; i < batch.length; i += ARCHIVE_SPLIT_SIZE) {
+    const chunk = batch.slice(i, i + ARCHIVE_SPLIT_SIZE)
+    try {
+      await globalLimit(() => archiveTasksWithRetry(getTaskIds(chunk), config))
+      archived.push(...chunk)
+    } catch (e) {
+      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+    }
+  }
+  return archived
+}
+
 async function executeArchive(label, toArchive, config) {
   let grandTotal = 0
   let lastUpdate = 0
@@ -1338,29 +1837,21 @@ async function executeArchive(label, toArchive, config) {
   }
 
   await runInPool(batches, PER_ACCOUNT_CONCURRENCY, async (batch) => {
-    const len = batch.length
-    const taskIds = new Array(len)
-    for (let i = 0; i < len; i++) {
-      taskIds[i] = batch[i].id
-    }
     const now = Date.now()
     if (now - lastUpdate > 500) {
       updateState({ currentRepo: batch[0].repo || '(no repo)' })
       lastUpdate = now
     }
-    try {
-      await globalLimit(() => archiveTasksWithRetry(taskIds, config))
-      grandTotal += batch.length
-      state.progress.archived += batch.length
-      if (Date.now() - lastUpdate > 500) {
-        updateState({})
-        lastUpdate = Date.now()
-      }
-      for (const task of batch) {
-        addLog(`  Archived [${label}] [${task.id}] ${task.title}`)
-      }
-    } catch (e) {
-      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+    const archived = await archiveBatchWithSplit(label, batch, config)
+    if (archived.length === 0) return
+    grandTotal += archived.length
+    state.progress.archived += archived.length
+    if (Date.now() - lastUpdate > 500) {
+      updateState({})
+      lastUpdate = Date.now()
+    }
+    for (const task of archived) {
+      addLog(`  Archived [${label}] [${task.id}] ${task.title}`)
     }
   })
   return grandTotal
@@ -1375,14 +1866,26 @@ async function processTab(tab, options) {
   const tasks = await safeListTasks(label, config)
   if (!tasks) return 0
 
-  const { toArchive, toSkip } = await filterArchivableTasks(label, tasks, options)
+  let filteredTasks = tasks
+  if (options.repoFilter) {
+    filteredTasks = tasks.filter((t) => matchesRepoFilter(options.repoFilter, t.source, t.repo))
+    addLog(
+      `[${label}] Filtered tasks by repo "${options.repoFilter}": keeping ${filteredTasks.length} of ${tasks.length} tasks`
+    )
+    if (filteredTasks.length === 0) {
+      addLog(`[${label}] No matching tasks found. Nothing to do.`)
+      return 0
+    }
+  }
+
+  const { toArchive, toSkip } = await filterArchivableTasks(label, filteredTasks, options)
 
   if (toSkip.length > 0) {
     addLog(`\n[${label}] ${toSkip.length} tasks skipped (open PRs matching)`)
   }
 
   if (toArchive.length === 0) {
-    if (!options.force && tasks.some(isArchivable)) {
+    if (!options.force && filteredTasks.some(isArchivable)) {
       addLog(`[${label}] Nothing to archive (all tasks have matching open PRs).`)
     }
     return 0
@@ -1405,8 +1908,18 @@ async function processTab(tab, options) {
   return grandTotal
 }
 
+const OP_MODE_HEADERS = {
+  suggestions: '=== SUGGESTIONS MODE ===',
+  agent_batch: '=== BATCH AGENT MODE ===',
+  remove_suggestions: '=== REMOVE SUGGESTIONS MODE ===',
+  export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ==='
+}
+
 function initOperationState(options) {
   prCache.clear()
+  if (options.repoFilter === '__ALL__') {
+    options.repoFilter = ''
+  }
   const randomArray = new Uint32Array(1)
   crypto.getRandomValues(randomArray)
   reqCounter = (randomArray[0] % 900000) + 100000
@@ -1418,11 +1931,13 @@ function initOperationState(options) {
     progress: { archived: 0, skipped: 0, total: 0 },
     results: [],
     log: [],
-    error: null
+    error: null,
+    exportData: null,
+    options: { ...options }
   })
 
   const isSuggestions = options.opMode === 'suggestions'
-  addLog(options.dryRun ? '=== DRY RUN MODE ===' : isSuggestions ? '=== SUGGESTIONS MODE ===' : '=== ARCHIVE MODE ===')
+  addLog(options.dryRun ? '=== DRY RUN MODE ===' : OP_MODE_HEADERS[options.opMode] || '=== ARCHIVE MODE ===')
   if (options.scheduled) addLog('=== SCHEDULED (chrome.alarms) ===')
   if (options.force) addLog('=== FORCE MODE (skip PR check) ===')
   addLog('=== v2: batchexecute API ===')
@@ -1437,12 +1952,33 @@ function initOperationState(options) {
   return isSuggestions
 }
 
+// Tabs are processed in parallel. Two tabs on one account would each read
+// the same remaining daily quota (and repeat the same archive/dismiss calls),
+// so only the first tab per account is used.
+function keepFirstTabPerAccount(tabs) {
+  const seenAccounts = new Set()
+  const uniqueTabs = []
+  for (const t of tabs) {
+    const num = extractAccountNum(t.url)
+    if (seenAccounts.has(num)) continue
+    seenAccounts.add(num)
+    uniqueTabs.push(t)
+  }
+  return uniqueTabs
+}
+
 async function discoverTabs(options) {
   let tabs = await getJulesTabs()
 
   if (options.scope === 'current' && options.activeTabId) {
     tabs = tabs.filter((t) => t.id === options.activeTabId)
   }
+
+  const uniqueTabs = keepFirstTabPerAccount(tabs)
+  if (uniqueTabs.length < tabs.length) {
+    addLog(`Skipping ${tabs.length - uniqueTabs.length} duplicate tab(s) for an already-listed account`)
+  }
+  tabs = uniqueTabs
 
   if (tabs.length === 0) {
     addLog('No Jules tabs found. Open jules.google.com first.')
@@ -1454,14 +1990,32 @@ async function discoverTabs(options) {
   return tabs
 }
 
+// opMode -> per-tab orchestrator. Anything unknown falls back to archive.
+function getTabProcessor(opMode) {
+  switch (opMode) {
+    case 'suggestions':
+      return processSuggestionsForTab
+    case 'remove_suggestions':
+      return processRemoveSuggestionsForTab
+    case 'export_suggestions':
+      return processExportSuggestionsForTab
+    case 'agent_batch':
+      return processBatchAgentForTab
+    default:
+      return processTab
+  }
+}
+
 async function processAllTabs(tabs, options, isSuggestions) {
+  // Legacy boolean callers predate opMode dispatch; keep them on the same path.
+  const opMode = options.opMode || (isSuggestions ? 'suggestions' : 'archive')
   // Process accounts in parallel. Per-account pools and the shared global
   // limiter keep total in-flight requests bounded; results preserve tab order.
   return Promise.all(
     tabs.map(async (tab) => {
       const label = getTabLabel(tab)
       try {
-        const count = isSuggestions ? await processSuggestionsForTab(tab, options) : await processTab(tab, options)
+        const count = await getTabProcessor(opMode)(tab, options)
         return { label, count }
       } catch (e) {
         addLog(`ERROR [${label}]: ${e.message}`)
@@ -1471,8 +2025,23 @@ async function processAllTabs(tabs, options, isSuggestions) {
   )
 }
 
-function finalizeOperation(results, isSuggestions) {
-  const verb = isSuggestions ? 'started' : 'archived'
+const OP_MODE_SUMMARY = {
+  suggestions: { verb: 'started', itemLabel: 'suggestions' },
+  remove_suggestions: { verb: 'removed', itemLabel: 'suggestions' },
+  export_suggestions: { verb: 'exported', itemLabel: 'suggestions' },
+  agent_batch: { verb: 'launched', itemLabel: 'master agent sessions' }
+}
+
+// Accepts the run's options (opMode) or the legacy isSuggestions boolean.
+function finalizeOperation(results, optionsOrIsSuggestions) {
+  let verb = 'archived'
+  let itemLabel = 'tasks'
+  if (typeof optionsOrIsSuggestions === 'object' && optionsOrIsSuggestions !== null) {
+    const summary = OP_MODE_SUMMARY[optionsOrIsSuggestions.opMode]
+    if (summary) ({ verb, itemLabel } = summary)
+  } else if (optionsOrIsSuggestions) {
+    verb = 'started'
+  }
   addLog(`\n${'='.repeat(50)}`)
   addLog('SUMMARY')
   addLog(`${'='.repeat(50)}`)
@@ -1481,7 +2050,7 @@ function finalizeOperation(results, isSuggestions) {
     grand += r.count
     addLog(`  ${r.label}: ${r.err ? `ERROR: ${r.err}` : `${r.count} ${verb}`}`)
   })
-  addLog(`\n  GRAND TOTAL: ${grand} tasks ${verb}`)
+  addLog(`\n  GRAND TOTAL: ${grand} ${itemLabel} ${verb}`)
 
   updateState({ status: 'done', results })
 }
@@ -1500,7 +2069,7 @@ async function startOperation(options) {
     if (!tabs) return
 
     const results = await processAllTabs(tabs, options, isSuggestions)
-    finalizeOperation(results, isSuggestions)
+    finalizeOperation(results, options)
   } catch (e) {
     handleOperationError(e)
   } finally {
@@ -1512,8 +2081,39 @@ async function startOperation(options) {
 // Message Handlers
 // =============================================================================
 
+// Repo picker source for the popup: every connected repo of the first Jules
+// tab's account, as sorted "owner/repo" display names.
+// Union of every signed-in account's connected repos, one lookup per account.
+// An account whose lookup fails is skipped; it only throws if all of them fail.
+async function getAllSourceNames() {
+  const tabs = keepFirstTabPerAccount(await getJulesTabs())
+  if (!tabs.length) return []
+  const settled = await Promise.allSettled(tabs.map(async (tab) => listAllSources(await getTabConfig(tab.id))))
+  const names = new Set()
+  for (const result of settled) {
+    if (result.status !== 'fulfilled') continue
+    for (const repo of result.value) names.add(repo.replace(/^github\//, ''))
+  }
+  const failure = settled.find((result) => result.status === 'rejected')
+  if (names.size === 0 && failure) throw failure.reason
+  return [...names].sort()
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.action) {
+    case 'GET_ALL_SOURCES':
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      getAllSourceNames()
+        .then((repos) => sendResponse({ repos }))
+        .catch((err) => {
+          console.error('Failed to query all sources:', err)
+          sendResponse({ repos: [], error: err.message })
+        })
+      return true
+
     case 'START':
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })

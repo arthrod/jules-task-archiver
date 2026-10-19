@@ -117,6 +117,9 @@ jobs:
             popup.js \
             popup.css \
             utils.js \
+            license.html \
+            license.css \
+            LICENSE \
             icons/
 
       - name: Upload to GitHub Release

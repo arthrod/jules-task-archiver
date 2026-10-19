@@ -1,3 +1,4 @@
+// Modified by tommyzed: Added repository filtering test cases
 const { describe, it } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -209,6 +210,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     globalThis.test_processSuggestionsForTab = processSuggestionsForTab;
     globalThis.test_SCHEDULE_ALARM_NAME = SCHEDULE_ALARM_NAME;
     globalThis.test_DEFAULT_SCHEDULE = DEFAULT_SCHEDULE;
+    globalThis.test_RJA83D = RJA83D;
   `
 
   const script = new vm.Script(scriptContent, { filename: bgScriptPath })
@@ -654,6 +656,14 @@ describe('parseResponse', () => {
     const response = ')]}\'\n\n55\n[["wrb.fr","Tjmm5c","[[\\"ok\\"]]",null,null,null,"generic"]]\n12\n[["di",99]]'
     const result = sandbox.test_parseResponse(response, 'Tjmm5c')
     assert.deepStrictEqual(result, [['ok']])
+  })
+
+  it('should throw when the matching entry carries an RPC error code', () => {
+    const { sandbox } = setupEnvironment()
+    // Shape verified live: a rejected call answers 200 with [code] at index 5
+    // and a null payload instead of a JSON string.
+    const response = ')]}\'\n\n60\n[["wrb.fr","Tjmm5c",null,null,null,[3],"generic"]]'
+    assert.throws(() => sandbox.test_parseResponse(response, 'Tjmm5c'), /RPC Tjmm5c error code \[3\]/)
   })
 
   it('should return null when the rpcId is not present', () => {
@@ -1519,6 +1529,21 @@ describe('startOperation refactoring', () => {
     assert.ok(state.log[0].includes('ARCHIVE MODE'))
   })
 
+  it('initOperationState should log the batch agent header for agent_batch runs', () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.test_initOperationState({ opMode: 'agent_batch', dryRun: false, force: false })
+
+    assert.strictEqual(sandbox.test_state().log[0], '=== BATCH AGENT MODE ===')
+  })
+
+  it("initOperationState should drop the previous run's exportData", () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.test_updateState({ status: 'done', exportData: { totalSuggestions: 3, repositories: [] } })
+    sandbox.test_initOperationState({ opMode: 'archive', dryRun: false, force: false })
+
+    assert.strictEqual(sandbox.test_state().exportData, null)
+  })
+
   it('discoverTabs should handle no tabs found', async () => {
     const { sandbox } = setupEnvironment()
     sandbox.chrome.tabs.query = async () => []
@@ -1527,6 +1552,39 @@ describe('startOperation refactoring', () => {
     assert.strictEqual(tabs, null)
     assert.strictEqual(sandbox.test_state().status, 'error')
     assert.strictEqual(sandbox.test_state().error, 'No Jules tabs found')
+  })
+
+  // Tabs run in parallel; two tabs on one account would each read the same
+  // remaining daily quota and could start twice the limit.
+  it('discoverTabs should keep one tab per account', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 1, url: 'https://jules.google.com/u/0/session/a' },
+      { id: 2, url: 'https://jules.google.com/u/1/' },
+      { id: 3, url: 'https://jules.google.com/u/0/repo/x' },
+      { id: 4, url: 'https://jules.google.com/tasks' }
+    ]
+    const tabs = await sandbox.test_discoverTabs({ scope: 'all' })
+
+    assert.deepStrictEqual(
+      Array.from(tabs, (t) => t.id),
+      [1, 2]
+    )
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Skipping 2 duplicate tab(s)')))
+  })
+
+  it('discoverTabs should keep the active tab for current scope even when the account has another tab', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 1, url: 'https://jules.google.com/u/0/session/a' },
+      { id: 3, url: 'https://jules.google.com/u/0/repo/x' }
+    ]
+    const tabs = await sandbox.test_discoverTabs({ scope: 'current', activeTabId: 3 })
+
+    assert.deepStrictEqual(
+      Array.from(tabs, (t) => t.id),
+      [3]
+    )
   })
 
   it('discoverTabs should return filtered tabs', async () => {
@@ -2209,6 +2267,74 @@ describe('executeArchive', () => {
     assert.strictEqual(batches[0][0], 'id-0')
     assert.strictEqual(batches[2][19], 'id-119')
   })
+
+  // Live run (2026-10-19): 2 of 147 fifty-id Tjmm5c batches came back with
+  // RPC error code [4]; the same ids then archived fine in chunks of 10.
+  // These go through the real callBatchExecute/parseResponse path, so the
+  // error carries callBatchExecute's "batchexecute Tjmm5c failed:" prefix.
+  const RPC_REJECTED = ')]}\'\n\n60\n[["wrb.fr","Tjmm5c",null,null,null,[4],"generic"]]'
+  const RPC_OK = ')]}\'\n\n55\n[["wrb.fr","Tjmm5c","[[\\"ok\\"]]",null,null,null,"generic"]]'
+
+  function mockTjmm5c(sandbox, rejects) {
+    const calls = []
+    sandbox.postBatchExecute = async (_rpcId, payload) => {
+      const ids = payload.find(Array.isArray)
+      calls.push(ids)
+      return { ok: true, status: 200, text: async () => (rejects(ids) ? RPC_REJECTED : RPC_OK) }
+    }
+    return calls
+  }
+
+  it('should retry a batch rejected with an RPC error code in smaller chunks', async () => {
+    const { sandbox } = setupEnvironment()
+    const mockTasks = Array.from({ length: 60 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
+    const calls = mockTjmm5c(sandbox, (ids) => ids.length === 50)
+
+    const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
+
+    assert.strictEqual(grandTotal, 60)
+    assert.strictEqual(sandbox.test_state().progress.archived, 60)
+    const retried = calls.filter((ids) => ids.length === 10 && ids[0] !== 'id-50')
+    assert.strictEqual(retried.length, 5)
+    assert.deepStrictEqual(
+      retried.flat().sort(),
+      mockTasks
+        .slice(0, 50)
+        .map((t) => t.id)
+        .sort()
+    )
+  })
+
+  it('should drop only the chunk that still fails after splitting', async () => {
+    const { sandbox } = setupEnvironment()
+    const mockTasks = Array.from({ length: 50 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
+    mockTjmm5c(sandbox, (ids) => ids.length === 50 || ids.includes('id-23'))
+
+    const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
+
+    assert.strictEqual(grandTotal, 40)
+    const log = sandbox.test_state().log
+    assert.ok(log.some((l) => l.includes('retrying in chunks of 10')))
+    assert.ok(log.some((l) => l.includes('ERROR [test-label] archiving batch:') && l.includes('error code [4]')))
+    assert.ok(!log.some((l) => l.includes('[id-23]')), 'the failed chunk must not be logged as archived')
+  })
+
+  it('should not split a batch that failed at the HTTP layer', async () => {
+    const { sandbox } = setupEnvironment()
+    const mockTasks = Array.from({ length: 50 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
+    const calls = []
+    sandbox.postBatchExecute = async (_rpcId, payload) => {
+      calls.push(payload.find(Array.isArray))
+      const err = new Error('HTTP 401')
+      err.status = 401
+      throw err
+    }
+
+    const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
+
+    assert.strictEqual(grandTotal, 0)
+    assert.strictEqual(calls.length, 1, 'an auth failure would fail every chunk too')
+  })
 })
 
 describe('listTasks', () => {
@@ -2469,5 +2595,596 @@ describe('alarm listener wiring', () => {
     alarmListeners[0]({ name: 'someone-elses-alarm' })
     await new Promise((r) => setImmediate(r))
     assert.strictEqual(sandbox.test_state().status, 'idle')
+  })
+})
+
+describe('matchesRepoFilter', () => {
+  const { sandbox } = setupEnvironment()
+
+  it('matches owner/repo exactly, case-insensitively, with or without the github/ prefix', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('Owner/Plate', 'github/owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/plate', 'owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('github/owner/plate', 'github/owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter(' owner/plate ', 'github/owner/plate'), true)
+  })
+
+  it('does not treat owner/repo as a substring pattern', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/plate', 'github/owner/plate-docs'), false)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/plate', 'github/other-owner/plate'), false)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/pla', 'github/owner/plate'), false)
+  })
+
+  it('matches a bare name against the repo segment only', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('plate', 'github/owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('plate', 'github/owner/plate-docs'), false)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner', 'github/owner/plate'), false)
+  })
+
+  it('checks every candidate and skips empty ones', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('o/r', undefined, '', 'o/r'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('o/r', undefined, ''), false)
+  })
+})
+
+describe('processTab repository filtering', () => {
+  const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
+
+  function setupArchiveEnv(tasks) {
+    const { sandbox } = setupEnvironment()
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+    sandbox.listTasks = async () => tasks
+    sandbox.getOpenPRs = async () => []
+    const archived = []
+    sandbox.archiveTasks = async (ids) => {
+      archived.push(...ids)
+    }
+    return { sandbox, archived }
+  }
+
+  it('filters tasks by exact repo name in repoFilter', async () => {
+    const tasks = [
+      { id: 'a', title: 'T1', state: 12, source: 'github/tommyzed/adventures', repo: 'tommyzed/adventures' },
+      { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/add-to-calendar', repo: 'tommyzed/add-to-calendar' }
+    ]
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'tommyzed/adventures' })
+    assert.deepStrictEqual(archived, ['a'])
+  })
+
+  it('matches the repo filter exactly and case-insensitively, never as a substring', async () => {
+    const tasks = [
+      { id: 'a', title: 'T1', state: 12, source: 'github/tommyzed/adventures', repo: 'tommyzed/adventures' },
+      { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/adventures-2', repo: 'tommyzed/adventures-2' },
+      { id: 'c', title: 'T3', state: 12, source: 'github/not-tommyzed/adventures', repo: 'not-tommyzed/adventures' }
+    ]
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'TommyZed/Adventures' })
+    assert.deepStrictEqual(archived, ['a'], 'adventures-2 and not-tommyzed/adventures must not be archived')
+  })
+
+  it('does not archive anything for a partial repo name', async () => {
+    const tasks = [
+      { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/add-to-calendar', repo: 'tommyzed/add-to-calendar' }
+    ]
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    const result = await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'Calendar' })
+    assert.strictEqual(result, 0)
+    assert.deepStrictEqual(archived, [])
+  })
+
+  it('returns 0 and logs message if no tasks match repoFilter', async () => {
+    const tasks = [
+      { id: 'a', title: 'T1', state: 12, source: 'github/tommyzed/adventures', repo: 'tommyzed/adventures' }
+    ]
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    const result = await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'other-repo' })
+    assert.strictEqual(result, 0)
+    assert.strictEqual(archived.length, 0)
+    const state = sandbox.test_state()
+    assert.ok(state.log.some((l) => l.includes('No matching tasks found. Nothing to do.')))
+  })
+
+  it('keeps the state filter and PR check when a repoFilter is set (no implicit force)', async () => {
+    const tasks = [
+      { id: 'done', title: 'Finished', state: 12, source: 'github/o/r', repo: 'o/r', owner: 'o', repoName: 'r' },
+      { id: 'busy', title: 'Running', state: 1, source: 'github/o/r', repo: 'o/r', owner: 'o', repoName: 'r' },
+      { id: 'pr', title: 'Has PR', state: 12, source: 'github/o/r', repo: 'o/r', owner: 'o', repoName: 'r' }
+    ]
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    sandbox.getOpenPRs = async () => [{ title: 'Has PR', titleLower: 'has pr', branch: 'b' }]
+    await sandbox.processTab(TAB, { force: false, dryRun: false, repoFilter: 'o/r' })
+    assert.deepStrictEqual(archived, ['done'], 'running task and task with an open PR must survive')
+  })
+})
+
+describe('processSuggestionsForTab repository filtering', () => {
+  const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
+
+  function setupSuggestionsEnv(repos) {
+    const { sandbox } = setupEnvironment()
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+    sandbox.getStartConfig = async () => ({ modelConfig: [null, 'gemini'], featureFlags: [], experimentIds: [] })
+    sandbox.getDailySessionQuota = async () => ({ used: 0, limit: 100, remaining: 100 })
+    sandbox.safeListSources = async () => repos
+
+    const queriedRepos = []
+    sandbox.listSuggestions = async (repo) => {
+      queriedRepos.push(repo)
+      return []
+    }
+    return { sandbox, queriedRepos }
+  }
+
+  it('filters suggestions-enabled repos by exact repo name in repoFilter', async () => {
+    const repos = ['github/tommyzed/adventures', 'github/tommyzed/add-to-calendar']
+    const { sandbox, queriedRepos } = setupSuggestionsEnv(repos)
+    await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'tommyzed/adventures' })
+    assert.deepStrictEqual(queriedRepos, ['github/tommyzed/adventures'])
+  })
+
+  it('matches suggestions-enabled repos exactly, not by substring', async () => {
+    const repos = ['github/tommyzed/adventures', 'github/tommyzed/adventures-2', 'github/tommyzed/add-to-calendar']
+    const { sandbox, queriedRepos } = setupSuggestionsEnv(repos)
+    await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'Tommyzed/Adventures' })
+    assert.deepStrictEqual(queriedRepos, ['github/tommyzed/adventures'])
+
+    queriedRepos.length = 0
+    const result = await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'Calendar' })
+    assert.strictEqual(result, 0)
+    assert.deepStrictEqual(queriedRepos, [])
+  })
+
+  it('returns 0 and logs message if no repos match repoFilter', async () => {
+    const repos = ['github/tommyzed/adventures']
+    const { sandbox, queriedRepos } = setupSuggestionsEnv(repos)
+    const result = await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'other-repo' })
+    assert.strictEqual(result, 0)
+    assert.strictEqual(queriedRepos.length, 0)
+    const state = sandbox.test_state()
+    assert.ok(state.log.some((l) => l.includes('No matching repos found. Nothing to do.')))
+  })
+})
+
+describe('processRemoveSuggestionsForTab', () => {
+  const TAB = { id: 1, url: 'https://jules.google.com/u/1/' }
+
+  function setupRemoveEnv(repos, suggestionsMap = {}) {
+    const { sandbox } = setupEnvironment()
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+    sandbox.safeListSources = async () => repos
+
+    const queriedRepos = []
+    const removedBatchIds = []
+
+    sandbox.listSuggestions = async (repo) => {
+      queriedRepos.push(repo)
+      return suggestionsMap[repo] || []
+    }
+
+    sandbox.dismissSuggestionWithRetry = async (id) => {
+      removedBatchIds.push(id)
+    }
+
+    return { sandbox, queriedRepos, removedBatchIds }
+  }
+
+  it('performs dry run without removing suggestions', async () => {
+    const repos = ['github/owner/repo1']
+    const suggestionsMap = {
+      'github/owner/repo1': [
+        { id: 'sug-1', title: 'Fix SQL injection', categorySlug: 'input-validation' },
+        { id: 'sug-2', title: 'Optimize loop', categorySlug: 'loop-optimization' }
+      ]
+    }
+    const { sandbox, removedBatchIds } = setupRemoveEnv(repos, suggestionsMap)
+    const count = await sandbox.processRemoveSuggestionsForTab(TAB, { opMode: 'remove_suggestions', dryRun: true })
+
+    assert.strictEqual(count, 0)
+    assert.strictEqual(removedBatchIds.length, 0)
+
+    const state = sandbox.test_state()
+    assert.ok(state.log.some((l) => l.includes('[DRY] Would remove [u/1] Fix SQL injection')))
+    assert.ok(state.log.some((l) => l.includes('[DRY] Would remove [u/1] Optimize loop')))
+  })
+
+  it('removes each suggestion during a live run', async () => {
+    const repos = ['github/owner/repo1']
+    const suggestionsMap = {
+      'github/owner/repo1': [
+        { id: 'sug-1', title: 'Fix SQL injection', categorySlug: 'input-validation' },
+        { id: 'sug-2', title: 'Optimize loop', categorySlug: 'loop-optimization' }
+      ]
+    }
+    const { sandbox, removedBatchIds } = setupRemoveEnv(repos, suggestionsMap)
+    const count = await sandbox.processRemoveSuggestionsForTab(TAB, { opMode: 'remove_suggestions', dryRun: false })
+
+    assert.strictEqual(count, 2)
+    assert.deepStrictEqual(removedBatchIds, ['sug-1', 'sug-2'])
+
+    const state = sandbox.test_state()
+    assert.ok(state.log.some((l) => l.includes('Removed [u/1] Fix SQL injection')))
+    assert.ok(state.log.some((l) => l.includes('Removed [u/1] Optimize loop')))
+    assert.ok(state.log.some((l) => l.includes('TOTAL: 2 suggestions removed')))
+  })
+
+  it('filters repos by repoFilter when removing suggestions', async () => {
+    const repos = ['github/owner/repo1', 'github/owner/repo2']
+    const { sandbox, queriedRepos } = setupRemoveEnv(repos)
+    await sandbox.processRemoveSuggestionsForTab(TAB, { opMode: 'remove_suggestions', repoFilter: 'repo2' })
+
+    assert.deepStrictEqual(queriedRepos, ['github/owner/repo2'])
+  })
+
+  it('returns 0 if no suggestions found', async () => {
+    const repos = ['github/owner/repo1']
+    const { sandbox } = setupRemoveEnv(repos, { 'github/owner/repo1': [] })
+    const count = await sandbox.processRemoveSuggestionsForTab(TAB, { opMode: 'remove_suggestions', dryRun: false })
+
+    assert.strictEqual(count, 0)
+    const state = sandbox.test_state()
+    assert.ok(state.log.some((l) => l.includes('TOTAL: 0 suggestions removed')))
+  })
+
+  it('formats finalizeOperation summary with "removed" for remove_suggestions mode', () => {
+    const { sandbox } = setupEnvironment()
+    const results = [{ label: 'u/0', count: 5 }]
+    sandbox.finalizeOperation(results, { opMode: 'remove_suggestions' })
+
+    const state = sandbox.test_state()
+    assert.ok(state.log.some((l) => l.includes('u/0: 5 removed')))
+    assert.ok(state.log.some((l) => l.includes('GRAND TOTAL: 5 suggestions removed')))
+  })
+})
+
+describe('dismissSuggestion (sc1vFf)', () => {
+  it('sends [suggestionId, 2] to sc1vFf', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = []
+    sandbox.callBatchExecute = async (rpcId, payload) => {
+      calls.push({ rpcId, payload })
+      return []
+    }
+    await sandbox.dismissSuggestion('sug-9', { accountNum: '0' })
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(calls)), [{ rpcId: 'sc1vFf', payload: ['sug-9', 2] }])
+  })
+})
+
+describe('processExportSuggestionsForTab', () => {
+  const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
+
+  function setupExportEnv(allRepos, suggestionsMap = {}) {
+    const { sandbox } = setupEnvironment()
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+    sandbox.listAllSources = async () => allRepos
+    const queriedRepos = []
+    sandbox.listSuggestions = async (repo) => {
+      queriedRepos.push(repo)
+      return suggestionsMap[repo] || []
+    }
+    const downloads = []
+    sandbox.chrome.downloads = {
+      download: (opts, cb) => {
+        downloads.push(opts)
+        cb(1)
+      }
+    }
+    return { sandbox, queriedRepos, downloads }
+  }
+
+  it('exports suggestions from every connected repo and saves a JSON file', async () => {
+    const { sandbox, queriedRepos, downloads } = setupExportEnv(['github/o/a', 'github/o/b'], {
+      'github/o/a': [{ id: 's1', title: 'One' }]
+    })
+    const count = await sandbox.processExportSuggestionsForTab(TAB, { opMode: 'export_suggestions' })
+
+    assert.strictEqual(count, 1)
+    assert.deepStrictEqual(queriedRepos, ['github/o/a', 'github/o/b'])
+    const exportData = sandbox.test_state().exportData
+    assert.strictEqual(exportData.totalSuggestions, 1)
+    assert.strictEqual(exportData.repositories.length, 1)
+    assert.strictEqual(exportData.repositories[0].repo, 'github/o/a')
+    assert.strictEqual(downloads.length, 1)
+    assert.ok(downloads[0].url.startsWith('data:application/json;charset=utf-8,'))
+    assert.match(downloads[0].filename, /^jules-suggestions-\d{4}-\d{2}-\d{2}\.json$/)
+  })
+
+  it('keeps every account in exportData when several accounts export in one run', async () => {
+    const { sandbox, downloads } = setupExportEnv(['github/o/a'], { 'github/o/a': [{ id: 's1', title: 'One' }] })
+    await sandbox.processExportSuggestionsForTab(TAB, { opMode: 'export_suggestions' })
+    await sandbox.processExportSuggestionsForTab(
+      { id: 2, url: 'https://jules.google.com/u/1/' },
+      { opMode: 'export_suggestions' }
+    )
+
+    const exportData = sandbox.test_state().exportData
+    assert.strictEqual(exportData.totalSuggestions, 2)
+    assert.strictEqual(exportData.accounts.length, 2)
+    assert.strictEqual(exportData.accounts[1].repositories[0].repo, 'github/o/a')
+    assert.strictEqual(downloads.length, 2, 'each account still gets its own file')
+  })
+
+  it('queries a typed owner/repo directly when it is not among the listed sources', async () => {
+    const { sandbox, queriedRepos } = setupExportEnv(['github/o/a'])
+    await sandbox.processExportSuggestionsForTab(TAB, { opMode: 'export_suggestions', repoFilter: 'other/repo' })
+    assert.deepStrictEqual(queriedRepos, ['github/other/repo'])
+  })
+
+  it('rejects a typed repo that is not a plain owner/repo pair', async () => {
+    const { sandbox, queriedRepos } = setupExportEnv(['github/o/a'])
+    const count = await sandbox.processExportSuggestionsForTab(TAB, {
+      opMode: 'export_suggestions',
+      repoFilter: 'evil"],[1'
+    })
+    assert.strictEqual(count, 0)
+    assert.deepStrictEqual(queriedRepos, [])
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Invalid repository')))
+  })
+})
+
+describe('buildBatchAgentPrompt', () => {
+  it('keeps the verification step toolchain-neutral', () => {
+    const { sandbox } = setupEnvironment()
+    const prompt = sandbox.buildBatchAgentPrompt([{ title: 'Fix it', filePath: 'src/a.py', line: 3 }], 'github/o/r')
+
+    assert.ok(!/gradle/i.test(prompt), 'prompt must not assume a Gradle project')
+    assert.match(prompt, /this repository's own build, lint and test commands/)
+  })
+})
+
+describe('processBatchAgentForTab', () => {
+  const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
+
+  function setupBatchEnv(allRepos, suggestionsMap = {}, { enabledRepos = allRepos, remaining = 100 } = {}) {
+    const { sandbox } = setupEnvironment()
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+    sandbox.getStartConfig = async () => ({ modelConfig: [null, 'gemini'], featureFlags: [], experimentIds: ['x1'] })
+    sandbox.getDailySessionQuota = async () => ({ used: 100 - remaining, limit: 100, remaining })
+    sandbox.listAllSources = async () => allRepos
+    sandbox.listSuggestionEnabledSources = async () => enabledRepos
+    sandbox.listSuggestions = async (repo) => suggestionsMap[repo] || []
+    const launches = []
+    sandbox.callBatchExecute = async (rpcId, payload) => {
+      launches.push({ rpcId, payload })
+      return []
+    }
+    return { sandbox, launches }
+  }
+
+  const SUGGESTIONS = {
+    'github/o/a': [
+      { id: 's1', title: 'First fix', categorySlug: 'dead-code', filePath: 'a.js', line: 1 },
+      { id: 's2', title: 'Second fix', categorySlug: 'injection', filePath: 'b.js', line: 2 }
+    ]
+  }
+
+  it('dry run logs one planned agent per repo and launches nothing', async () => {
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/empty'], SUGGESTIONS)
+    const count = await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: true })
+    assert.strictEqual(count, 0)
+    assert.strictEqual(launches.length, 0)
+    const log = sandbox.test_state().log
+    assert.ok(log.some((l) => l.includes('[DRY] Would launch 1 Master Agent on github/o/a handling all 2 items.')))
+    assert.ok(log.some((l) => l.includes('github/o/empty: 0 suggestions. Skipping agent launch.')))
+  })
+
+  it('launches one Rja83d session carrying every suggestion of the repo', async () => {
+    const { sandbox, launches } = setupBatchEnv(['github/o/a'], SUGGESTIONS)
+    const count = await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.strictEqual(count, 1)
+    assert.strictEqual(launches.length, 1)
+    const { rpcId, payload } = launches[0]
+    assert.strictEqual(rpcId, 'Rja83d')
+    assert.strictEqual(payload[sandbox.test_RJA83D.REPO], 'github/o/a')
+    const prompt = payload[sandbox.test_RJA83D.PROMPT]
+    assert.ok(prompt.includes('First fix') && prompt.includes('Second fix'))
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(payload[sandbox.test_RJA83D.METADATA][11])), [null, 's1'])
+  })
+
+  it('launches nothing when the daily session quota is exhausted', async () => {
+    const { sandbox, launches } = setupBatchEnv(['github/o/a'], SUGGESTIONS, { remaining: 0 })
+    const count = await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.strictEqual(count, 0)
+    assert.strictEqual(launches.length, 0)
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Daily limit reached')))
+  })
+
+  it('caps launches to the remaining daily quota', async () => {
+    const both = { ...SUGGESTIONS, 'github/o/b': [{ id: 's3', title: 'Third fix', filePath: 'c.js', line: 3 }] }
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/b'], both, { remaining: 1 })
+    const count = await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.strictEqual(count, 1)
+    assert.strictEqual(launches.length, 1)
+  })
+
+  it('without a repo filter only targets Suggestions-enabled repos', async () => {
+    const both = { ...SUGGESTIONS, 'github/o/off': [{ id: 's9', title: 'Toggle off', filePath: 'z.js', line: 9 }] }
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/off'], both, { enabledRepos: ['github/o/a'] })
+    await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.deepStrictEqual(
+      launches.map((l) => l.payload[sandbox.test_RJA83D.REPO]),
+      ['github/o/a']
+    )
+  })
+
+  it('an explicitly chosen repo is used even if its Suggestions toggle is off', async () => {
+    const both = { ...SUGGESTIONS, 'github/o/off': [{ id: 's9', title: 'Toggle off', filePath: 'z.js', line: 9 }] }
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/off'], both, { enabledRepos: ['github/o/a'] })
+    await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false, repoFilter: 'o/off' })
+    assert.deepStrictEqual(
+      launches.map((l) => l.payload[sandbox.test_RJA83D.REPO]),
+      ['github/o/off']
+    )
+  })
+
+  it('reports launches through state.progress', async () => {
+    const { sandbox } = setupBatchEnv(['github/o/a'], SUGGESTIONS)
+    await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    const { progress } = sandbox.test_state()
+    assert.strictEqual(progress.total, 1)
+    assert.strictEqual(progress.archived, 1)
+  })
+})
+
+describe('opMode dispatch and run state', () => {
+  it('routes each opMode to its per-tab orchestrator', async () => {
+    const { sandbox } = setupEnvironment()
+    const called = []
+    for (const name of [
+      'processTab',
+      'processSuggestionsForTab',
+      'processRemoveSuggestionsForTab',
+      'processExportSuggestionsForTab',
+      'processBatchAgentForTab'
+    ]) {
+      sandbox[name] = async () => {
+        called.push(name)
+        return 1
+      }
+    }
+    const tabs = [{ id: 1, url: 'https://jules.google.com/u/0/' }]
+    for (const opMode of ['archive', 'suggestions', 'remove_suggestions', 'export_suggestions', 'agent_batch']) {
+      await sandbox.test_processAllTabs(tabs, { opMode })
+    }
+    assert.deepStrictEqual(called, [
+      'processTab',
+      'processSuggestionsForTab',
+      'processRemoveSuggestionsForTab',
+      'processExportSuggestionsForTab',
+      'processBatchAgentForTab'
+    ])
+  })
+
+  it('initOperationState maps __ALL__ to no filter and records the run options', () => {
+    const { sandbox } = setupEnvironment()
+    const options = { opMode: 'remove_suggestions', dryRun: false, repoFilter: '__ALL__' }
+    sandbox.test_initOperationState(options)
+    assert.strictEqual(options.repoFilter, '')
+    const state = sandbox.test_state()
+    assert.strictEqual(state.options.opMode, 'remove_suggestions')
+    assert.ok(state.log.includes('=== REMOVE SUGGESTIONS MODE ==='))
+  })
+
+  it('getAllSourceNames returns sorted owner/repo names for the repo picker', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.getJulesTabs = async () => [{ id: 7, url: 'https://jules.google.com/u/0/' }]
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl', fsid: 'f', accountNum: '0' })
+    sandbox.listAllSources = async () => ['github/z/last', 'github/a/first']
+    assert.deepStrictEqual(Array.from(await sandbox.getAllSourceNames()), ['a/first', 'z/last'])
+  })
+
+  it('getAllSourceNames merges the repos of every signed-in account', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 7, url: 'https://jules.google.com/u/0/' },
+      { id: 8, url: 'https://jules.google.com/u/0/repo/x' },
+      { id: 9, url: 'https://jules.google.com/u/1/' }
+    ]
+    sandbox.getTabConfig = async (tabId) => ({ at: 'at', bl: 'bl', fsid: 'f', accountNum: tabId === 9 ? '1' : '0' })
+    const queried = []
+    sandbox.listAllSources = async (config) => {
+      queried.push(config.accountNum)
+      return config.accountNum === '1' ? ['github/b/second', 'github/a/first'] : ['github/a/first', 'github/z/last']
+    }
+
+    assert.deepStrictEqual(Array.from(await sandbox.getAllSourceNames()), ['a/first', 'b/second', 'z/last'])
+    assert.deepStrictEqual(queried.sort(), ['0', '1'], 'one lookup per account, not per tab')
+  })
+
+  it('getAllSourceNames keeps the accounts that answered when one fails', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 7, url: 'https://jules.google.com/u/0/' },
+      { id: 9, url: 'https://jules.google.com/u/1/' }
+    ]
+    sandbox.getTabConfig = async (tabId) => ({ at: 'at', bl: 'bl', fsid: 'f', accountNum: tabId === 9 ? '1' : '0' })
+    sandbox.listAllSources = async (config) => {
+      if (config.accountNum === '1') throw new Error('HTTP 401')
+      return ['github/a/first']
+    }
+
+    assert.deepStrictEqual(Array.from(await sandbox.getAllSourceNames()), ['a/first'])
+  })
+})
+
+describe('stale XSRF token recovery (HTTP 400)', () => {
+  const CONFIG = () => ({ at: 'STALE:1', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+  const OK_BODY = (rpcId) => `)]}'\n\n60\n[["wrb.fr","${rpcId}","[[\\"ok\\"]]",null,null,null,"generic"]]`
+  // Shape captured live: a rejected token answers 400 with an "er" envelope;
+  // when Jules can mint a replacement it is carried as ["xsrf","<token>"].
+  const XSRF_BODY = (token) =>
+    `)]}'\n\n120\n[["er",null,null,null,null,400,null,null,null,3,[{"48448350":["xsrf","${token}"]}]]]`
+  const NO_TOKEN_BODY = `)]}'\n\n60\n[["er",null,null,null,null,400,null,null,null,3]]`
+
+  function scriptedFetch(sandbox, responses) {
+    const calls = []
+    sandbox.fetch = async (url, opts) => {
+      const body = new URLSearchParams(opts.body)
+      calls.push({ rpcId: new URL(url).searchParams.get('rpcids'), at: body.get('at') })
+      const { status, text } = responses[Math.min(calls.length - 1, responses.length - 1)]
+      return { ok: status >= 200 && status < 300, status, text: async () => text }
+    }
+    return calls
+  }
+
+  it('retries once with the fresh token carried in the 400 body', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [
+      { status: 400, text: XSRF_BODY('FRESH:2') },
+      { status: 200, text: OK_BODY('p1Takd') }
+    ])
+    const config = CONFIG()
+    const result = await sandbox.test_callBatchExecute('p1Takd', ['', 4], config)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(result)), [['ok']])
+    assert.deepStrictEqual(
+      calls.map((c) => c.at),
+      ['STALE:1', 'FRESH:2']
+    )
+    assert.strictEqual(config.at, 'FRESH:2', 'later calls in the run reuse the fresh token')
+  })
+
+  it('mints a token with a read-only KQOO7 probe when the 400 body carries none', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [
+      { status: 400, text: NO_TOKEN_BODY },
+      { status: 400, text: XSRF_BODY('FRESH:3') },
+      { status: 200, text: OK_BODY('Tjmm5c') }
+    ])
+    const config = CONFIG()
+    await sandbox.test_callBatchExecute('Tjmm5c', [['t1'], 1], config)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(calls)), [
+      { rpcId: 'Tjmm5c', at: 'STALE:1' },
+      { rpcId: 'KQOO7', at: '' },
+      { rpcId: 'Tjmm5c', at: 'FRESH:3' }
+    ])
+  })
+
+  it('gives up after a single refresh', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [{ status: 400, text: XSRF_BODY('FRESH:4') }])
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', ['', 4], CONFIG()), /HTTP 400/)
+    assert.strictEqual(calls.length, 2)
+  })
+
+  it('does not touch the token on non-400 failures', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [{ status: 500, text: 'oops' }])
+    const config = CONFIG()
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', ['', 4], config), /HTTP 500/)
+    assert.strictEqual(calls.length, 1)
+    assert.strictEqual(config.at, 'STALE:1')
+  })
+})
+
+describe('ListTasks timeout', () => {
+  it('gives p1Takd a long timeout (multi-minute, 100MB+ responses on big accounts)', async () => {
+    const { sandbox } = setupEnvironment()
+    const timeouts = []
+    sandbox.jFetch = async (url, opts) => {
+      timeouts.push({ rpcId: new URL(url).searchParams.get('rpcids'), timeout: opts.timeout })
+      return { ok: true, status: 200, text: async () => ")]}'\n\n4\n[[]]" }
+    }
+    await sandbox.test_listTasks('', { at: 'a', bl: 'b', fsid: 'f', accountNum: '0' })
+    assert.strictEqual(timeouts[0].rpcId, 'p1Takd')
+    assert.ok(timeouts[0].timeout >= 180000, `p1Takd timeout was ${timeouts[0].timeout}`)
   })
 })

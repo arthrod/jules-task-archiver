@@ -1,3 +1,4 @@
+<!-- // Modified by tommyzed: Updated popup UI and footer -->
 <!doctype html>
 <html lang="en">
   <head>
@@ -19,7 +20,10 @@
           <legend id="opModeLabel">Operation</legend>
           <div class="segmented" id="opMode">
             <button type="button" data-value="archive" class="active" aria-pressed="true">Archive Tasks</button>
-            <button type="button" data-value="suggestions" aria-pressed="false">Start Suggestions</button>
+            <button type="button" data-value="suggestions" aria-pressed="false">Start (Separate)</button>
+            <button type="button" data-value="agent_batch" aria-pressed="false">Batch to 1 Agent</button>
+            <button type="button" data-value="remove_suggestions" aria-pressed="false">Remove</button>
+            <button type="button" data-value="export_suggestions" aria-pressed="false">Export JSON</button>
           </div>
         </fieldset>
       </div>
@@ -47,6 +51,25 @@
             <label><input type="radio" name="scope" value="all" checked /> All Jules tabs</label>
           </div>
         </fieldset>
+      </div>
+      <div class="setting-row">
+        <label for="repoFilter">Repository</label>
+        <span class="hint block-hint" id="repoFilterHint">(select from list or type owner/repo below)</span>
+        <select id="repoFilter" aria-describedby="repoFilterHint">
+          <option value="" selected>All Repositories</option>
+        </select>
+        <input
+          type="text"
+          id="customRepoInput"
+          class="custom-repo-input"
+          placeholder="Or enter owner/repo"
+          spellcheck="false"
+          autocomplete="off"
+          aria-label="Custom repository (owner/repo)"
+          aria-describedby="repoFilterHint"
+          maxlength="140"
+          pattern="[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+"
+        />
       </div>
     </section>
 
@@ -121,6 +144,7 @@
 
     <button type="submit" id="startBtn" class="primary">Start Archiving</button>
     <button type="button" id="resetBtn" class="secondary hidden">Reset</button>
+    <button type="button" id="downloadBtn" class="primary download-btn hidden">⬇ Download Suggestions JSON</button>
     </form>
 
     <section id="progressSection" class="hidden">
@@ -137,6 +161,10 @@
       <h2>Summary</h2>
       <div id="summary" class="summary" aria-live="polite"></div>
     </section>
+
+    <footer>
+      <a href="license.html" target="_blank" rel="noopener noreferrer" class="footer-link">License &amp; Credits</a>
+    </footer>
 
     <script src="popup.js"></script>
   </body>

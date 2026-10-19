@@ -1,3 +1,4 @@
+// Modified by tommyzed: Added repository selector and suggestions
 /**
  * Jules Task Archiver — Popup Script
  *
@@ -17,8 +18,11 @@ const mainForm = $('#mainForm')
 const ghOwnerInput = $('#ghOwner')
 const ghTokenInput = $('#ghToken')
 const forceCheckbox = $('#force')
+const repoFilterInput = $('#repoFilter')
+const customRepoInput = $('#customRepoInput')
 const startBtn = $('#startBtn')
 const resetBtn = $('#resetBtn')
+const downloadBtn = $('#downloadBtn')
 const progressSection = $('#progressSection')
 const summarySection = $('#summarySection')
 const currentInfo = $('#currentInfo')
@@ -46,12 +50,31 @@ let opMode = 'archive'
 function getRunningText() {
   const modeRadio = document.querySelector('input[name="mode"]:checked')
   const isDry = modeRadio && modeRadio.value === 'dry'
-  const isArchive = opMode === 'archive'
 
-  if (isArchive) {
+  if (opMode === 'archive') {
     return isDry ? '⏳ Dry Running Archive...' : '⏳ Running Archive...'
+  } else if (opMode === 'remove_suggestions') {
+    return isDry ? '⏳ Dry Running Remove Suggestions...' : '⏳ Running Remove Suggestions...'
+  } else if (opMode === 'export_suggestions') {
+    return '⏳ Exporting Suggestions to JSON...'
+  } else if (opMode === 'agent_batch') {
+    return isDry ? '⏳ Dry Running Batch Agent...' : '⏳ Launching Single Agent for All Suggestions...'
   } else {
     return isDry ? '⏳ Dry Running Suggestions...' : '⏳ Running Suggestions...'
+  }
+}
+
+function getStartButtonText(value, isDry) {
+  if (value === 'archive') {
+    return isDry ? 'Dry Run Archive' : 'Start Archiving'
+  } else if (value === 'remove_suggestions') {
+    return isDry ? 'Dry Run Remove Suggestions' : 'Remove Suggestions'
+  } else if (value === 'export_suggestions') {
+    return 'Export Suggestions JSON'
+  } else if (value === 'agent_batch') {
+    return isDry ? 'Dry Run Batch Agent' : 'Launch Batch Agent'
+  } else {
+    return isDry ? 'Dry Run Suggestions' : 'Start Suggestions'
   }
 }
 
@@ -84,11 +107,7 @@ function updateOpModeUI(value) {
   if (!startBtn.disabled) {
     const modeRadio = document.querySelector('input[name="mode"]:checked')
     const isDry = modeRadio && modeRadio.value === 'dry'
-    if (isArchive) {
-      startBtn.textContent = isDry ? 'Dry Run Archive' : 'Start Archiving'
-    } else {
-      startBtn.textContent = isDry ? 'Dry Run Suggestions' : 'Start Suggestions'
-    }
+    startBtn.textContent = getStartButtonText(value, isDry)
   }
 }
 
@@ -162,6 +181,64 @@ schedMaxStartsInput.addEventListener('change', () => {
   chrome.storage.sync.set({ schedMaxStarts: maxStarts })
 })
 
+// --- Repository picker ---
+// Option 0 ("All Repositories", value '') stays; connected repos follow it.
+function applyCodebases(codebases) {
+  const currentValue = repoFilterInput.value
+
+  while (repoFilterInput.options.length > 1) {
+    repoFilterInput.remove(1)
+  }
+
+  for (const cb of codebases) {
+    const opt = document.createElement('option')
+    opt.value = cb
+    opt.textContent = cb
+    repoFilterInput.appendChild(opt)
+  }
+
+  if (currentValue) {
+    repoFilterInput.value = currentValue
+  }
+}
+
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 1000
+
+function populateCodebases(attempt = 0) {
+  // Ask the background for every connected source via the Jules API first
+  chrome.runtime.sendMessage({ action: 'GET_ALL_SOURCES' }, (bgResp) => {
+    if (bgResp?.repos && bgResp.repos.length > 0) {
+      applyCodebases(bgResp.repos)
+      return
+    }
+
+    // Fallback: scrape the codebases list from the active Jules page
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (!tab?.id) return
+      chrome.tabs.sendMessage(tab.id, { action: 'GET_CODEBASES' }, (response) => {
+        if (chrome.runtime.lastError || !response?.codebases?.length) {
+          if (attempt < MAX_RETRIES) {
+            setTimeout(() => populateCodebases(attempt + 1), RETRY_DELAY_MS)
+          }
+          return
+        }
+        applyCodebases(response.codebases)
+      })
+    })
+  })
+}
+
+populateCodebases()
+
+// The dropdown and the free-text owner/repo box are mutually exclusive.
+repoFilterInput.addEventListener('change', () => {
+  if (repoFilterInput.value) customRepoInput.value = ''
+})
+customRepoInput.addEventListener('input', () => {
+  if (customRepoInput.value.trim()) repoFilterInput.value = ''
+})
+
 // --- Start operation ---
 mainForm.addEventListener('submit', async (e) => {
   e.preventDefault()
@@ -202,7 +279,8 @@ mainForm.addEventListener('submit', async (e) => {
     force: forceCheckbox.checked,
     scope,
     activeTabId,
-    opMode
+    opMode,
+    repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim()
   }
 
   // Reset UI
@@ -210,6 +288,9 @@ mainForm.addEventListener('submit', async (e) => {
   startBtn.setAttribute('aria-busy', 'true')
   startBtn.textContent = getRunningText()
   resetBtn.classList.add('hidden')
+  // A previous Export JSON result belongs to that run only.
+  downloadBtn.classList.add('hidden')
+  lastExportData = null
   progressSection.classList.remove('hidden')
   summarySection.classList.add('hidden')
   currentInfo.textContent = 'Starting...'
@@ -227,6 +308,7 @@ resetBtn.addEventListener('click', () => {
   startBtn.removeAttribute('aria-busy')
   updateOpModeUI(opMode)
   resetBtn.classList.add('hidden')
+  downloadBtn.classList.add('hidden')
   progressSection.classList.add('hidden')
   summarySection.classList.add('hidden')
   // Move focus back to the primary action so keyboard users are not stranded
@@ -278,6 +360,11 @@ function renderState(state) {
     if (state.status === 'done') {
       currentInfo.textContent = 'Complete'
       renderSummary(state.results)
+      if (state.exportData) {
+        lastExportData = state.exportData
+        downloadBtn.classList.remove('hidden')
+        downloadBtn.textContent = `⬇ Download Suggestions JSON (${state.exportData.totalSuggestions || 0} found)`
+      }
     } else {
       currentInfo.textContent = `Error: ${state.error}`
       progressFill.style.background = '#f87171'
@@ -342,3 +429,31 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
     }
   }
 })
+
+// --- Export download (re-save; the background already saved one copy) ---
+let lastExportData = null
+
+downloadBtn.addEventListener('click', () => {
+  if (lastExportData) {
+    downloadExportedSuggestions(lastExportData)
+  }
+})
+
+function downloadExportedSuggestions(exportData) {
+  try {
+    const filename = `jules-suggestions-${new Date().toISOString().slice(0, 10)}.json`
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    setTimeout(() => {
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    }, 1000)
+  } catch (err) {
+    console.error('Failed to trigger JSON download:', err)
+  }
+}
