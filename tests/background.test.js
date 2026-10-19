@@ -7,8 +7,10 @@ const path = require('node:path')
 
 const bgScriptPath = path.join(__dirname, '..', 'background.js')
 const utilsScriptPath = path.join(__dirname, '..', 'utils.js')
+const itemsScriptPath = path.join(__dirname, '..', 'items.js')
 const bgScriptContent = fs.readFileSync(bgScriptPath, 'utf8')
 const utilsScriptContent = fs.readFileSync(utilsScriptPath, 'utf8')
+const itemsScriptContent = fs.readFileSync(itemsScriptPath, 'utf8')
 
 function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
   const sessionSetData = []
@@ -17,6 +19,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
   const storageChangeListeners = []
   const alarmListeners = []
   const alarmsStore = new Map()
+  const messageListeners = []
 
   const chromeMock = {
     storage: {
@@ -75,7 +78,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
       }
     },
     runtime: {
-      onMessage: { addListener: () => {} },
+      onMessage: { addListener: (cb) => messageListeners.push(cb) },
       getPlatformInfo: async () => ({})
     },
     webNavigation: {
@@ -136,6 +139,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
 
   const scriptContent =
     utilsScriptContent +
+    itemsScriptContent +
     bgScriptContent +
     `\n
     globalThis.test_stateReadyPromise = stateReadyPromise;
@@ -159,9 +163,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     globalThis.test_parseResponse = parseResponse;
     globalThis.test_parseTask = parseTask;
     globalThis.test_groupTasksByRepo = groupTasksByRepo;
-    globalThis.test_isArchivable = isArchivable;
     globalThis.test_TASK = TASK;
-    globalThis.test_ARCHIVABLE_STATES = ARCHIVABLE_STATES;
     globalThis.test_JULES_ORIGIN = JULES_ORIGIN;
     globalThis.test_getJulesTabs = getJulesTabs;
     globalThis.test_extractAccountNum = extractAccountNum;
@@ -211,11 +213,11 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     globalThis.test_SCHEDULE_ALARM_NAME = SCHEDULE_ALARM_NAME;
     globalThis.test_DEFAULT_SCHEDULE = DEFAULT_SCHEDULE;
     globalThis.test_RJA83D = RJA83D;
-    globalThis.test_TASK_STATE = TASK_STATE;
+    globalThis.test_TASK_STATES = TASK_STATES;
     globalThis.test_INTERACT_EXPERIMENT_IDS = INTERACT_EXPERIMENT_IDS;
     globalThis.test_DEFAULT_CONTINUE_MESSAGE = DEFAULT_CONTINUE_MESSAGE;
     globalThis.test_DEFAULT_ERROR_CONTINUE_MESSAGE = DEFAULT_ERROR_CONTINUE_MESSAGE;
-    globalThis.test_MAX_CONTINUE_MESSAGE_LEN = MAX_CONTINUE_MESSAGE_LEN;
+    globalThis.test_MAX_MESSAGE_LEN = MAX_MESSAGE_LEN;
   `
 
   const script = new vm.Script(scriptContent, { filename: bgScriptPath })
@@ -226,6 +228,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     sessionSetData,
     alarmsStore,
     alarmListeners,
+    messageListeners,
     storageChangeListeners,
     getSyncStorage: () => syncStorage
   }
@@ -751,33 +754,7 @@ describe('parseTask', () => {
   })
 })
 
-describe('isArchivable', () => {
-  // State codes verified 2026-06-04 against 725 real tasks from the live
-  // batchexecute API. Terminal/finished states observed: 2, 4, 12, and null.
-  it('should return true for terminal task states (2, 4, 12)', () => {
-    const { sandbox } = setupEnvironment()
-    assert.strictEqual(sandbox.test_isArchivable({ state: 2 }), true)
-    assert.strictEqual(sandbox.test_isArchivable({ state: 4 }), true)
-    assert.strictEqual(sandbox.test_isArchivable({ state: 12 }), true)
-  })
-
-  it('should return true for null/undefined state (completed task variant)', () => {
-    const { sandbox } = setupEnvironment()
-    assert.strictEqual(sandbox.test_isArchivable({ state: null }), true)
-    assert.strictEqual(sandbox.test_isArchivable({ state: undefined }), true)
-  })
-
-  it('should return false for non-terminal / unknown states', () => {
-    const { sandbox } = setupEnvironment()
-    assert.strictEqual(sandbox.test_isArchivable({ state: 1 }), false)
-    assert.strictEqual(sandbox.test_isArchivable({ state: 5 }), false)
-    // Legacy reverse-engineered codes {3,9} are no longer emitted by Jules.
-    assert.strictEqual(sandbox.test_isArchivable({ state: 3 }), false)
-    assert.strictEqual(sandbox.test_isArchivable({ state: 9 }), false)
-  })
-})
-
-describe('processTab force vs default archiving', () => {
+describe('processTab archives the chosen item', () => {
   const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
 
   function setupArchiveEnv(tasks) {
@@ -792,55 +769,80 @@ describe('processTab force vs default archiving', () => {
     return { sandbox, archived }
   }
 
-  it('FORCE archives every task even when none are in a terminal state', async () => {
-    // Regression for the original bug: with real Jules state codes, the legacy
-    // {3,9} allowlist matched 0 tasks, so the candidates list was empty and
-    // Force archived nothing. Force must be independent of the state filter.
-    const tasks = [
-      { id: 'a', title: 'T1', state: 7, source: 'github/o/r' },
-      { id: 'b', title: 'T2', state: 99, source: 'github/o/r' }
-    ]
+  const tasks = [
+    { id: 'waiting', title: 'T', state: 12, source: 'github/o/r' },
+    { id: 'running', title: 'T', state: 2, source: 'github/o/r' },
+    { id: 'done', title: 'T', state: 3, source: 'github/o/r' },
+    { id: 'done7', title: 'T', state: 7, source: 'github/o/r' },
+    { id: 'nostate', title: 'T', state: null, source: 'github/o/r' },
+    { id: 'new', title: 'T', state: 99, source: 'github/o/r' }
+  ]
+
+  it('archives only the tasks in the chosen state', async () => {
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    await sandbox.processTab(TAB, { force: true, dryRun: false })
-    assert.deepStrictEqual(archived.sort(), ['a', 'b'])
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('Waiting on You (12)'), dryRun: false })
+    assert.deepStrictEqual(archived, ['waiting'])
   })
 
-  it('FORCE archives real terminal-state tasks (2, 4, 12, null)', async () => {
-    const tasks = [
-      { id: 'a', title: 'T', state: 12, source: 'github/o/r' },
-      { id: 'b', title: 'T', state: null, source: 'github/o/r' },
-      { id: 'c', title: 'T', state: 4, source: 'github/o/r' },
-      { id: 'd', title: 'T', state: 2, source: 'github/o/r' }
-    ]
+  it('archives every task for All, whatever its state', async () => {
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    await sandbox.processTab(TAB, { force: true, dryRun: false })
-    assert.strictEqual(archived.length, 4)
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('All'), dryRun: false })
+    assert.deepStrictEqual(archived.sort(), ['done', 'done7', 'new', 'nostate', 'running', 'waiting'])
   })
 
-  it('default mode archives terminal tasks and skips non-terminal ones', async () => {
-    const tasks = [
-      { id: 'term', title: 'Done', state: 12, source: 'github/o/r' },
-      { id: 'run', title: 'Running', state: 1, source: 'github/o/r' }
-    ]
+  it('archives only finished tasks (3, 7 and no state) for Completed', async () => {
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    await sandbox.processTab(TAB, { force: false, dryRun: false })
-    assert.deepStrictEqual(archived, ['term'])
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('Completed'), dryRun: false })
+    assert.deepStrictEqual(archived.sort(), ['done', 'done7', 'nostate'])
   })
 
-  it('default mode skips a terminal task with a matching open PR', async () => {
-    const tasks = [{ id: 'x', title: 'Fix the bug', state: 12, source: 'github/o/r', owner: 'o', repoName: 'r' }]
+  it('refuses to archive when no item is given', async () => {
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    sandbox.getOpenPRs = async () => [{ title: 'Fix the bug', titleLower: 'fix the bug', branch: 'b' }]
-    await sandbox.processTab(TAB, { force: false, dryRun: false })
+    await assert.rejects(sandbox.processTab(TAB, { dryRun: false }), /Archive needs an item/)
     assert.deepStrictEqual(archived, [])
   })
 
-  it('FORCE archives a terminal task even when it has a matching open PR', async () => {
-    const tasks = [{ id: 'x', title: 'Fix the bug', state: 12, source: 'github/o/r', owner: 'o', repoName: 'r' }]
-    const { sandbox, archived } = setupArchiveEnv(tasks)
+  it('logs how many tasks match the item, per state', async () => {
+    const { sandbox } = setupArchiveEnv(tasks)
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('Completed'), dryRun: true })
+    const log = sandbox.test_state().log
+    assert.ok(log.some((l) => l.includes('6 tasks, 3 match "Completed": 2 Completed (3), 1 Completed (7)')))
+  })
+
+  it('skips a task with a matching open PR', async () => {
+    const prTask = { id: 'x', title: 'Fix the bug', state: 12, source: 'github/o/r', owner: 'o', repoName: 'r' }
+    const { sandbox, archived } = setupArchiveEnv([prTask])
     sandbox.getOpenPRs = async () => [{ title: 'Fix the bug', titleLower: 'fix the bug', branch: 'b' }]
-    await sandbox.processTab(TAB, { force: true, dryRun: false })
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('All'), dryRun: false })
+    assert.deepStrictEqual(archived, [])
+  })
+
+  it('Force archives a task even when it has a matching open PR', async () => {
+    const prTask = { id: 'x', title: 'Fix the bug', state: 12, source: 'github/o/r', owner: 'o', repoName: 'r' }
+    const { sandbox, archived } = setupArchiveEnv([prTask])
+    let prChecks = 0
+    sandbox.getOpenPRs = async () => {
+      prChecks++
+      return [{ title: 'Fix the bug', titleLower: 'fix the bug', branch: 'b' }]
+    }
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('All'), force: true, dryRun: false })
     assert.deepStrictEqual(archived, ['x'])
+    assert.strictEqual(prChecks, 0, 'Force skips the PR lookup entirely')
+  })
+
+  it('Force does not widen the chosen item', async () => {
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('Error (4)'), force: true, dryRun: false })
+    assert.deepStrictEqual(archived, [])
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Nothing to archive.')))
+  })
+
+  it('a dry run lists the tasks and archives nothing', async () => {
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    const count = await sandbox.processTab(TAB, { item: sandbox.resolveItem('In Progress (2)'), dryRun: true })
+    assert.strictEqual(count, 0)
+    assert.deepStrictEqual(archived, [])
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('DRY RUN - would archive 1 tasks')))
   })
 })
 
@@ -1637,7 +1639,7 @@ describe('startOperation refactoring', () => {
 
   it('startOperation should orchestrate successfully', async () => {
     const { sandbox } = setupEnvironment()
-    const options = { opMode: 'archive' }
+    const options = { action: 'archive', item: 'Completed' }
 
     // Mock helpers
     sandbox.chrome.tabs.query = async () => [{ id: 1, url: 'https://jules.google.com/u/0/session' }]
@@ -2652,7 +2654,12 @@ describe('processTab repository filtering', () => {
       { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/add-to-calendar', repo: 'tommyzed/add-to-calendar' }
     ]
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'tommyzed/adventures' })
+    await sandbox.processTab(TAB, {
+      item: sandbox.resolveItem('All'),
+      force: true,
+      dryRun: false,
+      repoFilter: 'tommyzed/adventures'
+    })
     assert.deepStrictEqual(archived, ['a'])
   })
 
@@ -2663,7 +2670,12 @@ describe('processTab repository filtering', () => {
       { id: 'c', title: 'T3', state: 12, source: 'github/not-tommyzed/adventures', repo: 'not-tommyzed/adventures' }
     ]
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'TommyZed/Adventures' })
+    await sandbox.processTab(TAB, {
+      item: sandbox.resolveItem('All'),
+      force: true,
+      dryRun: false,
+      repoFilter: 'TommyZed/Adventures'
+    })
     assert.deepStrictEqual(archived, ['a'], 'adventures-2 and not-tommyzed/adventures must not be archived')
   })
 
@@ -2672,7 +2684,12 @@ describe('processTab repository filtering', () => {
       { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/add-to-calendar', repo: 'tommyzed/add-to-calendar' }
     ]
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    const result = await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'Calendar' })
+    const result = await sandbox.processTab(TAB, {
+      item: sandbox.resolveItem('All'),
+      force: true,
+      dryRun: false,
+      repoFilter: 'Calendar'
+    })
     assert.strictEqual(result, 0)
     assert.deepStrictEqual(archived, [])
   })
@@ -2682,14 +2699,19 @@ describe('processTab repository filtering', () => {
       { id: 'a', title: 'T1', state: 12, source: 'github/tommyzed/adventures', repo: 'tommyzed/adventures' }
     ]
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    const result = await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'other-repo' })
+    const result = await sandbox.processTab(TAB, {
+      item: sandbox.resolveItem('All'),
+      force: true,
+      dryRun: false,
+      repoFilter: 'other-repo'
+    })
     assert.strictEqual(result, 0)
     assert.strictEqual(archived.length, 0)
     const state = sandbox.test_state()
-    assert.ok(state.log.some((l) => l.includes('No matching tasks found. Nothing to do.')))
+    assert.ok(state.log.some((l) => l.includes('Nothing to archive.')))
   })
 
-  it('keeps the state filter and PR check when a repoFilter is set (no implicit force)', async () => {
+  it('keeps the item filter and PR check when a repoFilter is set (no implicit force)', async () => {
     const tasks = [
       { id: 'done', title: 'Finished', state: 12, source: 'github/o/r', repo: 'o/r', owner: 'o', repoName: 'r' },
       { id: 'busy', title: 'Running', state: 1, source: 'github/o/r', repo: 'o/r', owner: 'o', repoName: 'r' },
@@ -2697,7 +2719,12 @@ describe('processTab repository filtering', () => {
     ]
     const { sandbox, archived } = setupArchiveEnv(tasks)
     sandbox.getOpenPRs = async () => [{ title: 'Has PR', titleLower: 'has pr', branch: 'b' }]
-    await sandbox.processTab(TAB, { force: false, dryRun: false, repoFilter: 'o/r' })
+    await sandbox.processTab(TAB, {
+      item: sandbox.resolveItem('Waiting on You (12)'),
+      force: false,
+      dryRun: false,
+      repoFilter: 'o/r'
+    })
     assert.deepStrictEqual(archived, ['done'], 'running task and task with an open PR must survive')
   })
 })
@@ -3194,7 +3221,7 @@ describe('ListTasks timeout', () => {
   })
 })
 
-describe('continue waiting tasks', () => {
+describe('proceed', () => {
   const TAB = { id: 1, url: 'https://jules.google.com/u/1/' }
   const UUID_REGEX = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/
 
@@ -3210,7 +3237,7 @@ describe('continue waiting tasks', () => {
 
   // GetTask (n74qPd) returns the session with its activity log at [0][3];
   // the last entry is what the Jules UI threads its reply onto.
-  function setupContinueEnv(
+  function setupProceedEnv(
     tasks,
     { activities = {}, failInteract = new Set(), quota = [0, [86400], 100], interactError = 'HTTP 500' } = {}
   ) {
@@ -3236,326 +3263,548 @@ describe('continue waiting tasks', () => {
       }
       return []
     }
-    const interactCalls = () => calls.filter((c) => c.rpcId === 'SLmX6')
-    return { sandbox, calls, interactCalls }
+    const sent = (rpcId) => calls.filter((c) => c.rpcId === rpcId)
+    const writes = () => calls.filter((c) => c.rpcId === 'SLmX6' || c.rpcId === 'wk4vKd')
+    const log = () => sandbox.test_state().log
+    return { sandbox, calls, sent, writes, log }
   }
 
-  describe('getWaitingKind', () => {
-    it('maps Jules state 12 to a reply and 10 to a plan approval', () => {
+  describe('planProceed', () => {
+    const plan = (sandbox, t, itemText = 'All', options = {}) =>
+      JSON.parse(JSON.stringify(sandbox.planProceed(t, sandbox.resolveItem(itemText), options)))
+
+    it('replies to a task waiting on you with the default reply, and appends the message to it', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(sandbox.getWaitingKind({ state: 12 }), 'feedback')
-      assert.strictEqual(sandbox.getWaitingKind({ state: 10 }), 'plan')
+      const DEFAULT = sandbox.test_DEFAULT_CONTINUE_MESSAGE
+      assert.deepStrictEqual(plan(sandbox, task('a', 12)), { action: 'reply', message: DEFAULT })
+      assert.strictEqual(
+        plan(sandbox, task('a', 12), 'All', { message: ' Go on ' }).message,
+        `${DEFAULT}\n\n## Additional instructions\n\nGo on\n`
+      )
+      assert.strictEqual(
+        plan(sandbox, task('a', 12), 'All', { defaultReply: 'Custom default' }).message,
+        'Custom default'
+      )
+      assert.strictEqual(
+        plan(sandbox, task('a', 12), 'All', { defaultReply: 'Custom default', message: 'Go on' }).message,
+        'Custom default\n\n## Additional instructions\n\nGo on\n'
+      )
     })
 
-    it('maps Jules state 4 (Error) to a retry', () => {
+    it('approves a pending plan, and skips one without a plan id', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(sandbox.getWaitingKind({ state: 4 }), 'error')
+      assert.deepStrictEqual(plan(sandbox, task('p', 10, { planId: 'p1' })), { action: 'approve' })
+      assert.deepStrictEqual(plan(sandbox, task('p', 10)), { skip: 'no plan to approve' })
     })
 
-    it('leaves running, finished and paused tasks alone', () => {
+    it('resumes a paused session', () => {
       const { sandbox } = setupEnvironment()
-      for (const state of [1, 2, 3, 7, 8, 9, 11, null, undefined]) {
-        assert.strictEqual(sandbox.getWaitingKind({ state }), null, `state ${state}`)
+      assert.deepStrictEqual(plan(sandbox, task('z', 8)), { action: 'resume' })
+    })
+
+    it('retries a failed session with the retry prompt, counting against the quota', () => {
+      const { sandbox } = setupEnvironment()
+      assert.deepStrictEqual(plan(sandbox, task('e', 4)), {
+        action: 'retry',
+        message: sandbox.test_DEFAULT_ERROR_CONTINUE_MESSAGE,
+        usesQuota: true
+      })
+      assert.strictEqual(
+        plan(sandbox, task('e', 4), 'All', { message: 'Skip the flaky test' }).message,
+        `${sandbox.test_DEFAULT_ERROR_CONTINUE_MESSAGE}\n\n## Additional instructions\n\nSkip the flaky test\n`
+      )
+      assert.strictEqual(plan(sandbox, task('e', 4), 'All', { defaultRetry: 'Retry it' }).message, 'Retry it')
+    })
+
+    it('leaves running sessions alone unless there is a message to send', () => {
+      const { sandbox } = setupEnvironment()
+      for (const state of [1, 2, 9, 11]) {
+        assert.deepStrictEqual(plan(sandbox, task('r', state)), {
+          skip: 'already running (add a message to send one)'
+        })
+        assert.deepStrictEqual(plan(sandbox, task('r', state), 'All', { message: 'Also do X' }), {
+          action: 'reply',
+          message: 'Also do X'
+        })
+      }
+    })
+
+    it('under All, skips completed tasks unless Force is on', () => {
+      const { sandbox } = setupEnvironment()
+      for (const state of [3, 7, null]) {
+        assert.deepStrictEqual(plan(sandbox, task('c', state), 'All', { message: 'More' }), {
+          skip: 'completed (Proceed on All skips them unless Force is on)'
+        })
+        assert.deepStrictEqual(plan(sandbox, task('c', state), 'All', { message: 'More', force: true }), {
+          action: 'followUp',
+          message: 'More',
+          usesQuota: true
+        })
+      }
+    })
+
+    it('sends a follow-up to a completed task only when there is a message', () => {
+      const { sandbox } = setupEnvironment()
+      assert.deepStrictEqual(plan(sandbox, task('c', 3), 'Completed (3)'), {
+        skip: 'completed (a follow-up needs a message)'
+      })
+      assert.deepStrictEqual(plan(sandbox, task('c', 3), 'All', { force: true }), {
+        skip: 'completed (a follow-up needs a message)'
+      })
+      assert.deepStrictEqual(plan(sandbox, task('c', 7), 'Completed', { message: 'Add tests' }), {
+        action: 'followUp',
+        message: 'Add tests',
+        usesQuota: true
+      })
+    })
+
+    it('treats unknown and unmapped states like running ones', () => {
+      const { sandbox } = setupEnvironment()
+      for (const state of [0, 99]) {
+        assert.deepStrictEqual(plan(sandbox, task('u', state)), { skip: 'unknown state' })
+        assert.deepStrictEqual(plan(sandbox, task('u', state), 'All', { message: 'Hi' }), {
+          action: 'reply',
+          message: 'Hi'
+        })
       }
     })
   })
 
-  describe('parseTask plan id', () => {
-    it('reads the current plan id from row[10][0]', () => {
+  describe('planProceedWork', () => {
+    it('orders the work so quota goes to the most useful tasks first', () => {
       const { sandbox } = setupEnvironment()
-      const raw = new Array(31).fill(null)
-      raw[0] = '1'
-      raw[5] = 10
-      raw[10] = ['plan-abc', [['step-1', 'Read the code']]]
-      assert.strictEqual(sandbox.test_parseTask(raw).planId, 'plan-abc')
+      const tasks = [
+        task('done', 3),
+        task('err', 4),
+        task('run', 2),
+        task('paused', 8),
+        task('plan', 10, { planId: 'p' }),
+        task('fb', 12)
+      ]
+      const { work } = sandbox.planProceedWork(tasks, sandbox.resolveItem('All'), { message: 'Go', force: true })
+      assert.deepStrictEqual(
+        Array.from(work, (w) => w.task.id),
+        ['fb', 'plan', 'paused', 'run', 'err', 'done']
+      )
     })
 
-    it('is null when the task has no plan yet', () => {
+    it('counts the skipped tasks per reason', () => {
       const { sandbox } = setupEnvironment()
-      const raw = new Array(31).fill(null)
-      raw[0] = '1'
-      assert.strictEqual(sandbox.test_parseTask(raw).planId, null)
+      const tasks = [task('a', 3), task('b', 3), task('c', 2)]
+      const { work, skipped } = sandbox.planProceedWork(tasks, sandbox.resolveItem('All'), {})
+      assert.strictEqual(work.length, 0)
+      assert.deepStrictEqual(Object.fromEntries(skipped), {
+        'completed (Proceed on All skips them unless Force is on)': 2,
+        'already running (add a message to send one)': 1
+      })
     })
   })
 
   describe('buildInteractPayload', () => {
     it('builds the reply exactly as the Jules UI sends it', () => {
       const { sandbox } = setupEnvironment()
-      const payload = sandbox.buildInteractPayload(task('t1', 12), 'Keep going', 'act-9')
-      assert.strictEqual(payload.length, 4)
+      const payload = sandbox.buildInteractPayload(task('t1', 12), { action: 'reply', message: 'Go on' }, 'act-9')
       assert.strictEqual(payload[0], 't1')
-      const [planSlot, approvalSlot, message, activityId] = payload[1]
-      assert.strictEqual(planSlot, null)
-      assert.strictEqual(approvalSlot, null)
-      assert.strictEqual(message[0], 'Keep going')
-      assert.strictEqual(message[1], null)
-      assert.match(message[2], UUID_REGEX)
-      assert.strictEqual(activityId, 'act-9')
+      assert.strictEqual(payload[1][0], null)
+      assert.strictEqual(payload[1][1], null)
+      assert.strictEqual(payload[1][2][0], 'Go on')
+      assert.strictEqual(payload[1][2][1], null)
+      assert.match(payload[1][2][2], UUID_REGEX)
+      assert.strictEqual(payload[1][3], 'act-9')
       assert.strictEqual(payload[2], null)
       assert.deepStrictEqual(Array.from(payload[3][0]), Array.from(sandbox.test_INTERACT_EXPERIMENT_IDS))
     })
 
-    it('approves the plan for a task awaiting plan approval', () => {
+    it('approves a plan by its id and sends no text', () => {
       const { sandbox } = setupEnvironment()
-      const payload = sandbox.buildInteractPayload(task('t2', 10, { planId: 'plan-7' }), 'ignored', 'act-3')
-      assert.strictEqual(JSON.stringify(payload[1]), JSON.stringify([null, ['plan-7'], null, 'act-3']))
-    })
-
-    it('uses a fresh message id for every reply', () => {
-      const { sandbox } = setupEnvironment()
-      const a = sandbox.buildInteractPayload(task('t1', 12), 'x', 'act')
-      const b = sandbox.buildInteractPayload(task('t1', 12), 'x', 'act')
-      assert.notStrictEqual(a[1][2][2], b[1][2][2])
+      const payload = sandbox.buildInteractPayload(task('t2', 10, { planId: 'plan-7' }), { action: 'approve' }, 'act-1')
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(payload[1])), [null, ['plan-7'], null, 'act-1'])
     })
   })
 
-  describe('normalizeContinueMessage', () => {
-    it('falls back to the default message when none is given', () => {
-      const { sandbox } = setupEnvironment()
-      for (const value of [undefined, null, '', '   ', 42]) {
-        assert.strictEqual(sandbox.normalizeContinueMessage(value), sandbox.test_DEFAULT_CONTINUE_MESSAGE)
-      }
-    })
-
-    it('falls back to the given default for failed sessions', () => {
-      const { sandbox } = setupEnvironment()
-      const fallback = sandbox.test_DEFAULT_ERROR_CONTINUE_MESSAGE
-      assert.strictEqual(sandbox.normalizeContinueMessage('', fallback), fallback)
-      assert.strictEqual(sandbox.normalizeContinueMessage('x', fallback), 'x')
-    })
-
+  describe('normalizeMessage', () => {
     it('trims the message and caps its length', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(sandbox.normalizeContinueMessage('  go on  '), 'go on')
-      const long = 'a'.repeat(sandbox.test_MAX_CONTINUE_MESSAGE_LEN + 50)
-      assert.strictEqual(sandbox.normalizeContinueMessage(long).length, sandbox.test_MAX_CONTINUE_MESSAGE_LEN)
+      assert.strictEqual(sandbox.normalizeMessage('  hi  '), 'hi')
+      assert.strictEqual(sandbox.normalizeMessage('x'.repeat(5000)).length, sandbox.test_MAX_MESSAGE_LEN)
+      assert.strictEqual(sandbox.normalizeMessage(undefined), '')
+      assert.strictEqual(sandbox.normalizeMessage(42), '')
     })
   })
 
-  describe('processContinueForTab', () => {
-    it('dry run lists the waiting tasks without calling Jules', async () => {
+  describe('processProceedForTab', () => {
+    const run = (sandbox, itemText, options = {}) =>
+      sandbox.processProceedForTab(TAB, { item: sandbox.resolveItem(itemText), dryRun: false, ...options })
+
+    it('a dry run lists what it would do and sends nothing', async () => {
       const tasks = [
         task('fb', 12),
         task('plan', 10, { planId: 'p1' }),
         task('err', 4),
-        task('run', 2),
-        task('done', 3)
+        task('paused', 8),
+        task('run', 2)
       ]
-      const { sandbox, calls } = setupContinueEnv(tasks)
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: true })
+      const { sandbox, writes, sent, log } = setupProceedEnv(tasks)
+      const count = await run(sandbox, 'All', { dryRun: true })
 
       assert.strictEqual(count, 0)
-      assert.deepStrictEqual(calls, [])
-      const log = sandbox.test_state().log
-      assert.ok(log.some((l) => l.includes('1 awaiting your reply, 1 awaiting plan approval, 1 failed')))
-      assert.ok(log.some((l) => l.includes('[DRY] Would reply to [u/1] [fb] Task fb')))
-      assert.ok(log.some((l) => l.includes('[DRY] Would approve plan for [u/1] [plan] Task plan')))
-      assert.ok(log.some((l) => l.includes('[DRY] Would retry [u/1] [err] Task err')))
-      assert.ok(!log.some((l) => l.includes('[run]') || l.includes('[done]')))
+      assert.deepStrictEqual(writes(), [])
+      assert.deepStrictEqual(sent('n74qPd'), [])
+      assert.ok(log().some((l) => l.includes('[DRY] Would reply to [u/1] [fb] Task fb')))
+      assert.ok(log().some((l) => l.includes('[DRY] Would approve the plan of [u/1] [plan] Task plan')))
+      assert.ok(log().some((l) => l.includes('[DRY] Would retry [u/1] [err] Task err')))
+      assert.ok(log().some((l) => l.includes('[DRY] Would resume [u/1] [paused] Task paused')))
+      assert.ok(log().some((l) => l.includes('Skipping 1 task(s): already running (add a message to send one)')))
     })
 
-    it('replies to tasks awaiting feedback and approves pending plans', async () => {
-      const tasks = [task('fb', 12), task('plan', 10, { planId: 'p1' }), task('run', 2)]
-      const { sandbox, calls, interactCalls } = setupContinueEnv(tasks)
-      const count = await sandbox.processContinueForTab(TAB, {
-        opMode: 'continue_waiting',
-        dryRun: false,
-        continueMessage: 'Proceed'
-      })
+    it('replies, approves and resumes, each with the right call', async () => {
+      const tasks = [task('fb', 12), task('plan', 10, { planId: 'p1' }), task('paused', 8)]
+      const { sandbox, sent } = setupProceedEnv(tasks)
+      const count = await run(sandbox, 'All', { message: 'Proceed' })
 
-      assert.strictEqual(count, 2)
-      const sessionReads = calls.filter((c) => c.rpcId === 'n74qPd').map((c) => c.payload)
-      assert.deepStrictEqual(sessionReads.sort(), [
-        ['fb', 3],
-        ['plan', 3]
-      ])
-      const byTask = Object.fromEntries(interactCalls().map((c) => [c.payload[0], c.payload]))
+      assert.strictEqual(count, 3)
+      const byTask = Object.fromEntries(sent('SLmX6').map((c) => [c.payload[0], c.payload]))
       assert.deepStrictEqual(Object.keys(byTask).sort(), ['fb', 'plan'])
-      assert.strictEqual(byTask.fb[1][2][0], 'Proceed')
+      assert.ok(byTask.fb[1][2][0].endsWith('## Additional instructions\n\nProceed\n'))
+      assert.ok(byTask.fb[1][2][0].startsWith(sandbox.test_DEFAULT_CONTINUE_MESSAGE))
       assert.strictEqual(byTask.fb[1][3], 'act-last-fb')
       assert.deepStrictEqual(byTask.plan[1], [null, ['p1'], null, 'act-last-plan'])
+      assert.deepStrictEqual(
+        sent('wk4vKd').map((c) => c.payload),
+        [['paused']]
+      )
 
       const state = sandbox.test_state()
-      assert.strictEqual(state.progress.archived, 2)
-      assert.strictEqual(state.progress.total, 2)
-      assert.ok(state.log.some((l) => l.includes('Replied to [u/1] [fb] Task fb')))
-      assert.ok(state.log.some((l) => l.includes('Approved plan for [u/1] [plan] Task plan')))
-      assert.ok(state.log.some((l) => l.includes('TOTAL: 2 tasks continued')))
+      assert.strictEqual(state.progress.archived, 3)
+      assert.strictEqual(state.progress.total, 3)
+      assert.ok(state.log.some((l) => l.includes('Resumed [u/1] [paused] Task paused')))
+      assert.ok(state.log.some((l) => l.includes("Plan approvals and resumes don't take a message")))
+    })
+
+    it('only touches the chosen state', async () => {
+      const tasks = [task('fb', 12), task('err', 4)]
+      const { sandbox, writes } = setupProceedEnv(tasks)
+      await run(sandbox, 'Error (4)')
+      assert.deepStrictEqual(
+        writes().map((c) => c.payload[0]),
+        ['err']
+      )
     })
 
     it('only touches tasks in the selected repository', async () => {
-      const tasks = [task('mine', 12), task('other', 12, { source: 'github/o/other', repo: 'o/other' })]
-      const { sandbox, interactCalls } = setupContinueEnv(tasks)
-      const count = await sandbox.processContinueForTab(TAB, {
-        opMode: 'continue_waiting',
-        dryRun: false,
-        repoFilter: 'o/r'
-      })
-
-      assert.strictEqual(count, 1)
+      const tasks = [task('mine', 12), task('other', 12, { source: 'github/x/y', repo: 'x/y' })]
+      const { sandbox, writes } = setupProceedEnv(tasks)
+      await run(sandbox, 'Waiting on You (12)', { repoFilter: 'o/r' })
       assert.deepStrictEqual(
-        interactCalls().map((c) => c.payload[0]),
+        writes().map((c) => c.payload[0]),
         ['mine']
       )
     })
 
-    it('sends failed sessions the retry prompt, not the reply', async () => {
-      const { sandbox, interactCalls } = setupContinueEnv([task('fb', 12), task('err', 4)])
-      const count = await sandbox.processContinueForTab(TAB, {
-        opMode: 'continue_waiting',
-        dryRun: false,
-        continueMessage: 'Proceed',
-        continueErrorMessage: ''
-      })
-
+    it('sends a follow-up to completed tasks when Completed is chosen with a message', async () => {
+      const tasks = [task('done', 3), task('nostate', null)]
+      const { sandbox, sent } = setupProceedEnv(tasks)
+      const count = await run(sandbox, 'Completed (3)', { message: 'Add a changelog entry' })
       assert.strictEqual(count, 2)
-      const byTask = Object.fromEntries(interactCalls().map((c) => [c.payload[0], c.payload]))
-      assert.strictEqual(byTask.fb[1][2][0], 'Proceed')
-      assert.strictEqual(byTask.err[1][2][0], sandbox.test_DEFAULT_ERROR_CONTINUE_MESSAGE)
-      assert.strictEqual(byTask.err[1][3], 'act-last-err')
-      assert.ok(sandbox.test_state().log.some((l) => l.includes('Retried [u/1] [err] Task err')))
+      assert.deepStrictEqual(
+        sent('SLmX6').map((c) => c.payload[1][2][0]),
+        ['Add a changelog entry', 'Add a changelog entry']
+      )
     })
 
-    it('uses a custom retry prompt when one is given', async () => {
-      const { sandbox, interactCalls } = setupContinueEnv([task('err', 4)])
-      await sandbox.processContinueForTab(TAB, {
-        opMode: 'continue_waiting',
-        dryRun: false,
-        continueErrorMessage: ' Try again without the submodule '
+    it('gives the quota to failed sessions before completed ones', async () => {
+      const tasks = [task('done', 3), task('err1', 4), task('err2', 4), task('fb', 12)]
+      const { sandbox, writes, log } = setupProceedEnv(tasks, { quota: [98, [86400], 100] })
+      await run(sandbox, 'All', { message: 'Go', force: true })
+      assert.deepStrictEqual(
+        writes()
+          .map((c) => c.payload[0])
+          .sort(),
+        ['err1', 'err2', 'fb']
+      )
+      assert.ok(log().some((l) => l.includes('only 2 of 3 task(s) that start a new run will go')))
+    })
+
+    it('still replies when the daily session limit is used up', async () => {
+      const tasks = [task('fb', 12), task('err', 4)]
+      const { sandbox, writes, log } = setupProceedEnv(tasks, { quota: [100, [86400], 100] })
+      const count = await run(sandbox, 'All')
+      assert.strictEqual(count, 1)
+      assert.deepStrictEqual(
+        writes().map((c) => c.payload[0]),
+        ['fb']
+      )
+      assert.ok(log().some((l) => l.includes('Daily session limit reached (100/100): skipping 1 task(s)')))
+    })
+
+    it('shows the quota cap in a dry run too', async () => {
+      const tasks = [task('err1', 4), task('err2', 4)]
+      const { sandbox, writes, log } = setupProceedEnv(tasks, { quota: [99, [86400], 100] })
+      await run(sandbox, 'Error (4)', { dryRun: true })
+      assert.deepStrictEqual(writes(), [])
+      assert.strictEqual(log().filter((l) => l.includes('[DRY] Would retry')).length, 1)
+    })
+
+    it('does not look up the quota when nothing would start a new run', async () => {
+      const { sandbox, sent } = setupProceedEnv([task('fb', 12)])
+      await run(sandbox, 'All')
+      assert.deepStrictEqual(sent('KQOO7'), [])
+    })
+
+    it('still retries failed sessions when the quota lookup fails', async () => {
+      const { sandbox, writes, log } = setupProceedEnv([task('err', 4)], { quota: new Error('HTTP 500') })
+      await run(sandbox, 'All')
+      assert.deepStrictEqual(
+        writes().map((c) => c.payload[0]),
+        ['err']
+      )
+      assert.ok(log().some((l) => l.includes('WARNING: Could not fetch daily quota')))
+    })
+
+    it('explains a RESOURCE_EXHAUSTED reply as the daily session limit', async () => {
+      const { sandbox, log } = setupProceedEnv([task('err', 4)], {
+        failInteract: new Set(['err']),
+        interactError: 'RPC SLmX6 error code [8]'
       })
-      assert.strictEqual(interactCalls()[0].payload[1][2][0], 'Try again without the submodule')
-    })
-
-    it('sends the default message when the popup left it empty', async () => {
-      const { sandbox, interactCalls } = setupContinueEnv([task('fb', 12)])
-      await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false, continueMessage: '' })
-      assert.strictEqual(interactCalls()[0].payload[1][2][0], sandbox.test_DEFAULT_CONTINUE_MESSAGE)
-    })
-
-    it('skips a plan approval when the task carries no plan id', async () => {
-      const { sandbox, interactCalls } = setupContinueEnv([task('plan', 10)])
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
-      assert.strictEqual(count, 0)
-      assert.strictEqual(interactCalls().length, 0)
-      assert.ok(sandbox.test_state().log.some((l) => l.includes('SKIP [u/1] [plan]') && l.includes('no plan id')))
-    })
-
-    it('skips a task whose session has no activity to reply to', async () => {
-      const { sandbox, interactCalls } = setupContinueEnv([task('fb', 12)], { activities: { fb: [] } })
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
-      assert.strictEqual(count, 0)
-      assert.strictEqual(interactCalls().length, 0)
-      assert.ok(sandbox.test_state().log.some((l) => l.includes('SKIP [u/1] [fb]') && l.includes('no activity')))
+      await run(sandbox, 'All')
+      assert.ok(
+        log().some(
+          (l) => l.includes('ERROR [u/1] proceeding with [err]') && l.includes('(daily session limit reached)')
+        )
+      )
     })
 
     it('keeps going after one reply fails and never re-sends it', async () => {
       const tasks = [task('bad', 12), task('good', 12)]
-      const { sandbox, interactCalls } = setupContinueEnv(tasks, { failInteract: new Set(['bad']) })
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
+      const { sandbox, sent } = setupProceedEnv(tasks, { failInteract: new Set(['bad']) })
+      const count = await run(sandbox, 'All')
       assert.strictEqual(count, 1)
-      assert.strictEqual(
-        interactCalls().filter((c) => c.payload[0] === 'bad').length,
-        1,
-        'a reply is sent at most once'
-      )
-      const state = sandbox.test_state()
-      assert.strictEqual(state.progress.skipped, 1)
-      assert.ok(state.log.some((l) => l.includes('ERROR [u/1] continuing [bad]') && l.includes('HTTP 500')))
+      assert.strictEqual(sent('SLmX6').filter((c) => c.payload[0] === 'bad').length, 1)
+      assert.strictEqual(sandbox.test_state().progress.skipped, 1)
     })
 
-    it('skips failed sessions when the daily session limit is used up, but still replies', async () => {
-      const tasks = [task('fb', 12), task('err1', 4), task('err2', 4)]
-      const { sandbox, interactCalls } = setupContinueEnv(tasks, { quota: [100, [86400], 100] })
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
-      assert.strictEqual(count, 1)
-      assert.deepStrictEqual(
-        interactCalls().map((c) => c.payload[0]),
-        ['fb']
-      )
-      const log = sandbox.test_state().log
-      assert.ok(log.some((l) => l.includes('Daily session limit reached (100/100)') && l.includes('2 failed')))
-      assert.strictEqual(sandbox.test_state().progress.total, 1)
-    })
-
-    it('retries at most as many failed sessions as the quota has left', async () => {
-      const tasks = [task('err1', 4), task('err2', 4), task('err3', 4)]
-      const { sandbox, interactCalls } = setupContinueEnv(tasks, { quota: [98, [86400], 100] })
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
-      assert.strictEqual(count, 2)
-      assert.strictEqual(interactCalls().length, 2)
-      assert.ok(sandbox.test_state().log.some((l) => l.includes('only 2 of 3 failed session(s)')))
-    })
-
-    it('does not look up the quota when nothing failed', async () => {
-      const { sandbox, calls } = setupContinueEnv([task('fb', 12)], { quota: [100, [86400], 100] })
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
-      assert.strictEqual(count, 1)
-      assert.ok(!calls.some((c) => c.rpcId === 'KQOO7'))
-    })
-
-    it('still retries failed sessions when the quota lookup fails', async () => {
-      const { sandbox, interactCalls } = setupContinueEnv([task('err', 4)], { quota: new Error('HTTP 503') })
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
-      assert.strictEqual(count, 1)
-      assert.strictEqual(interactCalls().length, 1)
-      assert.ok(sandbox.test_state().log.some((l) => l.includes('WARNING: Could not fetch daily quota')))
-    })
-
-    it('explains a RESOURCE_EXHAUSTED reply as the daily session limit', async () => {
-      const { sandbox } = setupContinueEnv([task('err', 4)], {
-        failInteract: new Set(['err']),
-        interactError: 'RPC SLmX6 error code [8]'
-      })
-      await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-      assert.ok(
-        sandbox
-          .test_state()
-          .log.some((l) => l.includes('error code [8]') && l.includes('(daily session limit reached)'))
-      )
-    })
-
-    it('reports when nothing is waiting', async () => {
-      const { sandbox, calls } = setupContinueEnv([task('run', 2), task('done', 3)])
-      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
-
+    it('skips a task whose session has no activity to reply to', async () => {
+      const { sandbox, sent, log } = setupProceedEnv([task('empty', 12)], { activities: { empty: [] } })
+      const count = await run(sandbox, 'All')
       assert.strictEqual(count, 0)
-      assert.deepStrictEqual(calls, [])
-      assert.ok(sandbox.test_state().log.some((l) => l.includes('No tasks are waiting on you')))
+      assert.deepStrictEqual(sent('SLmX6'), [])
+      assert.ok(log().some((l) => l.includes('SKIP [u/1] [empty] Task empty (no activity to reply to)')))
+    })
+
+    it('refuses to run without an item', async () => {
+      const { sandbox, writes } = setupProceedEnv([task('fb', 12)])
+      await assert.rejects(sandbox.processProceedForTab(TAB, { dryRun: false }), /Proceed needs an item/)
+      assert.deepStrictEqual(writes(), [])
+    })
+
+    it('reports when there is nothing to do', async () => {
+      const { sandbox, writes, log } = setupProceedEnv([task('run', 2), task('done', 3)])
+      const count = await run(sandbox, 'All')
+      assert.strictEqual(count, 0)
+      assert.deepStrictEqual(writes(), [])
+      assert.ok(log().some((l) => l.includes('Nothing to proceed with.')))
+    })
+  })
+
+  describe('resolveRunOptions', () => {
+    const resolve = (sandbox, options) => JSON.parse(JSON.stringify(sandbox.resolveRunOptions(options)))
+
+    it('maps an action and a task item to the matching orchestrator', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(resolve(sandbox, { action: 'proceed', item: 'Error (4)' }).opMode, 'proceed')
+      assert.strictEqual(resolve(sandbox, { action: 'archive', item: 'All' }).opMode, 'archive')
+      assert.deepStrictEqual(resolve(sandbox, { action: 'archive', item: 'Error' }).item.codes, [4])
+    })
+
+    it('maps Suggestions to start, batch or remove', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(resolve(sandbox, { action: 'proceed', item: 'Suggestions' }).opMode, 'suggestions')
+      assert.strictEqual(
+        resolve(sandbox, { action: 'proceed', item: 'Suggestions', oneSession: true }).opMode,
+        'agent_batch'
+      )
+      assert.strictEqual(resolve(sandbox, { action: 'archive', item: 'Suggestions' }).opMode, 'remove_suggestions')
+    })
+
+    it('maps export to the suggestions export', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(resolve(sandbox, { action: 'export' }).opMode, 'export_suggestions')
+    })
+
+    it('normalizes the message', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(resolve(sandbox, { action: 'proceed', item: 'All', message: '  hi ' }).message, 'hi')
+    })
+
+    it('rejects an unknown action or item', () => {
+      const { sandbox } = setupEnvironment()
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'delete', item: 'All' }), /Unknown action "delete"/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', item: 'Nope' }), /Unknown item "Nope"/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', item: { codes: null } }), /Unknown item/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive' }), /Unknown item "undefined"/)
+    })
+
+    it('rejects options without an action, whatever else they carry', () => {
+      const { sandbox } = setupEnvironment()
+      assert.throws(() => sandbox.resolveRunOptions({ opMode: 'proceed', dryRun: false }), /Unknown action "undefined"/)
+      assert.throws(() => sandbox.resolveRunOptions({}), /Unknown action "undefined"/)
+    })
+  })
+
+  describe('START message', () => {
+    function send(env, options) {
+      return new Promise((resolve) => {
+        for (const listener of env.messageListeners) listener({ action: 'START', options }, {}, resolve)
+      })
+    }
+
+    it('answers with an error for an unknown item and starts nothing', async () => {
+      const env = setupEnvironment()
+      let started = false
+      env.sandbox.startOperation = async () => {
+        started = true
+      }
+      const response = await send(env, { action: 'archive', item: 'Bogus' })
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), { error: 'Unknown item "Bogus"' })
+      assert.strictEqual(started, false)
+    })
+
+    it('rejects a run without an action and starts nothing', async () => {
+      const env = setupEnvironment()
+      let started = false
+      env.sandbox.startOperation = async () => {
+        started = true
+      }
+      const response = await send(env, { opMode: 'proceed', dryRun: false })
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), { error: 'Unknown action "undefined"' })
+      assert.strictEqual(started, false)
+    })
+
+    it('rejects a second run while one is going', async () => {
+      const env = setupEnvironment()
+      let started = 0
+      env.sandbox.startOperation = async () => {
+        started++
+      }
+      env.sandbox.test_updateState({ status: 'running' })
+      const response = await send(env, { action: 'proceed', item: 'All', dryRun: true })
+      assert.match(JSON.parse(JSON.stringify(response)).error, /already going/)
+      assert.strictEqual(started, 0)
+    })
+
+    it('starts a valid run', async () => {
+      const env = setupEnvironment()
+      const seen = []
+      env.sandbox.startOperation = async (options) => {
+        seen.push(options)
+      }
+      const response = await send(env, { action: 'proceed', item: 'Waiting on You (12)', dryRun: true })
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), { ok: true })
+      assert.strictEqual(seen.length, 1)
     })
   })
 
   describe('run wiring', () => {
-    it('routes continue_waiting to processContinueForTab', async () => {
+    it('routes proceed to processProceedForTab', async () => {
       const { sandbox } = setupEnvironment()
       const called = []
-      sandbox.processContinueForTab = async () => {
-        called.push('continue')
+      sandbox.processProceedForTab = async () => {
+        called.push('proceed')
         return 3
       }
       sandbox.processTab = async () => {
         called.push('archive')
         return 0
       }
-      const results = await sandbox.test_processAllTabs([TAB], { opMode: 'continue_waiting' })
-      assert.deepStrictEqual(called, ['continue'])
+      const results = await sandbox.test_processAllTabs([TAB], { opMode: 'proceed', item: sandbox.resolveItem('All') })
+      assert.deepStrictEqual(called, ['proceed'])
       assert.strictEqual(results[0].count, 3)
     })
 
-    it('labels the run and its summary', () => {
+    it('labels the run, its item and its summary', () => {
       const { sandbox } = setupEnvironment()
-      sandbox.test_initOperationState({ opMode: 'continue_waiting', dryRun: false })
-      sandbox.finalizeOperation([{ label: 'u/1', count: 4 }], { opMode: 'continue_waiting' })
+      const options = sandbox.resolveRunOptions({ action: 'proceed', item: 'Waiting on You (12)', dryRun: false })
+      sandbox.test_initOperationState(options)
+      sandbox.finalizeOperation([{ label: 'u/1', count: 4 }], options)
       const log = sandbox.test_state().log
-      assert.ok(log.includes('=== CONTINUE WAITING MODE ==='))
-      assert.ok(log.some((l) => l.includes('u/1: 4 continued')))
-      assert.ok(log.some((l) => l.includes('GRAND TOTAL: 4 tasks continued')))
+      assert.ok(log.includes('=== PROCEED MODE ==='))
+      assert.ok(log.includes('=== ITEM: Waiting on You (12) ==='))
+      assert.ok(log.some((l) => l.includes('u/1: 4 proceeded')))
+      assert.ok(log.some((l) => l.includes('GRAND TOTAL: 4 tasks proceeded')))
+    })
+
+    it('notes that Archive ignores the message', () => {
+      const { sandbox } = setupEnvironment()
+      sandbox.test_initOperationState(sandbox.resolveRunOptions({ action: 'archive', item: 'All', message: 'Hi' }))
+      assert.ok(sandbox.test_state().log.includes("Archive doesn't use the message; it is ignored."))
+      sandbox.test_initOperationState(sandbox.resolveRunOptions({ action: 'proceed', item: 'All', message: 'Hi' }))
+      assert.ok(!sandbox.test_state().log.some((l) => l.includes("doesn't use the message")))
+    })
+
+    it('ends in an error state for an unknown item', async () => {
+      const { sandbox } = setupEnvironment()
+      await sandbox.test_startOperation({ action: 'archive', item: 'Bogus' })
+      const state = sandbox.test_state()
+      assert.strictEqual(state.status, 'error')
+      assert.strictEqual(state.error, 'Unknown item "Bogus"')
+    })
+
+    it('the scheduled tick archives Completed tasks only, with the PR check', async () => {
+      const { sandbox } = setupEnvironment({}, { schedEnabled: true, schedStartSuggestions: true, schedMaxStarts: 3 })
+      const runs = []
+      sandbox.startOperation = async (options) => {
+        runs.push(JSON.parse(JSON.stringify(options)))
+      }
+      await sandbox.test_runScheduledTick()
+      assert.deepStrictEqual(
+        runs.map((r) => [r.action, r.item, r.force]),
+        [
+          ['archive', 'Completed', false],
+          ['proceed', 'suggestions', false]
+        ]
+      )
+      assert.strictEqual(runs[1].maxSuggestions, 3)
+      assert.deepStrictEqual(Array.from(sandbox.resolveItem(runs[0].item).codes), [3, 7])
+    })
+  })
+
+  describe('scheduled tick and manual runs', () => {
+    it('skips the suggestions step when a manual run started after the archive step', async () => {
+      const { sandbox } = setupEnvironment({}, { schedEnabled: true, schedStartSuggestions: true, schedMaxStarts: 3 })
+      const runs = []
+      sandbox.startOperation = async (options) => {
+        runs.push(options.action)
+        // A manual START lands as the archive step ends.
+        sandbox.test_updateState({ status: 'running' })
+      }
+      await sandbox.test_runScheduledTick()
+      assert.deepStrictEqual(runs, ['archive'])
+    })
+  })
+
+  describe('Suggestions with a message', () => {
+    it('appends the message to each suggestion prompt', () => {
+      const { sandbox } = setupEnvironment()
+      const suggestion = { id: 's1', title: 'Fix it', categorySlug: 'security', filePath: 'a.js', line: 1 }
+      const payload = sandbox.buildStartPayload(suggestion, 'github/o/r', {}, null, 'Keep the diff small')
+      const prompt = payload[sandbox.test_RJA83D.PROMPT]
+      assert.ok(prompt.endsWith('## Additional instructions\n\nKeep the diff small\n'))
+      const plain = sandbox.buildStartPayload(suggestion, 'github/o/r', {}, null, '')
+      assert.ok(!plain[sandbox.test_RJA83D.PROMPT].includes('Additional instructions'))
+    })
+
+    it('passes the message to every suggestion start', async () => {
+      const { sandbox } = setupEnvironment()
+      sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+      sandbox.getDailySessionQuota = async () => null
+      sandbox.listSuggestionEnabledSources = async () => ['github/o/r']
+      sandbox.listSuggestions = async () => [{ id: 's1', title: 'One', categorySlug: 'testing' }]
+      const messages = []
+      sandbox.startSuggestion = async (_s, _repo, _config, _startConfig, message) => {
+        messages.push(message)
+      }
+      await sandbox.processSuggestionsForTab({ id: 1, url: 'https://jules.google.com/u/0/' }, { message: 'Extra' })
+      assert.deepStrictEqual(messages, ['Extra'])
     })
   })
 })

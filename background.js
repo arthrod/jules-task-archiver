@@ -1,5 +1,5 @@
 // Modified by tommyzed: Added repository filtering and suggestions
-importScripts('utils.js')
+importScripts('utils.js', 'items.js')
 /**
  * Jules Task Archiver v2 — Background Service Worker
  *
@@ -114,9 +114,9 @@ async function syncScheduleAlarm() {
   }
 }
 
-// One alarm tick: archive (normal mode — finished-state filter + open-PR check,
-// same defaults a manual Run uses; Force stays a deliberate manual choice), then
-// optionally start queued suggestions with a per-tick global cap.
+// One alarm tick: archive Completed tasks (with the open-PR check; Force stays
+// a deliberate manual choice), then optionally start queued suggestions with a
+// per-tick global cap.
 async function runScheduledTick() {
   await stateReadyPromise
   if (state.status === 'running') {
@@ -128,13 +128,22 @@ async function runScheduledTick() {
   const cfg = await getScheduleConfig()
   if (!cfg.schedEnabled) return // defensive: config toggled off after alarm fired
 
-  await startOperation({ dryRun: false, force: false, scope: 'all', opMode: 'archive', scheduled: true })
-  if (cfg.schedStartSuggestions) {
+  await startOperation({
+    action: 'archive',
+    item: 'Completed',
+    dryRun: false,
+    force: false,
+    scope: 'all',
+    scheduled: true
+  })
+  // A manual run may have started while the archive step was finishing.
+  if (cfg.schedStartSuggestions && state.status !== 'running') {
     await startOperation({
+      action: 'proceed',
+      item: ITEM_SUGGESTIONS,
       dryRun: false,
       force: false,
       scope: 'all',
-      opMode: 'suggestions',
       maxSuggestions: cfg.schedMaxStarts,
       scheduled: true
     })
@@ -456,14 +465,6 @@ const TASK = {
   DISPLAY_TITLE: 26
 }
 
-// Task states that indicate the task is finished and safe to archive.
-// Verified 2026-06-04 against 725 real tasks from the live batchexecute API:
-// finished tasks settle into states 2, 4, 12, or null. Any OTHER state is
-// treated as still-active and left untouched in the default flow (Force
-// archives regardless). Keeping this an allowlist means an unknown/new state
-// is protected by default rather than silently archived.
-const ARCHIVABLE_STATES = new Set([2, 4, 12])
-
 // Source (connected repo) row layout from YqkSHd.
 // [5] is a per-repo Suggestions block: [bool, bool, [TOGGLE], [bool]] where
 // TOGGLE === 2 means the repo's Suggestions toggle is ON, 1/absent means OFF.
@@ -521,10 +522,6 @@ function parseTask(raw) {
   }
 }
 
-function isArchivable(task) {
-  // A null/undefined state is emitted for one class of completed tasks.
-  return task.state == null || ARCHIVABLE_STATES.has(task.state)
-}
 // ⚡ Bolt Optimization: Use a standard for loop instead of for...of, and replace
 // double Map lookup (.has() + .get()) with a single .get() + undefined check.
 // This reduces hashing and lookups in the hot path.
@@ -947,8 +944,16 @@ function buildSuggestionMetadata(suggestionId, experimentIds) {
   return meta
 }
 
-function buildStartPayload(suggestion, repo, config, startConfig) {
-  return buildRja83dPayload(buildSuggestionPrompt(suggestion), suggestion.id, repo, config, startConfig)
+// "Add a message" on Suggestions goes at the end of every prompt.
+// The user's message goes after whatever text the extension sends (a
+// suggestion prompt, the default reply or retry), never in place of it.
+function appendMessage(prompt, message) {
+  return message ? `${prompt.trimEnd()}\n\n## Additional instructions\n\n${message}\n` : prompt
+}
+
+function buildStartPayload(suggestion, repo, config, startConfig, message) {
+  const prompt = appendMessage(buildSuggestionPrompt(suggestion), message)
+  return buildRja83dPayload(prompt, suggestion.id, repo, config, startConfig)
 }
 
 function buildRja83dPayload(prompt, suggestionId, repo, config, startConfig) {
@@ -965,8 +970,8 @@ function buildRja83dPayload(prompt, suggestionId, repo, config, startConfig) {
   return payload
 }
 
-async function startSuggestion(suggestion, repo, config, startConfig) {
-  const payload = buildStartPayload(suggestion, repo, config, startConfig)
+async function startSuggestion(suggestion, repo, config, startConfig, message) {
+  const payload = buildStartPayload(suggestion, repo, config, startConfig, message)
   return callBatchExecute('Rja83d', payload, config)
 }
 
@@ -1111,7 +1116,7 @@ async function processSuggestionsForTab(tab, options) {
       lastUpdate = now
     }
     try {
-      await globalLimit(() => withRetry(() => startSuggestion(s, repo, config, startConfig)))
+      await globalLimit(() => withRetry(() => startSuggestion(s, repo, config, startConfig, options.message)))
       totalStarted++
       state.progress.archived += 1
       if (Date.now() - lastUpdate > 500) {
@@ -1215,17 +1220,8 @@ async function processRemoveSuggestionsForTab(tab, options) {
 }
 
 // =============================================================================
-// Continue Waiting Orchestrator
+// Proceed Orchestrator
 // =============================================================================
-
-// ListTasks row[5] values for sessions that stopped and need the user. Taken
-// from the Jules web bundle's own state -> label map on 2026-10-19 and
-// cross-checked against row[25] (its second status enum) on 51 live tasks.
-const TASK_STATE = {
-  ERROR: 4,
-  AWAITING_PLAN_APPROVAL: 10,
-  AWAITING_USER_FEEDBACK: 12
-}
 
 // Interact (SLmX6) carries the client's experiment flags; these are the ones
 // the Jules UI sent with its own replies on 2026-10-19.
@@ -1240,24 +1236,75 @@ const DEFAULT_ERROR_CONTINUE_MESSAGE =
   'Your previous run stopped with an error before the task was finished. Please pick it back up: find the step ' +
   'that failed and retry it. If it keeps failing, work around it (for example, carry on without a broken optional ' +
   'dependency or git submodule) and note what you skipped. Then finish the original task.'
-const MAX_CONTINUE_MESSAGE_LEN = 2000
+const MAX_MESSAGE_LEN = 2000
 
-function getWaitingKind(task) {
-  if (task.state === TASK_STATE.AWAITING_USER_FEEDBACK) return 'feedback'
-  if (task.state === TASK_STATE.AWAITING_PLAN_APPROVAL) return 'plan'
-  if (task.state === TASK_STATE.ERROR) return 'error'
-  return null
+const PROCEED_VERBS = {
+  reply: { dry: 'reply to', done: 'Replied to' },
+  approve: { dry: 'approve the plan of', done: 'Approved the plan of' },
+  resume: { dry: 'resume', done: 'Resumed' },
+  retry: { dry: 'retry', done: 'Retried' },
+  followUp: { dry: 'send a follow-up to', done: 'Sent a follow-up to' }
 }
 
-const CONTINUE_VERBS = {
-  feedback: { dry: 'reply to', done: 'Replied to' },
-  plan: { dry: 'approve plan for', done: 'Approved plan for' },
-  error: { dry: 'retry', done: 'Retried' }
-}
+// Proceed works through tasks in this order, so whatever daily quota is left
+// goes to the most useful work first.
+const PROCEED_ORDER = { feedback: 0, plan: 1, paused: 2, running: 3, unknown: 3, error: 4, completed: 5 }
 
-function normalizeContinueMessage(value, fallback = DEFAULT_CONTINUE_MESSAGE) {
+function normalizeMessage(value) {
   const message = typeof value === 'string' ? value.trim() : ''
-  return message ? message.slice(0, MAX_CONTINUE_MESSAGE_LEN) : fallback
+  return message.slice(0, MAX_MESSAGE_LEN)
+}
+
+function taskKind(task) {
+  return taskStateFor(task)?.kind || 'unknown'
+}
+
+// What Proceed does with one task: { action, message, usesQuota } or
+// { skip: reason }. A retry or a follow-up starts a new run, so it counts
+// against the daily session quota; replying to a live session does not
+// (measured 2026-10-19 at 100/100: 13 replies went through, every retry got
+// RPC error code [8]).
+function planProceed(task, item, options = {}) {
+  const message = normalizeMessage(options.message)
+  const kind = taskKind(task)
+  switch (kind) {
+    case 'feedback':
+      return {
+        action: 'reply',
+        message: appendMessage(normalizeMessage(options.defaultReply) || DEFAULT_CONTINUE_MESSAGE, message)
+      }
+    case 'plan':
+      return task.planId ? { action: 'approve' } : { skip: 'no plan to approve' }
+    case 'paused':
+      return { action: 'resume' }
+    case 'error':
+      return {
+        action: 'retry',
+        message: appendMessage(normalizeMessage(options.defaultRetry) || DEFAULT_ERROR_CONTINUE_MESSAGE, message),
+        usesQuota: true
+      }
+    case 'completed':
+      if (item?.id === ITEM_ALL && !options.force)
+        return { skip: 'completed (Proceed on All skips them unless Force is on)' }
+      if (!message) return { skip: 'completed (a follow-up needs a message)' }
+      return { action: 'followUp', message, usesQuota: true }
+    default:
+      if (message) return { action: 'reply', message }
+      return { skip: kind === 'running' ? 'already running (add a message to send one)' : 'unknown state' }
+  }
+}
+
+// Planned work in PROCEED_ORDER, plus a count of skipped tasks per reason.
+function planProceedWork(tasks, item, options) {
+  const work = []
+  const skipped = new Map()
+  for (const task of tasks) {
+    const plan = planProceed(task, item, options)
+    if (plan.skip) skipped.set(plan.skip, (skipped.get(plan.skip) || 0) + 1)
+    else work.push({ task, plan, rank: PROCEED_ORDER[taskKind(task)] })
+  }
+  work.sort((a, b) => a.rank - b.rank)
+  return { work, skipped }
 }
 
 // GetTask view 3 includes the activity log. The UI threads every reply onto
@@ -1272,12 +1319,12 @@ async function getLastActivityId(taskId, config) {
 // [taskId, interaction, null, [experimentIds]] where interaction is
 // [_, [planId] to approve the plan, [text, null, clientMessageId] to reply,
 // lastActivityId]. Captured from the Jules UI and its plan-approval code.
-function buildInteractPayload(task, message, activityId) {
+function buildInteractPayload(task, plan, activityId) {
   const interaction = new Array(4).fill(null)
-  if (getWaitingKind(task) === 'plan') {
+  if (plan.action === 'approve') {
     interaction[1] = [task.planId]
   } else {
-    interaction[2] = [message, null, crypto.randomUUID().toUpperCase()]
+    interaction[2] = [plan.message, null, crypto.randomUUID().toUpperCase()]
   }
   interaction[3] = activityId
   return [task.id, interaction, null, [INTERACT_EXPERIMENT_IDS]]
@@ -1285,50 +1332,70 @@ function buildInteractPayload(task, message, activityId) {
 
 // Returns false when the task was skipped. The send is not retried: a 5xx may
 // still have delivered the reply, and a re-run only finds tasks still waiting.
-async function continueTask(label, task, message, config) {
-  if (getWaitingKind(task) === 'plan' && !task.planId) {
-    addLog(`  SKIP [${label}] [${task.id}] ${task.title} (no plan id to approve)`)
-    return false
+async function proceedTask(label, task, plan, config) {
+  if (plan.action === 'resume') {
+    await callBatchExecute('wk4vKd', [task.id], config)
+    return true
   }
   const activityId = await withRetry(() => getLastActivityId(task.id, config))
   if (!activityId) {
     addLog(`  SKIP [${label}] [${task.id}] ${task.title} (no activity to reply to)`)
     return false
   }
-  await callBatchExecute('SLmX6', buildInteractPayload(task, message, activityId), config)
+  await callBatchExecute('SLmX6', buildInteractPayload(task, plan, activityId), config)
   return true
 }
 
-// Retrying a failed session starts a new run, so it counts against the daily
-// session quota; replying to a live session does not. Measured 2026-10-19 at
-// 100/100: 13 replies went through, every retry got RPC error code [8].
-async function capRetriesToQuota(label, waiting, config) {
-  const failed = waiting.filter((t) => getWaitingKind(t) === 'error')
-  if (failed.length === 0) return waiting
+// Drops the work that would start a new run beyond the remaining daily quota.
+// The work is already ordered, so failed sessions go before completed ones.
+async function capToQuota(label, work, config) {
+  const quotaWork = work.filter((w) => w.plan.usesQuota)
+  if (quotaWork.length === 0) return work
   let quota = null
   try {
     quota = await getDailySessionQuota(config)
   } catch (e) {
     addLog(`[${label}] WARNING: Could not fetch daily quota: ${e.message}`)
-    return waiting
+    return work
   }
-  if (!quota || quota.remaining >= failed.length) return waiting
-  const others = waiting.filter((t) => getWaitingKind(t) !== 'error')
+  if (!quota || quota.remaining >= quotaWork.length) return work
+  const kept = new Set(quotaWork.slice(0, quota.remaining))
   if (quota.remaining === 0) {
     addLog(
-      `[${label}] Daily session limit reached (${quota.used}/${quota.limit}): skipping ${failed.length} failed session(s), since a retry starts a new run.`
+      `[${label}] Daily session limit reached (${quota.used}/${quota.limit}): skipping ${quotaWork.length} task(s) that would start a new run.`
     )
-    return others
+  } else {
+    addLog(
+      `[${label}] Daily sessions: ${quota.remaining} left, so only ${quota.remaining} of ${quotaWork.length} task(s) that start a new run will go.`
+    )
   }
-  addLog(
-    `[${label}] Daily sessions: ${quota.remaining} left, so only ${quota.remaining} of ${failed.length} failed session(s) will be retried.`
-  )
-  return [...others, ...failed.slice(0, quota.remaining)]
+  return work.filter((w) => !w.plan.usesQuota || kept.has(w))
 }
 
-// Replies to every session awaiting the user's feedback, approves every plan
-// awaiting approval, and asks every failed session to retry.
-async function processContinueForTab(tab, options) {
+// "12 Waiting on You (12), 3 Error (4)" for the log.
+function describeStates(tasks) {
+  const counts = new Map()
+  for (const t of tasks) {
+    const s = taskStateFor(t)
+    const key = s ? `${s.name} (${s.code})` : `state ${taskStateCode(t)}`
+    counts.set(key, (counts.get(key) || 0) + 1)
+  }
+  return [...counts].map(([key, n]) => `${n} ${key}`).join(', ')
+}
+
+// The tasks of the chosen item (and repository), logged with a count per state.
+function selectTasks(label, tasks, item, repoFilter) {
+  let selected = tasks.filter((t) => itemIncludesTask(item, t))
+  if (repoFilter) selected = selected.filter((t) => matchesRepoFilter(repoFilter, t.source, t.repo))
+  const where = repoFilter ? ` in ${repoFilter}` : ''
+  const breakdown = selected.length > 0 ? `: ${describeStates(selected)}` : ''
+  addLog(`[${label}] ${tasks.length} tasks, ${selected.length} match "${item.label}"${where}${breakdown}`)
+  return selected
+}
+
+async function processProceedForTab(tab, options) {
+  const { item } = options
+  if (!item) throw new Error('Proceed needs an item')
   const prepared = await prepareTab(tab)
   if (!prepared) return 0
   const { label, config } = prepared
@@ -1337,61 +1404,56 @@ async function processContinueForTab(tab, options) {
   const tasks = await safeListTasks(label, config)
   if (!tasks) return 0
 
-  let waiting = tasks.filter((t) => getWaitingKind(t) !== null)
-  if (options.repoFilter) {
-    waiting = waiting.filter((t) => matchesRepoFilter(options.repoFilter, t.source, t.repo))
-  }
-  const counts = { feedback: 0, plan: 0, error: 0 }
-  for (const t of waiting) counts[getWaitingKind(t)]++
-  addLog(
-    `[${label}] ${tasks.length} tasks: ${counts.feedback} awaiting your reply, ${counts.plan} awaiting plan approval, ${counts.error} failed`
-  )
-  if (waiting.length === 0) {
-    addLog(`[${label}] No tasks are waiting on you.`)
+  const selected = selectTasks(label, tasks, item, options.repoFilter)
+  const { work, skipped } = planProceedWork(selected, item, options)
+  for (const [reason, n] of skipped) addLog(`[${label}] Skipping ${n} task(s): ${reason}`)
+  if (work.length === 0) {
+    addLog(`[${label}] Nothing to proceed with.`)
     return 0
   }
+  if (
+    normalizeMessage(options.message) &&
+    work.some((w) => w.plan.action === 'approve' || w.plan.action === 'resume')
+  ) {
+    addLog(`[${label}] Plan approvals and resumes don't take a message; those tasks go without it.`)
+  }
 
+  const toProceed = await capToQuota(label, work, config)
   if (options.dryRun) {
-    for (const t of waiting) {
-      addLog(`  [DRY] Would ${CONTINUE_VERBS[getWaitingKind(t)].dry} [${label}] [${t.id}] ${t.title}`)
+    for (const { task, plan } of toProceed) {
+      addLog(`  [DRY] Would ${PROCEED_VERBS[plan.action].dry} [${label}] [${task.id}] ${task.title}`)
     }
     return 0
   }
-
-  waiting = await capRetriesToQuota(label, waiting, config)
-  if (waiting.length === 0) {
-    addLog(`\n[${label}] TOTAL: 0 tasks continued`)
+  if (toProceed.length === 0) {
+    addLog(`\n[${label}] TOTAL: 0 tasks proceeded`)
     return 0
   }
 
-  const replyMessage = normalizeContinueMessage(options.continueMessage)
-  const retryMessage = normalizeContinueMessage(options.continueErrorMessage, DEFAULT_ERROR_CONTINUE_MESSAGE)
-  state.progress.total += waiting.length
+  state.progress.total += toProceed.length
   updateState({})
 
-  let continued = 0
-  await runInPool(waiting, PER_ACCOUNT_CONCURRENCY, async (task) => {
+  let proceeded = 0
+  await runInPool(toProceed, PER_ACCOUNT_CONCURRENCY, async ({ task, plan }) => {
     try {
-      const kind = getWaitingKind(task)
-      const message = kind === 'error' ? retryMessage : replyMessage
-      const sent = await globalLimit(() => continueTask(label, task, message, config))
+      const sent = await globalLimit(() => proceedTask(label, task, plan, config))
       if (sent) {
-        continued++
+        proceeded++
         state.progress.archived++
-        addLog(`  ${CONTINUE_VERBS[kind].done} [${label}] [${task.id}] ${task.title}`)
+        addLog(`  ${PROCEED_VERBS[plan.action].done} [${label}] [${task.id}] ${task.title}`)
       } else {
         state.progress.skipped++
       }
     } catch (e) {
       state.progress.skipped++
       const hint = /error code \[8\]/.test(e.message) ? ' (daily session limit reached)' : ''
-      addLog(`  ERROR [${label}] continuing [${task.id}] ${task.title}: ${e.message}${hint}`)
+      addLog(`  ERROR [${label}] proceeding with [${task.id}] ${task.title}: ${e.message}${hint}`)
     }
     updateState({})
   })
 
-  addLog(`\n[${label}] TOTAL: ${continued} tasks continued`)
-  return continued
+  addLog(`\n[${label}] TOTAL: ${proceeded} tasks proceeded`)
+  return proceeded
 }
 
 // =============================================================================
@@ -1512,7 +1574,7 @@ async function processBatchAgentForTab(tab, options) {
     }
 
     addLog(`[${label}] ${repo}: Assembling ${suggestions.length} suggestions into 1 Unified Master Agent task...`)
-    const batchPrompt = buildBatchAgentPrompt(suggestions, repo)
+    const batchPrompt = appendMessage(buildBatchAgentPrompt(suggestions, repo), options.message)
 
     // Budget is spent before the call: a failed launch may still have
     // consumed a session server-side.
@@ -1908,25 +1970,15 @@ async function getTabConfig(tabId) {
 // Orchestrator
 // =============================================================================
 
+// The Items dropdown picks which states to archive; Force only skips the
+// open-PR check.
 async function filterArchivableTasks(label, tasks, options) {
   if (options.force) {
-    addLog(`[${label}] FORCE: archiving all ${tasks.length} tasks (skip state filter + PR check)`)
+    addLog(`[${label}] FORCE: archiving all ${tasks.length} tasks without the open-PR check`)
     return { toArchive: [...tasks], toSkip: [] }
   }
 
-  const candidates = tasks.filter(isArchivable)
-  const activeCount = tasks.length - candidates.length
-
-  addLog(`[${label}] ${tasks.length} total: ${candidates.length} archivable, ${activeCount} active`)
-
-  if (candidates.length === 0) {
-    const states = [...new Set(tasks.map((t) => t.state))].join(', ')
-    addLog(`[${label}] No archivable tasks among ${tasks.length} (states seen: ${states}).`)
-    addLog(`[${label}] Enable Force to archive regardless of state.`)
-    return { toArchive: [], toSkip: [] }
-  }
-
-  const byRepo = groupTasksByRepo(candidates)
+  const byRepo = groupTasksByRepo(tasks)
   addLog(`\n[${label}] Checking open PRs per task...`)
   const { ghOwner } = await chrome.storage.sync.get(['ghOwner'])
   const { ghToken } = await chrome.storage.local.get(['ghToken'])
@@ -2040,6 +2092,8 @@ async function executeArchive(label, toArchive, config) {
 }
 
 async function processTab(tab, options) {
+  const { item } = options
+  if (!item) throw new Error('Archive needs an item')
   const prepared = await prepareTab(tab)
   if (!prepared) return 0
   const { label, config } = prepared
@@ -2048,28 +2102,20 @@ async function processTab(tab, options) {
   const tasks = await safeListTasks(label, config)
   if (!tasks) return 0
 
-  let filteredTasks = tasks
-  if (options.repoFilter) {
-    filteredTasks = tasks.filter((t) => matchesRepoFilter(options.repoFilter, t.source, t.repo))
-    addLog(
-      `[${label}] Filtered tasks by repo "${options.repoFilter}": keeping ${filteredTasks.length} of ${tasks.length} tasks`
-    )
-    if (filteredTasks.length === 0) {
-      addLog(`[${label}] No matching tasks found. Nothing to do.`)
-      return 0
-    }
+  const selected = selectTasks(label, tasks, item, options.repoFilter)
+  if (selected.length === 0) {
+    addLog(`[${label}] Nothing to archive.`)
+    return 0
   }
 
-  const { toArchive, toSkip } = await filterArchivableTasks(label, filteredTasks, options)
+  const { toArchive, toSkip } = await filterArchivableTasks(label, selected, options)
 
   if (toSkip.length > 0) {
     addLog(`\n[${label}] ${toSkip.length} tasks skipped (open PRs matching)`)
   }
 
   if (toArchive.length === 0) {
-    if (!options.force && filteredTasks.some(isArchivable)) {
-      addLog(`[${label}] Nothing to archive (all tasks have matching open PRs).`)
-    }
+    addLog(`[${label}] Nothing to archive (all tasks have matching open PRs).`)
     return 0
   }
 
@@ -2095,7 +2141,32 @@ const OP_MODE_HEADERS = {
   agent_batch: '=== BATCH AGENT MODE ===',
   remove_suggestions: '=== REMOVE SUGGESTIONS MODE ===',
   export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ===',
-  continue_waiting: '=== CONTINUE WAITING MODE ==='
+  proceed: '=== PROCEED MODE ==='
+}
+
+const RUN_ACTIONS = new Set(['proceed', 'archive', 'export'])
+
+// The popup and the CLI send { action, item }; this turns them into the opMode
+// that picks the per-tab orchestrator. Callers that already send an opMode
+// (and no action) pass through unchanged. Throws on an unknown action or item.
+function resolveRunOptions(options) {
+  if (!RUN_ACTIONS.has(options.action)) throw new Error(`Unknown action "${options.action}"`)
+  const resolved = { ...options, message: normalizeMessage(options.message) }
+  if (options.action === 'export') {
+    resolved.opMode = 'export_suggestions'
+    return resolved
+  }
+  // No default: a missing item must never turn into "All" for an archive run.
+  const item = resolveItem(options.item)
+  if (!item) throw new Error(`Unknown item "${options.item}"`)
+  resolved.item = item
+  if (item.type === 'suggestions') {
+    if (options.action === 'archive') resolved.opMode = 'remove_suggestions'
+    else resolved.opMode = options.oneSession ? 'agent_batch' : 'suggestions'
+  } else {
+    resolved.opMode = options.action === 'archive' ? 'archive' : 'proceed'
+  }
+  return resolved
 }
 
 function initOperationState(options) {
@@ -2121,6 +2192,8 @@ function initOperationState(options) {
 
   const isSuggestions = options.opMode === 'suggestions'
   addLog(options.dryRun ? '=== DRY RUN MODE ===' : OP_MODE_HEADERS[options.opMode] || '=== ARCHIVE MODE ===')
+  if (options.item?.label) addLog(`=== ITEM: ${options.item.label} ===`)
+  if (options.action === 'archive' && options.message) addLog("Archive doesn't use the message; it is ignored.")
   if (options.scheduled) addLog('=== SCHEDULED (chrome.alarms) ===')
   if (options.force) addLog('=== FORCE MODE (skip PR check) ===')
   addLog('=== v2: batchexecute API ===')
@@ -2184,8 +2257,8 @@ function getTabProcessor(opMode) {
       return processExportSuggestionsForTab
     case 'agent_batch':
       return processBatchAgentForTab
-    case 'continue_waiting':
-      return processContinueForTab
+    case 'proceed':
+      return processProceedForTab
     default:
       return processTab
   }
@@ -2215,7 +2288,7 @@ const OP_MODE_SUMMARY = {
   remove_suggestions: { verb: 'removed', itemLabel: 'suggestions' },
   export_suggestions: { verb: 'exported', itemLabel: 'suggestions' },
   agent_batch: { verb: 'launched', itemLabel: 'master agent sessions' },
-  continue_waiting: { verb: 'continued', itemLabel: 'tasks' }
+  proceed: { verb: 'proceeded', itemLabel: 'tasks' }
 }
 
 // Accepts the run's options (opMode) or the legacy isSuggestions boolean.
@@ -2247,7 +2320,14 @@ function handleOperationError(e) {
   updateState({ status: 'error', error: msg })
 }
 
-async function startOperation(options) {
+async function startOperation(rawOptions) {
+  let options
+  try {
+    options = resolveRunOptions(rawOptions)
+  } catch (e) {
+    handleOperationError(e)
+    return
+  }
   const isSuggestions = initOperationState(options)
 
   try {
@@ -2303,6 +2383,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case 'START':
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      // One run at a time: two runs would read the same daily quota and race
+      // each other on the same tasks.
+      if (state.status === 'running') {
+        sendResponse({ error: 'A run is already going. Wait for it to finish.' })
+        break
+      }
+      try {
+        resolveRunOptions(msg.options || {})
+      } catch (e) {
+        sendResponse({ error: e.message })
         break
       }
       startOperation(msg.options)

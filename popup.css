@@ -1,399 +1,896 @@
-/* // Modified by tommyzed: Updated theme styling and footer */
+/* Modified by tommyzed: Updated popup layout and styles */
+/* Jules Task Archiver popup. Design: "Jules Task Archiver - Popup" (Claude
+   Design, Arthur Souza Rodrigues design system): warm paper, one near-black
+   ink, a highlighter-yellow mark, hairline borders, mono uppercase labels,
+   square corners. */
+
+@font-face {
+  font-family: "Libre Franklin";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("fonts/libre-franklin.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Roboto Mono";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url("fonts/roboto-mono.woff2") format("woff2");
+}
+
+:root {
+  --bg: #fafaf8;
+  --ink: #0a0a0a;
+  --muted: #6b6b6b;
+  --faint: #e8e8e5;
+  --surface: #ffffff;
+  --mark: #ffd400;
+  --mark-text: #0a0a0a;
+  --accent-green: #1f8a5b;
+  --danger: #b42318;
+  --ink-body: #333333;
+  --ff: "Libre Franklin", system-ui, -apple-system, sans-serif;
+  --mono: "Roboto Mono", ui-monospace, monospace;
+  --mono-weight: 600;
+  --t-fast: 0.18s ease;
+  /* Height of the main view and of each panel. Chrome caps popups at 600px,
+     so header (46px) + view must stay under it to avoid a scrollbar. */
+  --view-h: 440px;
+}
+
 * {
+  box-sizing: border-box;
   margin: 0;
   padding: 0;
-  box-sizing: border-box;
 }
 
 body {
-  width: 480px;
-  max-height: 560px;
-  overflow-y: auto;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  width: 800px;
+  background: var(--bg);
+  border: 1px solid var(--ink);
+  font-family: var(--ff);
+  color: var(--ink);
   font-size: 13px;
-  background: #1a1a2e;
-  color: #e2e8f0;
-  padding: 12px;
+  line-height: 1.45;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
 }
 
-header {
+::selection {
+  background: var(--mark);
+  color: var(--mark-text);
+}
+
+a {
+  color: var(--ink);
+}
+
+a:hover {
+  background: var(--mark);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-weight: var(--mono-weight);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.hidden {
+  /* biome-ignore lint/complexity/noImportantStyles: .hidden must beat every display rule (button.act, .btns, .line) */
+  display: none !important;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* --- Header --- */
+.top {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 12px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid #2d2d4a;
+  height: 46px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--ink);
 }
 
-h1 {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.version {
-  font-size: 11px;
-  color: #94a3b8;
-}
-
-h2 {
+.brand {
   font-size: 12px;
-  font-weight: 600;
-  color: #94a3b8;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: 8px;
+  letter-spacing: 0.06em;
+  font-weight: 700;
 }
 
-section {
-  margin-bottom: 12px;
-  padding: 10px;
-  background: #16213e;
-  border-radius: 6px;
+.brand .dot {
+  opacity: 0.35;
 }
 
-label,
-legend {
-  display: block;
-  font-size: 12px;
-  color: #94a3b8;
-  margin-bottom: 6px;
-}
-
-input[type="text"],
-input[type="password"],
-select,
-textarea {
-  display: block;
-  width: 100%;
-  padding: 6px 8px;
-  margin-top: 3px;
-  background: #0f172a;
-  border: 1px solid #334155;
-  border-radius: 4px;
-  color: #e2e8f0;
-  font-size: 13px;
-  outline: none;
-  transition:
-    border-color 0.2s ease,
-    outline-color 0.2s ease;
-}
-
-input[type="text"]:focus,
-input[type="password"]:focus,
-select:focus,
-textarea:focus {
-  border-color: #4ade80;
-}
-
-/* Number inputs sit inline with their label/hint ("Every [60] minutes"), so
-   they keep a compact fixed width instead of the block 100% rule above. */
-input[type="number"] {
-  display: inline-block;
-  width: 72px;
-  padding: 4px 6px;
-  margin: 0 6px;
-  background: #0f172a;
-  border: 1px solid #334155;
-  border-radius: 4px;
-  color: #e2e8f0;
-  font-size: 13px;
-  outline: none;
-  transition: border-color 0.2s ease;
-}
-
-input[type="number"]:focus {
-  border-color: #4ade80;
-}
-
-input[type="number"]:invalid {
-  border-color: #f87171;
-}
-
-.hint {
-  color: #94a3b8;
-  font-size: 11px;
-}
-
-.setting-row {
-  margin-bottom: 8px;
-}
-
-.setting-row label,
-.setting-row legend {
-  margin-bottom: 4px;
-}
-
-.segmented {
-  display: flex;
-  gap: 0;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-.segmented button {
-  flex: 1;
-  padding: 6px 4px;
-  border: none;
-  background: transparent;
-  color: #94a3b8;
-  cursor: pointer;
-  font-size: 11px;
-  transition:
-    background-color 0.2s ease,
-    color 0.2s ease,
-    transform 0.1s ease;
-}
-
-.segmented button:hover {
-  background: #1e293b;
-}
-
-.segmented button:active:not(:disabled) {
-  transform: scale(0.98);
-}
-
-.segmented button.active {
-  background: #4ade80;
-  color: #0f172a;
-  font-weight: 600;
-}
-
-.radio-group {
-  display: flex;
-  gap: 16px;
-  margin-bottom: 6px;
-}
-
-.radio-group label,
-.checkbox {
+.status {
   display: flex;
   align-items: center;
-  gap: 4px;
-  color: #e2e8f0;
-  font-size: 13px;
-  cursor: pointer;
+  gap: 7px;
+  font-size: 10px;
+  color: var(--muted);
 }
 
-input[type="radio"],
-input[type="checkbox"] {
-  accent-color: #4ade80;
+.pulse {
+  width: 7px;
+  height: 7px;
+  background: var(--accent-green);
+  position: relative;
 }
 
-button:focus-visible,
-input:focus-visible {
-  outline: 2px solid #4ade80;
-  outline-offset: 2px;
+.pulse::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid var(--accent-green);
+  animation: pulse 1.6s ease-out infinite;
 }
 
-.segmented button:focus-visible {
-  outline: 2px solid transparent;
-  box-shadow: inset 0 0 0 2px #4ade80;
+.status.off .pulse {
+  background: var(--muted);
 }
 
-.segmented button.active:focus-visible {
-  box-shadow: inset 0 0 0 2px #0f172a;
+.status.off .pulse::after {
+  display: none;
 }
 
-button.primary {
-  display: block;
-  width: 100%;
-  padding: 8px;
-  background: #4ade80;
-  color: #0f172a;
-  border: none;
-  border-radius: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  margin-bottom: 12px;
-  transition:
-    background-color 0.2s ease,
-    transform 0.1s ease;
+@keyframes pulse {
+  0% {
+    transform: scale(0.6);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
 }
 
-button.primary:hover {
-  background: #22c55e;
+@media (prefers-reduced-motion: reduce) {
+  .pulse::after {
+    animation: none;
+  }
 }
 
-button.primary:active:not(:disabled) {
-  transform: scale(0.98);
+/* --- Two columns: controls | progress and log --- */
+.cols {
+  display: grid;
+  grid-template-columns: 420px minmax(0, 1fr);
+  min-height: var(--view-h);
 }
 
-button.primary:disabled {
-  background: #334155;
-  color: #94a3b8;
-  cursor: not-allowed;
+/* --- Body --- */
+.body {
+  border-right: 1px solid var(--ink);
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
-button.primary:disabled[aria-busy="true"] {
-  background: rgba(74, 222, 128, 0.7);
-  color: #0f172a;
-  cursor: wait;
+.row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
 }
 
-button.secondary {
-  display: block;
-  width: 100%;
-  padding: 6px;
-  background: transparent;
-  color: #94a3b8;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  font-size: 12px;
-  cursor: pointer;
-  margin-bottom: 12px;
-  transition:
-    border-color 0.2s ease,
-    color 0.2s ease,
-    transform 0.1s ease;
+.row .k {
+  font-size: 10px;
+  color: var(--muted);
 }
 
-button.secondary:hover {
-  border-color: #94a3b8;
-  color: #e2e8f0;
-}
-
-button.secondary:active:not(:disabled) {
-  transform: scale(0.98);
-}
-
-.current-info {
-  font-size: 12px;
-  color: #94a3b8;
-  margin-bottom: 6px;
-}
-
-.progress-bar {
-  height: 4px;
-  background: #334155;
-  border-radius: 2px;
-  margin-bottom: 8px;
-  overflow: hidden;
-}
-
-.progress-fill {
-  height: 100%;
-  background: #4ade80;
-  border-radius: 2px;
-  width: 0%;
-  transition: width 0.3s ease;
-}
-
-.log {
-  max-height: 200px;
-  overflow-y: auto;
-  padding: 8px;
-  background: #0f172a;
-  border-radius: 4px;
-  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
-  font-size: 11px;
-  line-height: 1.5;
-  color: #94a3b8;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.summary {
-  font-family: "JetBrains Mono", "Fira Code", monospace;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.summary .total {
-  color: #4ade80;
-  font-weight: 600;
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid #334155;
-}
-
-.summary .error {
-  color: #f87171;
-}
-
-.summary .skipped {
-  color: #fbbf24;
-}
-
-/* CSP compliance additions */
-.hidden {
-  /* biome-ignore lint/complexity/noImportantStyles: utility must beat button.primary/.secondary (0,1,1) display:block */
-  display: none !important;
+.row .v {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .fieldset-reset {
   border: none;
+  min-width: 0;
+}
+
+.fieldset-reset legend {
+  float: left;
   padding: 0;
+}
+
+/* --- Items dropdown --- */
+.sel {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.sel-btn {
+  width: 100%;
+  height: 30px;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.sel-btn .tri {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid var(--ink);
+}
+
+.sel-btn.open {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+.sel-btn.open .tri {
+  border-top-color: var(--mark);
+}
+
+/* The repository <select> wears the same look, with a drawn triangle. */
+select.sel-btn {
+  appearance: none;
+  width: auto;
+  flex: 0 1 auto;
+  max-width: 55%;
+  padding-right: 26px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--ink) 50%), linear-gradient(135deg, var(--ink) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 10px) 50%;
+  background-size:
+    4px 6px,
+    4px 6px;
+  background-repeat: no-repeat;
+}
+
+.menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 10;
+  max-height: 340px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--ink);
+  border-top: none;
+  box-shadow: 7px 7px 0 var(--mark);
+  display: none;
+}
+
+.menu.open {
+  display: block;
+}
+
+.menu:focus {
+  outline: none;
+}
+
+.menu .grp {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 8px 10px 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.menu .grp::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--faint);
+}
+
+.menu .opt {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.menu .opt:hover,
+.menu .opt.active {
+  background: var(--mark);
+}
+
+.menu .opt.cur {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+.menu .opt.cur.active {
+  outline: 2px solid var(--mark);
+  outline-offset: -2px;
+}
+
+.menu .opt .n {
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--faint);
+  padding: 0 5px;
+}
+
+.menu .opt.cur .n {
+  background: transparent;
+  color: var(--mark);
+}
+
+/* --- Inputs --- */
+input[type="text"],
+input[type="password"],
+input[type="number"] {
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  height: 30px;
+  padding: 0 8px;
+  outline: none;
+  letter-spacing: 0.02em;
+  min-width: 0;
+}
+
+.custom-repo-input {
+  flex: 1;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #9a9a96;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+select:focus-visible,
+summary:focus-visible,
+a:focus-visible,
+pre:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  flex: none;
+  cursor: pointer;
+  position: relative;
   margin: 0;
-  display: contents;
+}
+
+input[type="radio"] {
+  border-radius: 50%;
+}
+
+input[type="checkbox"]:checked,
+input[type="radio"]:checked {
+  background: var(--ink);
+}
+
+input[type="checkbox"]:checked::after,
+input[type="radio"]:checked::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  background: var(--mark);
+}
+
+input[type="radio"]:checked::after {
+  border-radius: 50%;
+}
+
+label.cb {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12.5px;
+  color: var(--ink-body);
+  cursor: pointer;
+}
+
+.opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 58px;
+  resize: vertical;
+  font-family: var(--ff);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  padding: 7px 9px;
+  outline: none;
+}
+
+textarea:disabled {
+  border-color: var(--faint);
+  background: transparent;
+  color: var(--muted);
+}
+
+.hint {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--faint);
+  padding: 1px 6px;
+}
+
+.shint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.03em;
+}
+
+/* --- Tooltips: a "?" button shows the text on hover or focus; Escape hides it --- */
+.stack {
+  position: relative;
+}
+
+.tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tip-btn {
+  width: 15px;
+  height: 15px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--muted);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: help;
+}
+
+.tip-btn:hover,
+.tip-btn:focus-visible {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.tip-box {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 28px;
+  z-index: 30;
+  padding: 7px 9px;
+  background: var(--ink);
+  color: var(--bg);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  box-shadow: 4px 4px 0 var(--mark);
+}
+
+.tip:hover .tip-box,
+.tip-btn:focus-visible + .tip-box {
+  display: block;
+}
+
+.tip.tip-off .tip-box {
+  display: none;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--faint);
+}
+
+/* --- Actions --- */
+.actions {
+  display: flex;
+  gap: 10px;
+}
+
+button.act {
+  flex: 1;
+  height: 38px;
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  transition:
+    background var(--t-fast),
+    color var(--t-fast),
+    transform var(--t-fast);
+}
+
+button.act.pri {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+button.act:hover:not(:disabled) {
+  background: var(--mark);
+  color: var(--mark-text);
+  border-color: var(--mark);
+  transform: translateY(-2px);
+}
+
+button.act:disabled {
+  cursor: progress;
+  opacity: 0.55;
+}
+
+/* --- Settings / Schedule / Export: side by side in the header --- */
+.lrow {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  margin-left: auto;
+  margin-right: 18px;
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.lrow > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-left: 1px solid var(--faint);
+  background: transparent;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+
+.lrow > button:last-child {
+  border-right: 1px solid var(--faint);
+}
+
+.lrow > button:hover:not(:disabled),
+.lrow > button[aria-expanded="true"] {
+  background: var(--mark);
+}
+
+.lrow .caret {
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid var(--ink);
+  transition: transform var(--t-fast);
+}
+
+.xbtn[aria-expanded="true"] .caret {
+  transform: rotate(90deg);
+}
+
+.xb {
+  min-height: var(--view-h);
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: var(--ff);
+  font-weight: 400;
+  font-size: 12.5px;
+}
+
+.xb .linkrow {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-decoration: none;
+  padding: 2px 0;
+}
+
+.xb .linkrow:hover {
+  background: var(--mark);
+}
+
+.lrow .dl {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--ink);
+  position: relative;
+}
+
+.lrow .dl::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 1px;
+  background: var(--ink);
+}
+
+.xb.set {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  align-items: start;
+  gap: 0 24px;
+}
+
+.srow {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--faint);
+}
+
+.srow .sk {
+  padding: 8px 0 0;
+  font-size: 9.5px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.srow .sv {
+  padding: 6px 0 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+.line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-height: 26px;
+}
+
+.line .l {
+  font-size: 12px;
+  color: var(--ink-body);
+}
+
+.line .u {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.xb input[type="text"],
+.xb input[type="password"],
+.xb input[type="number"] {
+  height: 26px;
+}
+
+.xb input.n {
+  width: 56px;
+  text-align: center;
+}
+
+.xb input.s {
+  width: 96px;
+}
+
+.xb input.m {
+  width: 110px;
+}
+
+.xb input.w {
+  flex: 1;
+}
+
+input:invalid {
+  border-color: var(--danger);
 }
 
 .validation-error {
   display: none;
-  color: #f87171;
+  color: var(--danger);
   font-size: 11px;
-  margin-top: 4px;
 }
 
-input[type="text"]:invalid,
-input[type="password"]:invalid {
-  border-color: #f87171;
-}
-
-input[type="text"]:invalid:focus,
-input[type="password"]:invalid:focus,
-input[type="text"]:invalid:focus-visible,
-input[type="password"]:invalid:focus-visible {
-  outline-color: #f87171;
-  border-color: #f87171;
-}
-
-input:invalid ~ .validation-error {
+.sv:has(input:invalid) .validation-error {
   display: block;
 }
 
-.block-hint {
-  display: block;
-  margin-left: 20px;
+/* --- Progress / log: fills the right column at the controls' height, so a
+   long log scrolls inside itself and never grows the popup --- */
+.log {
+  position: relative;
+  min-height: 0;
+}
+
+.log-in {
+  position: absolute;
+  inset: 0;
+  padding: 14px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.log .h {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.bar {
+  height: 4px;
+  background: var(--faint);
+  position: relative;
+}
+
+.bar i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: var(--ink);
+  transition: width var(--t-fast);
+}
+
+.idle,
+.current-info {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.current-info:empty {
+  display: none;
+}
+
+.log pre {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--ink-body);
+  white-space: pre-wrap;
+  word-break: break-word;
   margin-top: 2px;
+}
+
+.summary {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.summary .total {
+  font-weight: 600;
+  background: var(--mark);
+  align-self: flex-start;
+  padding: 0 4px;
+}
+
+.summary .error {
+  color: var(--danger);
+}
+
+.btns {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.btns:not(:has(button:not(.hidden))) {
+  display: none;
+}
+
+button.sb {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 7px 10px;
   cursor: pointer;
+  transition:
+    background var(--t-fast),
+    color var(--t-fast);
 }
 
-.custom-repo-input {
-  margin-top: 6px;
-  font-size: 12px;
+button.sb.pri {
+  background: var(--ink);
+  color: var(--bg);
 }
 
-textarea {
-  resize: vertical;
-  font-family: inherit;
-}
-
-.continue-error-label {
-  display: block;
-  margin-top: 10px;
-}
-
-.download-btn {
-  margin-top: 8px;
-}
-
-footer {
-  margin-top: 12px;
-  padding-top: 8px;
-  border-top: 1px solid #2d2d4a;
-  text-align: center;
-}
-
-.footer-link {
-  color: #94a3b8;
-  font-size: 11px;
-  text-decoration: none;
-  transition: color 0.2s ease;
-}
-
-.footer-link:hover {
-  color: #4ade80;
-  text-decoration: underline;
+button.sb:hover {
+  background: var(--mark);
+  color: var(--mark-text);
 }
