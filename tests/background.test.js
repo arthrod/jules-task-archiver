@@ -1554,6 +1554,39 @@ describe('startOperation refactoring', () => {
     assert.strictEqual(sandbox.test_state().error, 'No Jules tabs found')
   })
 
+  // Tabs run in parallel; two tabs on one account would each read the same
+  // remaining daily quota and could start twice the limit.
+  it('discoverTabs should keep one tab per account', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 1, url: 'https://jules.google.com/u/0/session/a' },
+      { id: 2, url: 'https://jules.google.com/u/1/' },
+      { id: 3, url: 'https://jules.google.com/u/0/repo/x' },
+      { id: 4, url: 'https://jules.google.com/tasks' }
+    ]
+    const tabs = await sandbox.test_discoverTabs({ scope: 'all' })
+
+    assert.deepStrictEqual(
+      Array.from(tabs, (t) => t.id),
+      [1, 2]
+    )
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Skipping 2 duplicate tab(s)')))
+  })
+
+  it('discoverTabs should keep the active tab for current scope even when the account has another tab', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 1, url: 'https://jules.google.com/u/0/session/a' },
+      { id: 3, url: 'https://jules.google.com/u/0/repo/x' }
+    ]
+    const tabs = await sandbox.test_discoverTabs({ scope: 'current', activeTabId: 3 })
+
+    assert.deepStrictEqual(
+      Array.from(tabs, (t) => t.id),
+      [3]
+    )
+  })
+
   it('discoverTabs should return filtered tabs', async () => {
     const { sandbox } = setupEnvironment()
     sandbox.chrome.tabs.query = async () => [

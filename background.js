@@ -1948,6 +1948,22 @@ async function discoverTabs(options) {
     tabs = tabs.filter((t) => t.id === options.activeTabId)
   }
 
+  // Tabs are processed in parallel. Two tabs on one account would each read
+  // the same remaining daily quota (and repeat the same archive/dismiss
+  // calls), so keep only the first tab per account.
+  const seenAccounts = new Set()
+  const uniqueTabs = []
+  for (const t of tabs) {
+    const num = extractAccountNum(t.url)
+    if (seenAccounts.has(num)) continue
+    seenAccounts.add(num)
+    uniqueTabs.push(t)
+  }
+  if (uniqueTabs.length < tabs.length) {
+    addLog(`Skipping ${tabs.length - uniqueTabs.length} duplicate tab(s) for an already-listed account`)
+  }
+  tabs = uniqueTabs
+
   if (tabs.length === 0) {
     addLog('No Jules tabs found. Open jules.google.com first.')
     updateState({ status: 'error', error: 'No Jules tabs found' })
