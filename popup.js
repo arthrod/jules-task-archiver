@@ -2,7 +2,8 @@
 /**
  * Jules Task Archiver — Popup Script
  *
- * Handles UI interactions, settings persistence, and progress display.
+ * The Items dropdown with Proceed and Archive, settings persistence and
+ * progress display. items.js (loaded first) provides the dropdown entries.
  */
 
 const $ = (sel) => document.querySelector(sel)
@@ -12,34 +13,57 @@ const $ = (sel) => document.querySelector(sel)
 // (devtools, extension context) and bypasses the input's typing limit.
 const MAX_OWNER_LEN = 39
 const MAX_TOKEN_LEN = 255
-// Matches #continueMessage's maxlength and the background's cap.
-const MAX_CONTINUE_MESSAGE_LEN = 2000
+// Matches #message's maxlength and the background's cap.
+const MAX_MESSAGE_LEN = 2000
+const JULES_TABS_URL = 'https://jules.google.com/*'
+const SCHEDULE_ALARM_NAME = 'jta-scheduled-tick'
 
 // --- DOM refs ---
-const mainForm = $('#mainForm')
+const itemsBtn = $('#itemsBtn')
+const itemsBtnText = $('#itemsBtnText')
+const itemsMenu = $('#itemsMenu')
+const dryRunInput = $('#dryRun')
+const forceInput = $('#force')
+const addMessageInput = $('#addMessage')
+const messageInput = $('#message')
+const messageHint = $('#messageHint')
+const oneSessionRow = $('#oneSessionRow')
+const oneSessionInput = $('#oneSession')
+const proceedBtn = $('#proceedBtn')
+const archiveBtn = $('#archiveBtn')
+const exportBtn = $('#exportBtn')
 const ghOwnerInput = $('#ghOwner')
 const ghTokenInput = $('#ghToken')
-const forceCheckbox = $('#force')
 const repoFilterInput = $('#repoFilter')
 const customRepoInput = $('#customRepoInput')
-const continueMessageInput = $('#continueMessage')
-const continueErrorMessageInput = $('#continueErrorMessage')
-const continueMessageRow = $('#continueMessageRow')
-const startBtn = $('#startBtn')
 const resetBtn = $('#resetBtn')
 const downloadBtn = $('#downloadBtn')
-const progressSection = $('#progressSection')
-const summarySection = $('#summarySection')
+const logStatus = $('#logStatus')
+const idleText = $('#idleText')
 const currentInfo = $('#currentInfo')
 const progressFill = $('#progressFill')
 const logPre = $('#log')
+const summarySection = $('#summarySection')
 const summaryDiv = $('#summary')
+const tabStatus = $('#tabStatus')
+const tabStatusText = $('#tabStatusText')
+const settingsToggle = $('#settingsToggle')
+const scheduleToggle = $('#scheduleToggle')
+const settingsPanel = $('#settingsPanel')
+const schedulePanel = $('#schedulePanel')
+const mainView = $('#mainView')
 
 // --- Schedule settings (read by background.js's chrome.alarms tick) ---
 const schedEnabledInput = $('#schedEnabled')
 const schedIntervalInput = $('#schedInterval')
 const schedSuggestionsInput = $('#schedSuggestions')
 const schedMaxStartsInput = $('#schedMaxStarts')
+const schedNext = $('#schedNext')
+
+// Run state. Declared up front: Chrome calls the storage callbacks below
+// asynchronously, but nothing guarantees it.
+let runningAction = null
+let lastExportData = null
 
 // Storage-side bounds match background.js; the background re-validates anyway,
 // these just keep obviously-bad values out of sync storage.
@@ -49,120 +73,283 @@ function readClampedNumber(input, min, max, fallback) {
   return Math.min(max, Math.max(min, n))
 }
 
-// --- Operation mode state ---
-let opMode = 'archive'
+// =============================================================================
+// Items dropdown
+// =============================================================================
 
-function getRunningText() {
-  const modeRadio = document.querySelector('input[name="mode"]:checked')
-  const isDry = modeRadio && modeRadio.value === 'dry'
+const ITEMS = listItems()
+let selectedItemId = ITEM_ALL
+let activeOptionIndex = -1
+let optionEls = []
 
-  if (opMode === 'archive') {
-    return isDry ? '⏳ Dry Running Archive...' : '⏳ Running Archive...'
-  } else if (opMode === 'remove_suggestions') {
-    return isDry ? '⏳ Dry Running Remove Suggestions...' : '⏳ Running Remove Suggestions...'
-  } else if (opMode === 'export_suggestions') {
-    return '⏳ Exporting Suggestions to JSON...'
-  } else if (opMode === 'agent_batch') {
-    return isDry ? '⏳ Dry Running Batch Agent...' : '⏳ Launching Single Agent for All Suggestions...'
-  } else if (opMode === 'continue_waiting') {
-    return isDry ? '⏳ Dry Running Continue Waiting...' : '⏳ Continuing Waiting Tasks...'
-  } else {
-    return isDry ? '⏳ Dry Running Suggestions...' : '⏳ Running Suggestions...'
-  }
+function getSelectedItem() {
+  return ITEMS.find((i) => i.id === selectedItemId) || ITEMS[0]
 }
 
-function getStartButtonText(value, isDry) {
-  if (value === 'archive') {
-    return isDry ? 'Dry Run Archive' : 'Start Archiving'
-  } else if (value === 'remove_suggestions') {
-    return isDry ? 'Dry Run Remove Suggestions' : 'Remove Suggestions'
-  } else if (value === 'export_suggestions') {
-    return 'Export Suggestions JSON'
-  } else if (value === 'agent_batch') {
-    return isDry ? 'Dry Run Batch Agent' : 'Launch Batch Agent'
-  } else if (value === 'continue_waiting') {
-    return isDry ? 'Dry Run Continue Waiting' : 'Continue Waiting Tasks'
-  } else {
-    return isDry ? 'Dry Run Suggestions' : 'Start Suggestions'
-  }
+function itemKind(item) {
+  if (item.type === 'suggestions') return 'suggestions'
+  if (item.codes === null) return 'all'
+  return TASK_STATES.find((s) => s.code === item.code)?.kind || 'unknown'
 }
 
-// --- Operation mode selector ---
-function setActiveOpMode(value) {
-  opMode = value
-  updateOpModeUI(value)
+// What the message does for the chosen item, shown under the message box.
+// The message is always added after the text the extension sends itself, or
+// sent on its own where the extension sends nothing.
+const MESSAGE_HINTS = {
+  all: 'Added after the default reply and retry prompt, and sent on its own to running sessions.',
+  feedback: 'Added after the default reply.',
+  plan: "Plans are approved; an approval can't carry a message.",
+  paused: "Paused sessions are resumed; a resume can't carry a message.",
+  running: 'Sent to each running session. Without a message, running sessions are left alone.',
+  error: 'Added after the default retry prompt. A retry starts a new run and uses daily quota.',
+  completed: 'Sent as a follow-up. Each one starts a new run and uses daily quota.',
+  unknown: 'Sent to each session. Without a message, these are left alone.',
+  suggestions: "Added after each suggestion's prompt."
 }
 
-function updateOpModeUI(value) {
-  document.querySelectorAll('#opMode button').forEach((b) => {
-    const isActive = b.dataset.value === value
-    b.classList.toggle('active', isActive)
-    b.setAttribute('aria-pressed', String(isActive))
-  })
-
-  // Progressive disclosure: hide archive-specific settings
-  const isArchive = value === 'archive'
-  const settingsSection = document.querySelector('.settings')
-  const forceCheckboxContainer = forceCheckbox.closest('.setting-row')
-
-  if (settingsSection) {
-    settingsSection.classList.toggle('hidden', !isArchive)
-  }
-  if (forceCheckboxContainer) {
-    forceCheckboxContainer.classList.toggle('hidden', !isArchive)
-  }
-  continueMessageRow?.classList.toggle('hidden', value !== 'continue_waiting')
-
-  // Context-aware start button text
-  if (!startBtn.disabled) {
-    const modeRadio = document.querySelector('input[name="mode"]:checked')
-    const isDry = modeRadio && modeRadio.value === 'dry'
-    startBtn.textContent = getStartButtonText(value, isDry)
-  }
+function optionDomId(item) {
+  return `item-${item.id.replace(/[^a-z0-9]/gi, '-')}`
 }
 
-document.querySelectorAll('#opMode button').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    setActiveOpMode(btn.dataset.value)
-    chrome.storage.sync.set({ opMode })
-  })
-})
-
-// Update button text when execution mode changes
-document.querySelectorAll('input[name="mode"]').forEach((radio) => {
-  radio.addEventListener('change', () => {
-    if (!startBtn.disabled && !startBtn.textContent.startsWith('⏳')) {
-      updateOpModeUI(opMode)
+function renderItemsMenu() {
+  itemsMenu.textContent = ''
+  optionEls = []
+  let groupEl = null
+  let groupName = null
+  for (const item of ITEMS) {
+    if (item.group !== groupName) {
+      groupName = item.group
+      groupEl = document.createElement('div')
+      groupEl.setAttribute('role', 'group')
+      const heading = document.createElement('div')
+      heading.className = 'grp'
+      heading.id = `items-group-${groupName.toLowerCase()}`
+      heading.setAttribute('role', 'presentation')
+      heading.textContent = groupName
+      groupEl.setAttribute('aria-labelledby', heading.id)
+      groupEl.appendChild(heading)
+      itemsMenu.appendChild(groupEl)
     }
+    const opt = document.createElement('div')
+    opt.className = 'opt'
+    opt.id = optionDomId(item)
+    opt.setAttribute('role', 'option')
+    opt.setAttribute('aria-label', item.label)
+    opt.setAttribute('aria-selected', String(item.id === selectedItemId))
+    opt.dataset.id = item.id
+    const name = document.createElement('span')
+    name.textContent = item.name || item.label
+    opt.appendChild(name)
+    if (item.code !== undefined) {
+      const code = document.createElement('span')
+      code.className = 'n'
+      code.setAttribute('aria-hidden', 'true')
+      code.textContent = String(item.code)
+      opt.appendChild(code)
+    }
+    opt.addEventListener('click', () => {
+      selectItem(item.id)
+      closeItemsMenu(true)
+    })
+    groupEl.appendChild(opt)
+    optionEls.push(opt)
+  }
+}
+
+function selectItem(id, { save = true } = {}) {
+  if (!ITEMS.some((i) => i.id === id)) return
+  selectedItemId = id
+  const item = getSelectedItem()
+  itemsBtnText.textContent = item.label
+  for (const opt of optionEls) {
+    const selected = opt.dataset.id === id
+    opt.setAttribute('aria-selected', String(selected))
+    opt.classList.toggle('cur', selected)
+  }
+  updateItemUI()
+  if (save) chrome.storage.sync.set({ item: id })
+}
+
+function updateItemUI() {
+  const item = getSelectedItem()
+  oneSessionRow.classList.toggle('hidden', item.type !== 'suggestions')
+  messageHint.textContent = MESSAGE_HINTS[itemKind(item)]
+}
+
+function setActiveOption(index) {
+  if (optionEls.length === 0) return
+  activeOptionIndex = (index + optionEls.length) % optionEls.length
+  optionEls.forEach((opt, i) => {
+    opt.classList.toggle('active', i === activeOptionIndex)
   })
+  const active = optionEls[activeOptionIndex]
+  itemsMenu.setAttribute('aria-activedescendant', active.id)
+  active.scrollIntoView?.({ block: 'nearest' })
+}
+
+function openItemsMenu() {
+  itemsBtn.setAttribute('aria-expanded', 'true')
+  itemsBtn.classList.add('open')
+  itemsMenu.classList.add('open')
+  setActiveOption(
+    Math.max(
+      0,
+      ITEMS.findIndex((i) => i.id === selectedItemId)
+    )
+  )
+  itemsMenu.focus()
+}
+
+function closeItemsMenu(returnFocus) {
+  itemsBtn.setAttribute('aria-expanded', 'false')
+  itemsBtn.classList.remove('open')
+  itemsMenu.classList.remove('open')
+  itemsMenu.removeAttribute('aria-activedescendant')
+  if (returnFocus) itemsBtn.focus()
+}
+
+function isItemsMenuOpen() {
+  return itemsBtn.getAttribute('aria-expanded') === 'true'
+}
+
+itemsBtn.addEventListener('click', () => {
+  if (isItemsMenuOpen()) closeItemsMenu(true)
+  else openItemsMenu()
 })
 
-// --- Load saved settings & cleanup insecure storage ---
+itemsBtn.addEventListener('keydown', (e) => {
+  if (['ArrowDown', 'ArrowUp', 'Enter', ' '].includes(e.key)) {
+    e.preventDefault()
+    openItemsMenu()
+  }
+})
+
+itemsMenu.addEventListener('keydown', (e) => {
+  switch (e.key) {
+    case 'ArrowDown':
+      e.preventDefault()
+      setActiveOption(activeOptionIndex + 1)
+      break
+    case 'ArrowUp':
+      e.preventDefault()
+      setActiveOption(activeOptionIndex - 1)
+      break
+    case 'Home':
+      e.preventDefault()
+      setActiveOption(0)
+      break
+    case 'End':
+      e.preventDefault()
+      setActiveOption(optionEls.length - 1)
+      break
+    case 'Enter':
+    case ' ':
+      e.preventDefault()
+      selectItem(optionEls[activeOptionIndex].dataset.id)
+      closeItemsMenu(true)
+      break
+    case 'Escape':
+      e.preventDefault()
+      closeItemsMenu(true)
+      break
+    case 'Tab':
+      closeItemsMenu(false)
+      break
+    default:
+      break
+  }
+})
+
+document.addEventListener?.('click', (e) => {
+  if (isItemsMenuOpen() && !itemsBtn.contains(e.target) && !itemsMenu.contains(e.target)) closeItemsMenu(false)
+})
+
+renderItemsMenu()
+selectItem(ITEM_ALL, { save: false })
+
+// =============================================================================
+// Message box
+// =============================================================================
+
+function updateMessageBox() {
+  messageInput.disabled = !addMessageInput.checked
+}
+
+addMessageInput.addEventListener('change', () => {
+  updateMessageBox()
+  if (addMessageInput.checked) messageInput.focus()
+})
+
+// Saved shortly after typing stops (sync storage limits writes per minute), and
+// at once on change, so closing the popup mid-sentence keeps the text.
+let messageSaveTimer = null
+function saveMessage() {
+  clearTimeout(messageSaveTimer)
+  chrome.storage.sync.set({ message: messageInput.value.trim().slice(0, MAX_MESSAGE_LEN) })
+}
+messageInput.addEventListener('input', () => {
+  clearTimeout(messageSaveTimer)
+  messageSaveTimer = setTimeout(saveMessage, 400)
+})
+messageInput.addEventListener('change', saveMessage)
+
+// --- Settings / Schedule: side-by-side toggles in the header. An open panel
+// takes the place of the controls and log, one panel at a time, so the popup
+// never needs to scroll. ---
+const PANELS = [
+  [settingsToggle, settingsPanel],
+  [scheduleToggle, schedulePanel]
+]
+function togglePanel(toggle) {
+  let anyOpen = false
+  for (const [btn, panel] of PANELS) {
+    const open = btn === toggle && btn.getAttribute('aria-expanded') !== 'true'
+    btn.setAttribute('aria-expanded', String(open))
+    panel.classList.toggle('hidden', !open)
+    anyOpen ||= open
+  }
+  mainView.classList.toggle('hidden', anyOpen)
+}
+for (const [btn] of PANELS) btn.addEventListener('click', () => togglePanel(btn))
+
+// --- Tooltips: Escape hides an open one until the pointer or focus leaves ---
+const tips = document.querySelectorAll('.tip')
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') for (const tip of tips) tip.classList.add('tip-off')
+})
+for (const tip of tips) {
+  tip.addEventListener('mouseleave', () => tip.classList.remove('tip-off'))
+  tip.addEventListener('focusout', () => tip.classList.remove('tip-off'))
+}
+
+dryRunInput.addEventListener('change', () => {
+  if (!isRunning()) showIdle()
+})
+
+// =============================================================================
+// Load saved settings & cleanup insecure storage
+// =============================================================================
+
 chrome.storage.sync.get(
   [
     'ghOwner',
-    'opMode',
+    'item',
+    'message',
     'ghToken',
     'schedEnabled',
     'schedIntervalMin',
     'schedStartSuggestions',
-    'schedMaxStarts',
-    'continueMessage',
-    'continueErrorMessage'
+    'schedMaxStarts'
   ],
   (syncData) => {
-    if (typeof syncData.continueMessage === 'string') continueMessageInput.value = syncData.continueMessage
-    if (typeof syncData.continueErrorMessage === 'string') {
-      continueErrorMessageInput.value = syncData.continueErrorMessage
-    }
+    if (typeof syncData.item === 'string' && !isRunning()) selectItem(syncData.item, { save: false })
+    if (typeof syncData.message === 'string') messageInput.value = syncData.message
     schedEnabledInput.checked = syncData.schedEnabled === true
     if (syncData.schedIntervalMin !== undefined) schedIntervalInput.value = String(syncData.schedIntervalMin)
     schedSuggestionsInput.checked = syncData.schedStartSuggestions === true
     if (syncData.schedMaxStarts !== undefined) schedMaxStartsInput.value = String(syncData.schedMaxStarts)
     if (syncData.ghOwner) ghOwnerInput.value = syncData.ghOwner
-    if (syncData.opMode) {
-      setActiveOpMode(syncData.opMode)
-    }
+    showNextScheduledRun()
 
     // Cleanup legacy insecure storage of token in sync
     if (syncData.ghToken) {
@@ -178,6 +365,7 @@ chrome.storage.sync.get(
     })
   }
 )
+
 // --- Save settings on change ---
 ghOwnerInput.addEventListener('change', () => {
   chrome.storage.sync.set({ ghOwner: ghOwnerInput.value.trim().slice(0, MAX_OWNER_LEN) })
@@ -185,24 +373,19 @@ ghOwnerInput.addEventListener('change', () => {
 ghTokenInput.addEventListener('change', () => {
   chrome.storage.local.set({ ghToken: ghTokenInput.value.trim().slice(0, MAX_TOKEN_LEN) })
 })
-continueMessageInput.addEventListener('change', () => {
-  chrome.storage.sync.set({ continueMessage: continueMessageInput.value.trim().slice(0, MAX_CONTINUE_MESSAGE_LEN) })
-})
-continueErrorMessageInput.addEventListener('change', () => {
-  chrome.storage.sync.set({
-    continueErrorMessage: continueErrorMessageInput.value.trim().slice(0, MAX_CONTINUE_MESSAGE_LEN)
-  })
-})
 
 // Schedule settings persist on change; background.js's storage.onChanged
 // listener reconciles the chrome.alarms schedule — no message needed.
 schedEnabledInput.addEventListener('change', () => {
   chrome.storage.sync.set({ schedEnabled: schedEnabledInput.checked === true })
+  // The background re-creates the alarm after the write lands.
+  setTimeout(showNextScheduledRun, 300)
 })
 schedIntervalInput.addEventListener('change', () => {
   const minutes = readClampedNumber(schedIntervalInput, 1, 1440, 60)
   schedIntervalInput.value = String(minutes)
   chrome.storage.sync.set({ schedIntervalMin: minutes })
+  setTimeout(showNextScheduledRun, 300)
 })
 schedSuggestionsInput.addEventListener('change', () => {
   chrome.storage.sync.set({ schedStartSuggestions: schedSuggestionsInput.checked === true })
@@ -213,7 +396,48 @@ schedMaxStartsInput.addEventListener('change', () => {
   chrome.storage.sync.set({ schedMaxStarts: maxStarts })
 })
 
-// --- Repository picker ---
+function showNextScheduledRun() {
+  if (!schedNext || !chrome.alarms?.get) return
+  if (!schedEnabledInput.checked) {
+    schedNext.classList.add('hidden')
+    return
+  }
+  Promise.resolve(chrome.alarms.get(SCHEDULE_ALARM_NAME)).then((alarm) => {
+    if (!alarm?.scheduledTime) {
+      schedNext.classList.add('hidden')
+      return
+    }
+    const time = new Date(alarm.scheduledTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    schedNext.textContent = `next ${time}`
+    schedNext.classList.remove('hidden')
+  })
+}
+
+// =============================================================================
+// Header: open Jules tabs
+// =============================================================================
+
+function showJulesTabs() {
+  Promise.resolve(chrome.tabs.query({ url: JULES_TABS_URL })).then((tabs) => {
+    const julesTabs = (tabs || []).filter((t) => t.url && !t.url.includes('accounts.google'))
+    const accounts = new Set(julesTabs.map((t) => /\/u\/(\d+)(?:\/|$)/.exec(new URL(t.url).pathname)?.[1] || '0'))
+    tabStatus.classList.toggle('off', julesTabs.length === 0)
+    if (julesTabs.length === 0) {
+      tabStatusText.textContent = 'No Jules tab open'
+      return
+    }
+    const a = accounts.size
+    const t = julesTabs.length
+    tabStatusText.textContent = `${a} account${a === 1 ? '' : 's'} · ${t} tab${t === 1 ? '' : 's'}`
+  })
+}
+
+showJulesTabs()
+
+// =============================================================================
+// Repository picker
+// =============================================================================
+
 // Option 0 ("All Repositories", value '') stays; connected repos follow it.
 function applyCodebases(codebases) {
   const currentValue = repoFilterInput.value
@@ -271,9 +495,90 @@ customRepoInput.addEventListener('input', () => {
   if (customRepoInput.value.trim()) repoFilterInput.value = ''
 })
 
-// --- Start operation ---
-mainForm.addEventListener('submit', async (e) => {
-  e.preventDefault()
+// =============================================================================
+// Run: Proceed, Archive, Export
+// =============================================================================
+
+const RUN_BUTTONS = { proceed: proceedBtn, archive: archiveBtn, export: exportBtn }
+const RUN_BUTTON_TEXT = { proceed: 'Proceed', archive: 'Archive', export: 'Export suggestions' }
+const RUNNING_TEXT = { proceed: '⏳ Proceeding…', archive: '⏳ Archiving…', export: '⏳ Exporting…' }
+
+function isRunning() {
+  return runningAction !== null
+}
+
+function setRunning(action, dryRun) {
+  runningAction = RUN_BUTTONS[action] ? action : 'proceed'
+  for (const [name, btn] of Object.entries(RUN_BUTTONS)) {
+    btn.disabled = true
+    if (name === runningAction) {
+      btn.setAttribute('aria-busy', 'true')
+      btn.textContent = dryRun && name !== 'export' ? '⏳ Dry run…' : RUNNING_TEXT[name]
+    }
+  }
+}
+
+function setIdle() {
+  runningAction = null
+  for (const [name, btn] of Object.entries(RUN_BUTTONS)) {
+    btn.disabled = false
+    btn.removeAttribute('aria-busy')
+    btn.textContent = RUN_BUTTON_TEXT[name]
+  }
+}
+
+function showIdle() {
+  logStatus.textContent = 'Idle'
+  idleText.textContent = dryRunInput.checked
+    ? 'Dry-run is on: Proceed and Archive only list what they would do.'
+    : 'Dry-run is off: Proceed and Archive change your tasks.'
+}
+
+// Live runs that can't be undone from the popup ask first.
+function confirmLiveRun(action, item, force, message) {
+  if (action === 'archive' && item.id === ITEM_ALL) {
+    return window.confirm(
+      '⚠️ Archive every task?\n\nThis includes running sessions and sessions waiting on you.' +
+        (force ? '\n\nForce is on: tasks with a matching open pull request are archived too.' : '')
+    )
+  }
+  if (action === 'archive' && force) {
+    return window.confirm(
+      '⚠️ Force archive?\n\nTasks with a matching open pull request will be archived too.\n\nContinue?'
+    )
+  }
+  if (action === 'proceed' && force && item.id === ITEM_ALL && message) {
+    return window.confirm(
+      '⚠️ Force is on.\n\nCompleted tasks get your message as a follow-up, and each one starts a new run.\n\nContinue?'
+    )
+  }
+  return true
+}
+
+async function startRun(action) {
+  if (isRunning()) return
+  const item = getSelectedItem()
+  const dryRun = action === 'export' ? false : dryRunInput.checked
+  const force = forceInput.checked
+  const message = addMessageInput.checked ? (messageInput.value || '').trim().slice(0, MAX_MESSAGE_LEN) : ''
+  if (!dryRun && action !== 'export' && !confirmLiveRun(action, item, force, message)) return
+
+  // Lock the buttons before the first await so a second click can't start a
+  // second run while the current tab is looked up.
+  setRunning(action, dryRun)
+  togglePanel(null) // show the log
+  resetBtn.classList.add('hidden')
+  // A previous Export JSON result belongs to that run only.
+  downloadBtn.classList.add('hidden')
+  lastExportData = null
+  summarySection.classList.add('hidden')
+  idleText.classList.add('hidden')
+  logStatus.textContent = dryRun ? 'Starting · dry-run' : 'Starting'
+  currentInfo.textContent = 'Starting...'
+  progressFill.style.width = '0%'
+  progressFill.style.background = '' // Reset error color if present
+  logPre.textContent = ''
+
   // Save settings first, ensuring token is only in local storage
   chrome.storage.sync.set({
     ghOwner: ghOwnerInput.value.trim().slice(0, MAX_OWNER_LEN)
@@ -283,7 +588,6 @@ mainForm.addEventListener('submit', async (e) => {
     ghToken: ghTokenInput.value.trim().slice(0, MAX_TOKEN_LEN)
   })
 
-  const mode = document.querySelector('input[name="mode"]:checked').value
   const scope = document.querySelector('input[name="scope"]:checked').value
 
   // Get active tab for "current" scope
@@ -296,58 +600,47 @@ mainForm.addEventListener('submit', async (e) => {
     activeTabId = tab?.id
   }
 
-  if (mode === 'run' && forceCheckbox.checked && opMode === 'archive') {
-    if (
-      !window.confirm(
-        '⚠️ WARNING: You are about to FORCE archive tasks.\n\nThis will ignore task state and open Pull Requests.\n\nAre you sure you want to proceed?'
-      )
-    ) {
-      return
-    }
-  }
-
   const options = {
-    dryRun: mode === 'dry',
-    force: forceCheckbox.checked,
+    action,
+    item: item.id,
+    dryRun,
+    force,
+    message,
+    oneSession: item.type === 'suggestions' && oneSessionInput.checked,
     scope,
     activeTabId,
-    opMode,
-    repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim(),
-    continueMessage: (continueMessageInput.value || '').trim().slice(0, MAX_CONTINUE_MESSAGE_LEN),
-    continueErrorMessage: (continueErrorMessageInput.value || '').trim().slice(0, MAX_CONTINUE_MESSAGE_LEN)
+    repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim()
   }
 
-  // Reset UI
-  startBtn.disabled = true
-  startBtn.setAttribute('aria-busy', 'true')
-  startBtn.textContent = getRunningText()
-  resetBtn.classList.add('hidden')
-  // A previous Export JSON result belongs to that run only.
-  downloadBtn.classList.add('hidden')
-  lastExportData = null
-  progressSection.classList.remove('hidden')
-  summarySection.classList.add('hidden')
-  currentInfo.textContent = 'Starting...'
-  progressFill.style.width = '0%'
-  progressFill.style.background = '' // Reset error color if present
-  logPre.textContent = ''
+  chrome.runtime.sendMessage({ action: 'START', options }, (response) => {
+    if (response?.error) {
+      setIdle()
+      currentInfo.textContent = `Error: ${response.error}`
+      logStatus.textContent = 'Error'
+    }
+  })
+}
 
-  chrome.runtime.sendMessage({ action: 'START', options })
-})
+proceedBtn.addEventListener('click', () => startRun('proceed'))
+archiveBtn.addEventListener('click', () => startRun('archive'))
+exportBtn.addEventListener('click', () => startRun('export'))
 
 // --- Reset ---
 resetBtn.addEventListener('click', () => {
   chrome.runtime.sendMessage({ action: 'RESET' })
-  startBtn.disabled = false
-  startBtn.removeAttribute('aria-busy')
-  updateOpModeUI(opMode)
+  setIdle()
   resetBtn.classList.add('hidden')
   downloadBtn.classList.add('hidden')
-  progressSection.classList.add('hidden')
   summarySection.classList.add('hidden')
+  logPre.classList.add('hidden')
+  logPre.textContent = ''
+  currentInfo.textContent = ''
+  progressFill.style.width = '0%'
+  idleText.classList.remove('hidden')
+  showIdle()
   // Move focus back to the primary action so keyboard users are not stranded
   // on the now-hidden Reset button.
-  startBtn.focus()
+  proceedBtn.focus()
 })
 
 // --- Listen for state changes ---
@@ -360,11 +653,13 @@ chrome.storage.onChanged.addListener((changes) => {
 
 // --- Render state ---
 function renderState(state) {
+  const dryRun = state.options?.dryRun === true
   // Log
   if (state.log?.length > 0) {
     logPre.textContent = state.log.join('\n')
     logPre.scrollTop = logPre.scrollHeight
-    progressSection.classList.remove('hidden')
+    logPre.classList.remove('hidden')
+    idleText.classList.add('hidden')
   }
 
   // Current info
@@ -373,34 +668,37 @@ function renderState(state) {
     if (state.currentTab) parts.push(state.currentTab)
     if (state.currentRepo) parts.push(state.currentRepo)
     currentInfo.textContent = parts.join(' > ')
+    logStatus.textContent = dryRun ? 'Running · dry-run' : 'Running'
 
     if (state.progress?.total > 0) {
-      const pct = Math.round(((state.progress.archived + state.progress.skipped) / state.progress.total) * 100)
+      const done = state.progress.archived + state.progress.skipped
+      const pct = Math.round((done / state.progress.total) * 100)
       progressFill.style.width = `${pct}%`
       progressFill.parentElement.setAttribute('aria-valuenow', String(pct))
-      currentInfo.textContent += ` [${state.progress.archived + state.progress.skipped}/${state.progress.total}]`
+      currentInfo.textContent += ` [${done}/${state.progress.total}]`
+      logStatus.textContent = `${done} / ${state.progress.total}${dryRun ? ' · dry-run' : ''}`
     }
   }
 
   // Done or error
   if (state.status === 'done' || state.status === 'error') {
-    startBtn.disabled = false
-    startBtn.removeAttribute('aria-busy')
-    updateOpModeUI(opMode)
+    setIdle()
     resetBtn.classList.remove('hidden')
     progressFill.style.width = '100%'
     progressFill.parentElement.setAttribute('aria-valuenow', '100')
 
     if (state.status === 'done') {
       currentInfo.textContent = 'Complete'
+      logStatus.textContent = dryRun ? 'Done · dry-run' : 'Done'
       renderSummary(state.results)
       if (state.exportData) {
         lastExportData = state.exportData
         downloadBtn.classList.remove('hidden')
-        downloadBtn.textContent = `⬇ Download Suggestions JSON (${state.exportData.totalSuggestions || 0} found)`
+        downloadBtn.textContent = `⬇ Download suggestions JSON (${state.exportData.totalSuggestions || 0} found)`
       }
     } else {
       currentInfo.textContent = `Error: ${state.error}`
+      logStatus.textContent = 'Error'
       progressFill.style.background = '#f87171'
     }
   }
@@ -414,7 +712,6 @@ function renderSummary(results) {
   if (!results?.length) {
     const emptyDiv = document.createElement('div')
     emptyDiv.className = 'hint'
-    emptyDiv.style.marginTop = '4px'
     emptyDiv.textContent = 'No items were processed. Try checking your scope or if tasks exist.'
     summaryDiv.appendChild(emptyDiv)
     return
@@ -447,25 +744,18 @@ function renderSummary(results) {
 }
 
 // --- Check for existing state on popup open ---
+showIdle()
 chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
   if (state && state.status !== 'idle') {
-    // Rehydrate opMode if it's available in the state options
-    if (state.options?.opMode) {
-      opMode = state.options.opMode
-    }
+    // Rehydrate the item the run was started with.
+    if (state.options?.item?.id) selectItem(state.options.item.id, { save: false })
+    if (state.status === 'running') setRunning(state.options?.action || 'proceed', state.options?.dryRun === true)
     renderState(state)
-    if (state.status === 'running') {
-      startBtn.disabled = true
-      startBtn.setAttribute('aria-busy', 'true')
-      startBtn.textContent = getRunningText()
-    } else {
-      resetBtn.classList.remove('hidden')
-    }
+    if (state.status !== 'running') resetBtn.classList.remove('hidden')
   }
 })
 
 // --- Export download (re-save; the background already saved one copy) ---
-let lastExportData = null
 
 downloadBtn.addEventListener('click', () => {
   if (lastExportData) {

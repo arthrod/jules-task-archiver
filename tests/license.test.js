@@ -74,10 +74,6 @@ describe('Apache 2.0 License Compliance', () => {
     const popupHtml = fs.readFileSync(path.join(rootDir, 'popup.html'), 'utf8')
     const popupCss = fs.readFileSync(path.join(rootDir, 'popup.css'), 'utf8')
 
-    it('should contain a footer element', () => {
-      assert.ok(popupHtml.includes('<footer>'), 'popup.html must contain a <footer> tag')
-    })
-
     it('should contain a link to license.html that opens in a new tab', () => {
       assert.ok(/href=["']license\.html["']/.test(popupHtml), 'popup.html must link to license.html')
       assert.ok(/target=["']_blank["']/.test(popupHtml), 'license link must have target="_blank"')
@@ -87,9 +83,9 @@ describe('Apache 2.0 License Compliance', () => {
       )
     })
 
-    it('popup.css should define footer styles', () => {
-      assert.ok(popupCss.includes('footer {'), 'popup.css must contain footer rules')
-      assert.ok(popupCss.includes('.footer-link'), 'popup.css must contain .footer-link rules')
+    it('popup.css should style the license link', () => {
+      assert.ok(/class="linkrow"/.test(popupHtml), 'the license link must use the .linkrow style')
+      assert.ok(popupCss.includes('.linkrow'), 'popup.css must contain .linkrow rules')
     })
   })
 
@@ -157,7 +153,7 @@ describe('Release packaging', () => {
   const cdYml = fs.readFileSync(path.join(rootDir, '.github', 'workflows', 'cd.yml'), 'utf8')
   const zipBlock = cdYml.slice(cdYml.indexOf('zip -r'), cdYml.indexOf('icons/', cdYml.indexOf('zip -r')))
 
-  for (const file of ['license.html', 'license.css', 'LICENSE']) {
+  for (const file of ['license.html', 'license.css', 'LICENSE', 'items.js', 'fonts/']) {
     it(`release zip ships ${file}`, () => {
       assert.ok(new RegExp(`\\s${file.replace('.', '\\.')}\\s`).test(zipBlock), `${file} missing from zip command`)
     })
