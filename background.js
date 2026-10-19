@@ -1299,6 +1299,33 @@ async function continueTask(label, task, message, config) {
   return true
 }
 
+// Retrying a failed session starts a new run, so it counts against the daily
+// session quota; replying to a live session does not. Measured 2026-10-19 at
+// 100/100: 13 replies went through, every retry got RPC error code [8].
+async function capRetriesToQuota(label, waiting, config) {
+  const failed = waiting.filter((t) => getWaitingKind(t) === 'error')
+  if (failed.length === 0) return waiting
+  let quota = null
+  try {
+    quota = await getDailySessionQuota(config)
+  } catch (e) {
+    addLog(`[${label}] WARNING: Could not fetch daily quota: ${e.message}`)
+    return waiting
+  }
+  if (!quota || quota.remaining >= failed.length) return waiting
+  const others = waiting.filter((t) => getWaitingKind(t) !== 'error')
+  if (quota.remaining === 0) {
+    addLog(
+      `[${label}] Daily session limit reached (${quota.used}/${quota.limit}): skipping ${failed.length} failed session(s), since a retry starts a new run.`
+    )
+    return others
+  }
+  addLog(
+    `[${label}] Daily sessions: ${quota.remaining} left, so only ${quota.remaining} of ${failed.length} failed session(s) will be retried.`
+  )
+  return [...others, ...failed.slice(0, quota.remaining)]
+}
+
 // Replies to every session awaiting the user's feedback, approves every plan
 // awaiting approval, and asks every failed session to retry.
 async function processContinueForTab(tab, options) {
@@ -1331,6 +1358,12 @@ async function processContinueForTab(tab, options) {
     return 0
   }
 
+  waiting = await capRetriesToQuota(label, waiting, config)
+  if (waiting.length === 0) {
+    addLog(`\n[${label}] TOTAL: 0 tasks continued`)
+    return 0
+  }
+
   const replyMessage = normalizeContinueMessage(options.continueMessage)
   const retryMessage = normalizeContinueMessage(options.continueErrorMessage, DEFAULT_ERROR_CONTINUE_MESSAGE)
   state.progress.total += waiting.length
@@ -1351,7 +1384,8 @@ async function processContinueForTab(tab, options) {
       }
     } catch (e) {
       state.progress.skipped++
-      addLog(`  ERROR [${label}] continuing [${task.id}] ${task.title}: ${e.message}`)
+      const hint = /error code \[8\]/.test(e.message) ? ' (daily session limit reached)' : ''
+      addLog(`  ERROR [${label}] continuing [${task.id}] ${task.title}: ${e.message}${hint}`)
     }
     updateState({})
   })

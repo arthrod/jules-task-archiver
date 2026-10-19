@@ -3210,7 +3210,10 @@ describe('continue waiting tasks', () => {
 
   // GetTask (n74qPd) returns the session with its activity log at [0][3];
   // the last entry is what the Jules UI threads its reply onto.
-  function setupContinueEnv(tasks, { activities = {}, failInteract = new Set() } = {}) {
+  function setupContinueEnv(
+    tasks,
+    { activities = {}, failInteract = new Set(), quota = [0, [86400], 100], interactError = 'HTTP 500' } = {}
+  ) {
     const { sandbox } = setupEnvironment()
     sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '1' })
     sandbox.listTasks = async () => tasks
@@ -3224,7 +3227,13 @@ describe('continue waiting tasks', () => {
         ]
         return [[payload[0], null, 'prompt', acts]]
       }
-      if (rpcId === 'SLmX6' && failInteract.has(payload[0])) throw new Error('batchexecute SLmX6 failed: HTTP 500')
+      if (rpcId === 'KQOO7') {
+        if (quota instanceof Error) throw quota
+        return quota
+      }
+      if (rpcId === 'SLmX6' && failInteract.has(payload[0])) {
+        throw new Error(`batchexecute SLmX6 failed: ${interactError}`)
+      }
       return []
     }
     const interactCalls = () => calls.filter((c) => c.rpcId === 'SLmX6')
@@ -3455,6 +3464,61 @@ describe('continue waiting tasks', () => {
       const state = sandbox.test_state()
       assert.strictEqual(state.progress.skipped, 1)
       assert.ok(state.log.some((l) => l.includes('ERROR [u/1] continuing [bad]') && l.includes('HTTP 500')))
+    })
+
+    it('skips failed sessions when the daily session limit is used up, but still replies', async () => {
+      const tasks = [task('fb', 12), task('err1', 4), task('err2', 4)]
+      const { sandbox, interactCalls } = setupContinueEnv(tasks, { quota: [100, [86400], 100] })
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 1)
+      assert.deepStrictEqual(
+        interactCalls().map((c) => c.payload[0]),
+        ['fb']
+      )
+      const log = sandbox.test_state().log
+      assert.ok(log.some((l) => l.includes('Daily session limit reached (100/100)') && l.includes('2 failed')))
+      assert.strictEqual(sandbox.test_state().progress.total, 1)
+    })
+
+    it('retries at most as many failed sessions as the quota has left', async () => {
+      const tasks = [task('err1', 4), task('err2', 4), task('err3', 4)]
+      const { sandbox, interactCalls } = setupContinueEnv(tasks, { quota: [98, [86400], 100] })
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 2)
+      assert.strictEqual(interactCalls().length, 2)
+      assert.ok(sandbox.test_state().log.some((l) => l.includes('only 2 of 3 failed session(s)')))
+    })
+
+    it('does not look up the quota when nothing failed', async () => {
+      const { sandbox, calls } = setupContinueEnv([task('fb', 12)], { quota: [100, [86400], 100] })
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 1)
+      assert.ok(!calls.some((c) => c.rpcId === 'KQOO7'))
+    })
+
+    it('still retries failed sessions when the quota lookup fails', async () => {
+      const { sandbox, interactCalls } = setupContinueEnv([task('err', 4)], { quota: new Error('HTTP 503') })
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 1)
+      assert.strictEqual(interactCalls().length, 1)
+      assert.ok(sandbox.test_state().log.some((l) => l.includes('WARNING: Could not fetch daily quota')))
+    })
+
+    it('explains a RESOURCE_EXHAUSTED reply as the daily session limit', async () => {
+      const { sandbox } = setupContinueEnv([task('err', 4)], {
+        failInteract: new Set(['err']),
+        interactError: 'RPC SLmX6 error code [8]'
+      })
+      await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+      assert.ok(
+        sandbox
+          .test_state()
+          .log.some((l) => l.includes('error code [8]') && l.includes('(daily session limit reached)'))
+      )
     })
 
     it('reports when nothing is waiting', async () => {
