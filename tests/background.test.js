@@ -1529,6 +1529,14 @@ describe('startOperation refactoring', () => {
     assert.ok(state.log[0].includes('ARCHIVE MODE'))
   })
 
+  it("initOperationState should drop the previous run's exportData", () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.test_updateState({ status: 'done', exportData: { totalSuggestions: 3, repositories: [] } })
+    sandbox.test_initOperationState({ opMode: 'archive', dryRun: false, force: false })
+
+    assert.strictEqual(sandbox.test_state().exportData, null)
+  })
+
   it('discoverTabs should handle no tabs found', async () => {
     const { sandbox } = setupEnvironment()
     sandbox.chrome.tabs.query = async () => []

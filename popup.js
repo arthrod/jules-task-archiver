@@ -286,6 +286,9 @@ mainForm.addEventListener('submit', async (e) => {
   startBtn.setAttribute('aria-busy', 'true')
   startBtn.textContent = getRunningText()
   resetBtn.classList.add('hidden')
+  // A previous Export JSON result belongs to that run only.
+  downloadBtn.classList.add('hidden')
+  lastExportData = null
   progressSection.classList.remove('hidden')
   summarySection.classList.add('hidden')
   currentInfo.textContent = 'Starting...'

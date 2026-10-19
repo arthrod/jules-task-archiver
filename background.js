@@ -1877,6 +1877,7 @@ function initOperationState(options) {
     results: [],
     log: [],
     error: null,
+    exportData: null,
     options: { ...options }
   })
 

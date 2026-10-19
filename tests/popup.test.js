@@ -608,6 +608,24 @@ describe('Export download', () => {
 
     assert.strictEqual(elements['#downloadBtn'].classList.contains('hidden'), true)
   })
+
+  it('should drop the previous export when another operation starts', async () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    sandbox.chrome.runtime.sendMessage = () => {}
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    sandbox.renderState({
+      status: 'done',
+      log: ['done'],
+      results: [{ label: 'default', count: 3 }],
+      exportData: { totalSuggestions: 3, repositories: [] }
+    })
+    assert.strictEqual(elements['#downloadBtn'].classList.contains('hidden'), false)
+
+    await elements['#mainForm'].dispatchEvent('submit', { preventDefault: () => {} })
+
+    assert.strictEqual(elements['#downloadBtn'].classList.contains('hidden'), true)
+    assert.strictEqual(vm.runInContext('lastExportData', sandbox), null, 'stale export must not be downloadable')
+  })
 })
 
 describe('popup.html accessibility', () => {
