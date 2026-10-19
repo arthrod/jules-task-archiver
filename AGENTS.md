@@ -23,9 +23,14 @@ popup.js (UI) <-> background.js (batchexecute client) <-> content.js (token extr
                 chrome.storage.sync (settings)
 ```
 
-Two operation modes:
+Five operation modes:
 1. **Archive Tasks** -- ListTasks (p1Takd) -> check GitHub PRs -> ArchiveTask (Tjmm5c)
-2. **Start Suggestions** -- ListTasks -> discover repos -> ListSuggestions (hQP40d) -> StartSuggestion (Rja83d)
+2. **Start Suggestions** -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> cap to remaining daily quota (KQOO7) -> StartSuggestion (Rja83d)
+3. **Batch Agent** -- ListSources -> ListSuggestions (hQP40d) per repo -> ONE StartSuggestion (Rja83d) per repo whose prompt carries every suggestion; same toggle + daily-quota (KQOO7) rules as Start Suggestions, except an explicitly chosen owner/repo is used as-is.
+4. **Remove Suggestions** -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> DismissSuggestion (sc1vFf) per suggestion.
+5. **Export Suggestions JSON** -- ListSources (all connected repos, read-only) -> ListSuggestions (hQP40d) per repo -> JSON file via chrome.downloads (re-downloadable from the popup).
+
+Every mode accepts an optional repository filter (popup dropdown or typed `owner/repo`); empty = all repos.
 
 Content script extracts auth tokens (SNlM0e, cfb2h, FdrFJe) from `WIZ_global_data` via MAIN world script injection. Also observes fetch() for Rja83d calls to capture model config and experiment IDs.
 
@@ -37,6 +42,7 @@ Background service worker makes all API calls. No DOM automation.
 - `Tjmm5c` -- ArchiveTask (taskId, action)
 - `hQP40d` -- ListSuggestions (repo)
 - `Rja83d` -- StartSuggestion (prompt, model config, repo, experiment IDs)
+- `sc1vFf` -- DismissSuggestion (suggestionId, [1]=2 dismiss)
 
 ## Development
 

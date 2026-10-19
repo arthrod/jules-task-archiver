@@ -1,3 +1,4 @@
+/* // Modified by tommyzed: Updated theme styling and footer */
 * {
   margin: 0;
   padding: 0;
@@ -5,7 +6,7 @@
 }
 
 body {
-  width: 380px;
+  width: 480px;
   max-height: 560px;
   overflow-y: auto;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -59,7 +60,8 @@ legend {
 }
 
 input[type="text"],
-input[type="password"] {
+input[type="password"],
+select {
   display: block;
   width: 100%;
   padding: 6px 8px;
@@ -76,7 +78,8 @@ input[type="password"] {
 }
 
 input[type="text"]:focus,
-input[type="password"]:focus {
+input[type="password"]:focus,
+select:focus {
   border-color: #4ade80;
 }
 
@@ -128,12 +131,12 @@ input[type="number"]:invalid {
 
 .segmented button {
   flex: 1;
-  padding: 6px 12px;
+  padding: 6px 4px;
   border: none;
   background: transparent;
   color: #94a3b8;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11px;
   transition:
     background-color 0.2s ease,
     color 0.2s ease,
@@ -352,4 +355,32 @@ input:invalid ~ .validation-error {
   margin-left: 20px;
   margin-top: 2px;
   cursor: pointer;
+}
+
+.custom-repo-input {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.download-btn {
+  margin-top: 8px;
+}
+
+footer {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #2d2d4a;
+  text-align: center;
+}
+
+.footer-link {
+  color: #94a3b8;
+  font-size: 11px;
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.footer-link:hover {
+  color: #4ade80;
+  text-decoration: underline;
 }

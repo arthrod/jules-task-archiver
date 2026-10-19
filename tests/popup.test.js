@@ -1,3 +1,4 @@
+// Modified by tommyzed: Updated popup unit test assertions
 const { describe, it } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
@@ -142,6 +143,7 @@ function createMockChrome(syncStorage, localStorage, sessionStorage, listeners) 
       sendMessage: (msg, cb) => {
         if (cb) {
           if (msg.action === 'GET_STATE') cb({ status: 'idle' })
+          else if (msg.action === 'GET_ALL_SOURCES') cb({ repos: [] })
           else cb()
         }
       },
@@ -150,9 +152,26 @@ function createMockChrome(syncStorage, localStorage, sessionStorage, listeners) 
       }
     },
     tabs: {
-      query: (_opts) => Promise.resolve([{ id: 123 }])
+      query: (_opts) => Promise.resolve([{ id: 123 }]),
+      // Repo-picker fallback (GET_CODEBASES) runs when GET_ALL_SOURCES is empty.
+      // Answer with a repo so the popup does not schedule retry timers.
+      sendMessage: (_tabId, msg, cb) => {
+        if (cb) cb(msg.action === 'GET_CODEBASES' ? { codebases: ['owner/scraped'] } : undefined)
+      }
     }
   }
+}
+
+/**
+ * Creates a mock <select> with the popup's static "All Repositories" option.
+ */
+function createMockSelect() {
+  const select = createMockElement('select')
+  select.value = ''
+  select.options = [{ value: '', textContent: 'All Repositories' }]
+  select.remove = (i) => select.options.splice(i, 1)
+  select.appendChild = (opt) => select.options.push(opt)
+  return select
 }
 
 /**
@@ -198,6 +217,9 @@ function setupPopupSandbox() {
     '#ghOwner': createMockElement('input'),
     '#ghToken': createMockElement('input'),
     '#force': createMockElement('input', { type: 'checkbox' }),
+    '#repoFilter': createMockSelect(),
+    '#customRepoInput': createMockElement('input'),
+    '#downloadBtn': createMockElement('button'),
     '#startBtn': createMockElement('button'),
     'input[name="mode"]:checked': createMockElement('input', { value: 'dry' }),
     '#resetBtn': createMockElement('button'),
@@ -217,7 +239,8 @@ function setupPopupSandbox() {
 
   const opModeButtons = [
     createMockElement('button', { dataset: { value: 'archive' } }),
-    createMockElement('button', { dataset: { value: 'suggestions' } })
+    createMockElement('button', { dataset: { value: 'suggestions' } }),
+    createMockElement('button', { dataset: { value: 'remove_suggestions' } })
   ]
 
   const document = createMockDocument(elements, opModeButtons, radioStates)
@@ -453,6 +476,39 @@ describe('Button Event Handlers', () => {
     assert.strictEqual(sentMessage.options.opMode, 'archive')
     assert.strictEqual(elements['#startBtn'].disabled, true)
     assert.strictEqual(elements['#startBtn'].textContent, '⏳ Dry Running Archive...')
+    assert.strictEqual(sentMessage.options.repoFilter, '', 'no selection means all repositories')
+  })
+
+  it('should send the selected repository as repoFilter', async () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    let sentMessage = null
+    sandbox.chrome.runtime.sendMessage = (msg) => {
+      sentMessage = msg
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    elements['#repoFilter'].value = 'test-owner/test-repo'
+    await elements['#mainForm'].dispatchEvent('submit', { preventDefault: () => {} })
+
+    assert.strictEqual(sentMessage.action, 'START')
+    assert.strictEqual(sentMessage.options.repoFilter, 'test-owner/test-repo')
+  })
+
+  it('should prefer the typed owner/repo over the dropdown selection', async () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    let sentMessage = null
+    sandbox.chrome.runtime.sendMessage = (msg) => {
+      sentMessage = msg
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    elements['#repoFilter'].value = 'test-owner/test-repo'
+    elements['#customRepoInput'].value = '  typed/repo  '
+    await elements['#mainForm'].dispatchEvent('submit', { preventDefault: () => {} })
+
+    assert.strictEqual(sentMessage.options.repoFilter, 'typed/repo')
   })
 
   it('should send RESET message when resetBtn is clicked', () => {
@@ -481,6 +537,76 @@ describe('Button Event Handlers', () => {
     assert.strictEqual(elements['#startBtn'].focused, false)
     elements['#resetBtn'].dispatchEvent('click')
     assert.strictEqual(elements['#startBtn'].focused, true, 'focus should return to the primary action')
+  })
+})
+
+describe('Repository picker', () => {
+  it('should populate options from GET_ALL_SOURCES', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    const baseSend = sandbox.chrome.runtime.sendMessage
+    sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (msg.action === 'GET_ALL_SOURCES') return cb({ repos: ['a/one', 'b/two'] })
+      return baseSend(msg, cb)
+    }
+
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    const values = elements['#repoFilter'].options.map((o) => o.value)
+    assert.deepStrictEqual(values, ['', 'a/one', 'b/two'])
+  })
+
+  it('should fall back to the content script codebases when GET_ALL_SOURCES is empty', async () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    // tabs.query resolves asynchronously before GET_CODEBASES is sent
+    await new Promise((r) => setTimeout(r, 0))
+
+    const values = elements['#repoFilter'].options.map((o) => o.value)
+    assert.deepStrictEqual(values, ['', 'owner/scraped'])
+  })
+
+  it('should clear the typed repo when a dropdown option is chosen, and vice versa', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    elements['#customRepoInput'].value = 'typed/repo'
+    elements['#repoFilter'].value = 'a/one'
+    elements['#repoFilter'].dispatchEvent('change')
+    assert.strictEqual(elements['#customRepoInput'].value, '')
+
+    elements['#customRepoInput'].value = 'typed/repo'
+    elements['#customRepoInput'].dispatchEvent('input')
+    assert.strictEqual(elements['#repoFilter'].value, '')
+  })
+})
+
+describe('Export download', () => {
+  it('should show the download button when a finished run carries exportData', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    elements['#downloadBtn'].classList.add('hidden')
+
+    sandbox.renderState({
+      status: 'done',
+      log: ['done'],
+      results: [{ label: 'default', count: 3 }],
+      exportData: { totalSuggestions: 3, repositories: [] }
+    })
+
+    assert.strictEqual(elements['#downloadBtn'].classList.contains('hidden'), false)
+    assert.strictEqual(elements['#downloadBtn'].textContent, '⬇ Download Suggestions JSON (3 found)')
+  })
+
+  it('should hide the download button on reset', () => {
+    const { sandbox, elements } = setupPopupSandbox()
+    sandbox.chrome.runtime.sendMessage = () => {}
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+    elements['#downloadBtn'].classList.remove('hidden')
+
+    elements['#resetBtn'].dispatchEvent('click')
+
+    assert.strictEqual(elements['#downloadBtn'].classList.contains('hidden'), true)
   })
 })
 
@@ -549,6 +675,36 @@ describe('updateOpModeUI details', () => {
     assert.strictEqual(elements['#startBtn'].textContent, 'Start Suggestions')
   })
 
+  it('should update startBtn text based on opMode and dryRun (Remove Suggestions/Dry)', () => {
+    const { sandbox, elements, radioStates } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    radioStates.mode = 'dry'
+    sandbox.setActiveOpMode('remove_suggestions')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Dry Run Remove Suggestions')
+    assert.strictEqual(sandbox.getRunningText(), '⏳ Dry Running Remove Suggestions...')
+  })
+
+  it('should update startBtn text based on opMode and dryRun (Remove Suggestions/Live)', () => {
+    const { sandbox, elements, radioStates } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    radioStates.mode = 'live'
+    sandbox.setActiveOpMode('remove_suggestions')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Remove Suggestions')
+    assert.strictEqual(sandbox.getRunningText(), '⏳ Running Remove Suggestions...')
+  })
+
+  it('should label the start button for Export JSON regardless of dry run', () => {
+    const { sandbox, elements, radioStates } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    radioStates.mode = 'dry'
+    sandbox.setActiveOpMode('export_suggestions')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Export Suggestions JSON')
+    assert.strictEqual(sandbox.getRunningText(), '⏳ Exporting Suggestions to JSON...')
+  })
+
   it('should NOT update startBtn text when button is disabled', () => {
     const { sandbox, elements, radioStates } = setupPopupSandbox()
     vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
@@ -570,17 +726,30 @@ describe('updateOpModeUI direct calls', () => {
     // Reset initial state
     opModeButtons[0].classList.toggle('active', false)
     opModeButtons[1].classList.toggle('active', false)
+    opModeButtons[2].classList.toggle('active', false)
 
     sandbox.updateOpModeUI('archive')
     assert.ok(opModeButtons[0].classList.contains('active'))
     assert.strictEqual(opModeButtons[0].getAttribute('aria-pressed'), 'true')
     assert.ok(!opModeButtons[1].classList.contains('active'))
     assert.strictEqual(opModeButtons[1].getAttribute('aria-pressed'), 'false')
+    assert.ok(!opModeButtons[2].classList.contains('active'))
+    assert.strictEqual(opModeButtons[2].getAttribute('aria-pressed'), 'false')
 
     sandbox.updateOpModeUI('suggestions')
     assert.ok(!opModeButtons[0].classList.contains('active'))
     assert.strictEqual(opModeButtons[0].getAttribute('aria-pressed'), 'false')
     assert.ok(opModeButtons[1].classList.contains('active'))
     assert.strictEqual(opModeButtons[1].getAttribute('aria-pressed'), 'true')
+    assert.ok(!opModeButtons[2].classList.contains('active'))
+    assert.strictEqual(opModeButtons[2].getAttribute('aria-pressed'), 'false')
+
+    sandbox.updateOpModeUI('remove_suggestions')
+    assert.ok(!opModeButtons[0].classList.contains('active'))
+    assert.strictEqual(opModeButtons[0].getAttribute('aria-pressed'), 'false')
+    assert.ok(!opModeButtons[1].classList.contains('active'))
+    assert.strictEqual(opModeButtons[1].getAttribute('aria-pressed'), 'false')
+    assert.ok(opModeButtons[2].classList.contains('active'))
+    assert.strictEqual(opModeButtons[2].getAttribute('aria-pressed'), 'true')
   })
 })

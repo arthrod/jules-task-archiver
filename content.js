@@ -1,3 +1,4 @@
+// Modified by tommyzed: Updated message types and codebases
 /**
  * Jules Task Archiver — Content Script (Isolated World)
  *
@@ -106,6 +107,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         })
       })
       return true // async response
+
+    // Fallback repo list for the popup's picker, scraped from the Jules
+    // codebases page when the YqkSHd lookup returns nothing.
+    case 'GET_CODEBASES': {
+      const codebases = Array.from(document.querySelectorAll('.source-row.clickable-row'))
+        .map((el) => {
+          const owner = el.querySelector('.owner')?.textContent.trim() || ''
+          const repo = el.querySelector('.repo')?.textContent.trim() || ''
+          return owner && repo ? `${owner}/${repo}` : ''
+        })
+        .filter(Boolean)
+      sendResponse({ codebases })
+      break
+    }
 
     default:
       sendResponse({ error: 'Unknown action' })

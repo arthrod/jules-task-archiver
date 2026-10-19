@@ -65,6 +65,13 @@
 - **Category-aware prompts** -- generates tailored prompts per suggestion category (security fix, performance optimization, test coverage, code cleanup)
 - **Config capture** -- observes Jules UI to capture model config and experiment IDs for accurate reproduction
 
+### Batch Agent, Remove and Export
+
+- **Batch to 1 Agent** -- one Jules session per repo whose prompt carries every queued suggestion, instead of one session per suggestion (counts against the daily session quota like Start Suggestions)
+- **Remove Suggestions** -- bulk-dismiss queued suggestions on Suggestions-enabled repos (Dry Run previews the list)
+- **Export Suggestions JSON** -- save every suggestion across all connected repos to `jules-suggestions-YYYY-MM-DD.json`; re-download from the popup
+- **Repository filter** -- every mode can be narrowed to one repo from the dropdown or a typed `owner/repo`
+
 ### Scheduled Operations
 
 - **Auto-archive on a schedule** -- `chrome.alarms`-driven periodic archive of finished tasks across all Jules tabs; runs in the background while the popup is closed (service-worker safe, no `setInterval`)
@@ -92,12 +99,13 @@
 1. Open one or more `jules.google.com` tabs (supports multiple accounts)
 2. Click the extension icon in the toolbar
 3. Configure:
-   - **Operation** -- Archive Tasks or Start Suggestions
+   - **Operation** -- Archive Tasks, Start (Separate), Batch to 1 Agent, Remove, or Export JSON
    - **GitHub Owner** -- your GitHub username (for PR checks in archive mode)
    - **GitHub Token** -- optional, for private repos
    - **Mode** -- Dry Run (preview) or Run (execute)
    - **Force** -- archive every task regardless of state or open PRs (archive mode only)
    - **Scope** -- current tab only or all Jules tabs
+   - **Repository** -- All Repositories (default), one repo from the list, or a typed `owner/repo`
 4. Click **Start**
 
 5. (Optional) In **Schedule**, enable **Auto-archive on a schedule**, set the interval in minutes, and optionally enable **Also start suggestions each tick** with a max-starts cap. Scheduled runs use normal archive safety (finished-state filter + open-PR check) — they never Force.
@@ -131,6 +139,9 @@ popup.js (UI) <-> background.js (batchexecute client) <-> content.js (message re
 | ArchiveTask | `Tjmm5c` | Archive a single task |
 | ListSuggestions | `hQP40d` | Fetch code suggestions for a repo |
 | StartSuggestion | `Rja83d` | Start a suggestion as a new task |
+| DismissSuggestion | `sc1vFf` | Remove a queued suggestion |
+| ListSources | `YqkSHd` | Connected repos + per-repo Suggestions toggle |
+| DailyQuota | `KQOO7` | Sessions used today vs. daily limit |
 
 ## Permissions
 
@@ -140,6 +151,8 @@ popup.js (UI) <-> background.js (batchexecute client) <-> content.js (message re
 | `tabs` | Query all Jules tabs for multi-account support |
 | `scripting` | Inject content script into pre-existing tabs |
 | `alarms` | Periodic scheduled archive/suggestion ticks via `chrome.alarms` |
+| `downloads` | Save the Export Suggestions JSON file |
+| `notifications` | Notify when an export is saved or a Batch Agent is dispatched |
 | `jules.google.com` | Content script for token extraction |
 | `api.github.com` | Check open PRs via GitHub REST API |
 
@@ -169,6 +182,10 @@ Check out these MCP servers for AI-powered development:
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Credits
+
+Repository filtering, Remove Suggestions, Export Suggestions JSON and Batch Agent were contributed by [tommyzed](https://github.com/tommyzed/jules-task-manager) and [PaddyO84](https://github.com/PaddyO84/jules-task-manager). See `license.html` (popup footer → License & Credits).
 
 ## License
 
