@@ -2749,11 +2749,13 @@ describe('processExportSuggestionsForTab', () => {
 describe('processBatchAgentForTab', () => {
   const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
 
-  function setupBatchEnv(allRepos, suggestionsMap = {}) {
+  function setupBatchEnv(allRepos, suggestionsMap = {}, { enabledRepos = allRepos, remaining = 100 } = {}) {
     const { sandbox } = setupEnvironment()
     sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
     sandbox.getStartConfig = async () => ({ modelConfig: [null, 'gemini'], featureFlags: [], experimentIds: ['x1'] })
+    sandbox.getDailySessionQuota = async () => ({ used: 100 - remaining, limit: 100, remaining })
     sandbox.listAllSources = async () => allRepos
+    sandbox.listSuggestionEnabledSources = async () => enabledRepos
     sandbox.listSuggestions = async (repo) => suggestionsMap[repo] || []
     const launches = []
     sandbox.callBatchExecute = async (rpcId, payload) => {
@@ -2791,6 +2793,50 @@ describe('processBatchAgentForTab', () => {
     const prompt = payload[sandbox.test_RJA83D.PROMPT]
     assert.ok(prompt.includes('First fix') && prompt.includes('Second fix'))
     assert.deepStrictEqual(JSON.parse(JSON.stringify(payload[sandbox.test_RJA83D.METADATA][11])), [null, 's1'])
+  })
+
+  it('launches nothing when the daily session quota is exhausted', async () => {
+    const { sandbox, launches } = setupBatchEnv(['github/o/a'], SUGGESTIONS, { remaining: 0 })
+    const count = await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.strictEqual(count, 0)
+    assert.strictEqual(launches.length, 0)
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Daily limit reached')))
+  })
+
+  it('caps launches to the remaining daily quota', async () => {
+    const both = { ...SUGGESTIONS, 'github/o/b': [{ id: 's3', title: 'Third fix', filePath: 'c.js', line: 3 }] }
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/b'], both, { remaining: 1 })
+    const count = await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.strictEqual(count, 1)
+    assert.strictEqual(launches.length, 1)
+  })
+
+  it('without a repo filter only targets Suggestions-enabled repos', async () => {
+    const both = { ...SUGGESTIONS, 'github/o/off': [{ id: 's9', title: 'Toggle off', filePath: 'z.js', line: 9 }] }
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/off'], both, { enabledRepos: ['github/o/a'] })
+    await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    assert.deepStrictEqual(
+      launches.map((l) => l.payload[sandbox.test_RJA83D.REPO]),
+      ['github/o/a']
+    )
+  })
+
+  it('an explicitly chosen repo is used even if its Suggestions toggle is off', async () => {
+    const both = { ...SUGGESTIONS, 'github/o/off': [{ id: 's9', title: 'Toggle off', filePath: 'z.js', line: 9 }] }
+    const { sandbox, launches } = setupBatchEnv(['github/o/a', 'github/o/off'], both, { enabledRepos: ['github/o/a'] })
+    await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false, repoFilter: 'o/off' })
+    assert.deepStrictEqual(
+      launches.map((l) => l.payload[sandbox.test_RJA83D.REPO]),
+      ['github/o/off']
+    )
+  })
+
+  it('reports launches through state.progress', async () => {
+    const { sandbox } = setupBatchEnv(['github/o/a'], SUGGESTIONS)
+    await sandbox.processBatchAgentForTab(TAB, { opMode: 'agent_batch', dryRun: false })
+    const { progress } = sandbox.test_state()
+    assert.strictEqual(progress.total, 1)
+    assert.strictEqual(progress.archived, 1)
   })
 })
 

@@ -1218,11 +1218,35 @@ async function processBatchAgentForTab(tab, options) {
   const { label, config } = prepared
 
   const startConfig = await getStartConfig()
-  addLog(`[${label}] Discovering target repositories for Batch Agent...`)
-  const repos = await safeListSources(label, config, true)
-  if (!repos) return 0
 
-  const targetRepos = resolveTargetRepos(label, repos, options.repoFilter)
+  // Each launch is one Jules session, so the daily session quota applies
+  // exactly as it does to Start Suggestions.
+  let remaining = Number.POSITIVE_INFINITY
+  try {
+    const quota = await getDailySessionQuota(config)
+    if (quota) {
+      addLog(`[${label}] Daily sessions: ${quota.used}/${quota.limit} used, ${quota.remaining} remaining`)
+      if (quota.remaining === 0) {
+        addLog(`[${label}] Daily limit reached. Skipping Batch Agent.`)
+        return 0
+      }
+      remaining = quota.remaining
+    }
+  } catch (e) {
+    addLog(`[${label}] WARNING: Could not fetch daily quota: ${e.message}`)
+  }
+
+  // "All repositories" means the Suggestions-enabled ones, same as Start
+  // Suggestions; only an explicitly chosen repo may bypass the toggle.
+  addLog(`[${label}] Discovering target repositories for Batch Agent...`)
+  let targetRepos
+  if (options.repoFilter) {
+    const repos = await safeListSources(label, config, true)
+    if (!repos) return 0
+    targetRepos = resolveTargetRepos(label, repos, options.repoFilter)
+  } else {
+    targetRepos = await safeListSources(label, config)
+  }
   if (!targetRepos) return 0
 
   addLog(`[${label}] Querying suggestions across ${targetRepos.length} repo(s)...`)
@@ -1230,6 +1254,10 @@ async function processBatchAgentForTab(tab, options) {
 
   for (const repo of targetRepos) {
     if (state.status === 'cancelled') break
+    if (remaining <= 0) {
+      addLog(`[${label}] Daily limit reached. Not launching on the remaining repos.`)
+      break
+    }
     const suggestions = await listSuggestions(repo, config)
     if (!suggestions || suggestions.length === 0) {
       addLog(`[${label}] ${repo}: 0 suggestions. Skipping agent launch.`)
@@ -1239,15 +1267,23 @@ async function processBatchAgentForTab(tab, options) {
     addLog(`[${label}] ${repo}: Assembling ${suggestions.length} suggestions into 1 Unified Master Agent task...`)
     const batchPrompt = buildBatchAgentPrompt(suggestions, repo)
 
+    // Budget is spent before the call: a failed launch may still have
+    // consumed a session server-side.
+    remaining--
+
     if (options.dryRun) {
       addLog(`  [DRY] Would launch 1 Master Agent on ${repo} handling all ${suggestions.length} items.`)
       continue
     }
 
+    state.progress.total++
+    updateState({ currentRepo: repo.replace(/^github\//, '') })
     const payload = buildRja83dPayload(batchPrompt, suggestions[0].id, repo, config, startConfig)
     try {
-      await withRetry(() => callBatchExecute('Rja83d', payload, config))
+      await globalLimit(() => withRetry(() => callBatchExecute('Rja83d', payload, config)))
       totalTasksLaunched++
+      state.progress.archived++
+      updateState({})
       addLog(`  Launched Unified Agent for ${repo} with all ${suggestions.length} suggestions`)
       notify(
         'Jules Master Agent Dispatched',
