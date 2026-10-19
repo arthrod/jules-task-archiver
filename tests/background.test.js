@@ -2237,14 +2237,25 @@ describe('executeArchive', () => {
 
   // Live run (2026-10-19): 2 of 147 fifty-id Tjmm5c batches came back with
   // RPC error code [4]; the same ids then archived fine in chunks of 10.
+  // These go through the real callBatchExecute/parseResponse path, so the
+  // error carries callBatchExecute's "batchexecute Tjmm5c failed:" prefix.
+  const RPC_REJECTED = ')]}\'\n\n60\n[["wrb.fr","Tjmm5c",null,null,null,[4],"generic"]]'
+  const RPC_OK = ')]}\'\n\n55\n[["wrb.fr","Tjmm5c","[[\\"ok\\"]]",null,null,null,"generic"]]'
+
+  function mockTjmm5c(sandbox, rejects) {
+    const calls = []
+    sandbox.postBatchExecute = async (_rpcId, payload) => {
+      const ids = payload.find(Array.isArray)
+      calls.push(ids)
+      return { ok: true, status: 200, text: async () => (rejects(ids) ? RPC_REJECTED : RPC_OK) }
+    }
+    return calls
+  }
+
   it('should retry a batch rejected with an RPC error code in smaller chunks', async () => {
     const { sandbox } = setupEnvironment()
     const mockTasks = Array.from({ length: 60 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
-    const calls = []
-    sandbox.archiveTasksWithRetry = async (ids) => {
-      calls.push(ids)
-      if (ids.length === 50) throw new Error('RPC Tjmm5c error code [4]')
-    }
+    const calls = mockTjmm5c(sandbox, (ids) => ids.length === 50)
 
     const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
 
@@ -2264,16 +2275,14 @@ describe('executeArchive', () => {
   it('should drop only the chunk that still fails after splitting', async () => {
     const { sandbox } = setupEnvironment()
     const mockTasks = Array.from({ length: 50 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
-    sandbox.archiveTasksWithRetry = async (ids) => {
-      if (ids.length === 50 || ids.includes('id-23')) throw new Error('RPC Tjmm5c error code [4]')
-    }
+    mockTjmm5c(sandbox, (ids) => ids.length === 50 || ids.includes('id-23'))
 
     const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
 
     assert.strictEqual(grandTotal, 40)
     const log = sandbox.test_state().log
     assert.ok(log.some((l) => l.includes('retrying in chunks of 10')))
-    assert.ok(log.some((l) => l.includes('ERROR [test-label] archiving batch: RPC Tjmm5c error code [4]')))
+    assert.ok(log.some((l) => l.includes('ERROR [test-label] archiving batch:') && l.includes('error code [4]')))
     assert.ok(!log.some((l) => l.includes('[id-23]')), 'the failed chunk must not be logged as archived')
   })
 
@@ -2281,9 +2290,11 @@ describe('executeArchive', () => {
     const { sandbox } = setupEnvironment()
     const mockTasks = Array.from({ length: 50 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
     const calls = []
-    sandbox.archiveTasksWithRetry = async (ids) => {
-      calls.push(ids)
-      throw new Error('HTTP 401')
+    sandbox.postBatchExecute = async (_rpcId, payload) => {
+      calls.push(payload.find(Array.isArray))
+      const err = new Error('HTTP 401')
+      err.status = 401
+      throw err
     }
 
     const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })

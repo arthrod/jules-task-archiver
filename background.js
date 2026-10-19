@@ -28,9 +28,10 @@ const GLOBAL_CONCURRENCY = 12
 const ARCHIVE_BATCH_SIZE = 50
 // A 50-id batch can be rejected with an RPC error code (seen live: [4],
 // DEADLINE_EXCEEDED, on 2 of 147 batches) while the same ids succeed in
-// smaller chunks, so a rejected batch is retried at this size.
+// smaller chunks, so a rejected batch is retried at this size. Not anchored:
+// callBatchExecute rethrows as "batchexecute Tjmm5c failed: RPC Tjmm5c error code [4]".
 const ARCHIVE_SPLIT_SIZE = 10
-const RPC_ERROR_CODE_REGEX = /^RPC \w+ error code \[/
+const RPC_ERROR_CODE_REGEX = /\bRPC \w+ error code \[/
 
 // ⚡ Bolt Optimization: After parsing the URL, use a fast regex test to extract
 // the account ID instead of allocating string arrays via `.split('/')`. This avoids
