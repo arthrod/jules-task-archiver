@@ -783,13 +783,23 @@ async function getDailySessionQuota(config) {
 // =============================================================================
 
 // The popup sends repoFilter as "owner/repo" (dropdown or typed); '' means all
-// repos. Sources are "github/owner/repo" ids, tasks carry both forms.
+// repos. Sources are "github/owner/repo" ids, tasks carry both forms. Matching
+// is exact (case-insensitive): a substring match would let "owner/plate" also
+// archive or dismiss in "owner/plate-docs". A bare name matches the repo segment.
+function normalizeRepoId(value) {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/^github\//, '')
+}
+
 function matchesRepoFilter(repoFilter, ...candidates) {
-  const filterLower = repoFilter.toLowerCase().trim()
+  const wanted = normalizeRepoId(repoFilter)
+  const bareName = !wanted.includes('/')
   for (const c of candidates) {
     if (!c) continue
-    const full = c.toLowerCase()
-    if (full.includes(filterLower) || full.replace(/^github\//, '').includes(filterLower)) return true
+    const repo = normalizeRepoId(c)
+    if (bareName ? repo.slice(repo.lastIndexOf('/') + 1) === wanted : repo === wanted) return true
   }
   return false
 }

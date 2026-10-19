@@ -2490,6 +2490,34 @@ describe('alarm listener wiring', () => {
   })
 })
 
+describe('matchesRepoFilter', () => {
+  const { sandbox } = setupEnvironment()
+
+  it('matches owner/repo exactly, case-insensitively, with or without the github/ prefix', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('Owner/Plate', 'github/owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/plate', 'owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('github/owner/plate', 'github/owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter(' owner/plate ', 'github/owner/plate'), true)
+  })
+
+  it('does not treat owner/repo as a substring pattern', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/plate', 'github/owner/plate-docs'), false)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/plate', 'github/other-owner/plate'), false)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner/pla', 'github/owner/plate'), false)
+  })
+
+  it('matches a bare name against the repo segment only', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('plate', 'github/owner/plate'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('plate', 'github/owner/plate-docs'), false)
+    assert.strictEqual(sandbox.matchesRepoFilter('owner', 'github/owner/plate'), false)
+  })
+
+  it('checks every candidate and skips empty ones', () => {
+    assert.strictEqual(sandbox.matchesRepoFilter('o/r', undefined, '', 'o/r'), true)
+    assert.strictEqual(sandbox.matchesRepoFilter('o/r', undefined, ''), false)
+  })
+})
+
 describe('processTab repository filtering', () => {
   const TAB = { id: 1, url: 'https://jules.google.com/u/0/' }
 
@@ -2515,14 +2543,25 @@ describe('processTab repository filtering', () => {
     assert.deepStrictEqual(archived, ['a'])
   })
 
-  it('filters tasks by substring repo name case-insensitively', async () => {
+  it('matches the repo filter exactly and case-insensitively, never as a substring', async () => {
     const tasks = [
       { id: 'a', title: 'T1', state: 12, source: 'github/tommyzed/adventures', repo: 'tommyzed/adventures' },
+      { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/adventures-2', repo: 'tommyzed/adventures-2' },
+      { id: 'c', title: 'T3', state: 12, source: 'github/not-tommyzed/adventures', repo: 'not-tommyzed/adventures' }
+    ]
+    const { sandbox, archived } = setupArchiveEnv(tasks)
+    await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'TommyZed/Adventures' })
+    assert.deepStrictEqual(archived, ['a'], 'adventures-2 and not-tommyzed/adventures must not be archived')
+  })
+
+  it('does not archive anything for a partial repo name', async () => {
+    const tasks = [
       { id: 'b', title: 'T2', state: 12, source: 'github/tommyzed/add-to-calendar', repo: 'tommyzed/add-to-calendar' }
     ]
     const { sandbox, archived } = setupArchiveEnv(tasks)
-    await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'Calendar' })
-    assert.deepStrictEqual(archived, ['b'])
+    const result = await sandbox.processTab(TAB, { force: true, dryRun: false, repoFilter: 'Calendar' })
+    assert.strictEqual(result, 0)
+    assert.deepStrictEqual(archived, [])
   })
 
   it('returns 0 and logs message if no tasks match repoFilter', async () => {
@@ -2575,11 +2614,16 @@ describe('processSuggestionsForTab repository filtering', () => {
     assert.deepStrictEqual(queriedRepos, ['github/tommyzed/adventures'])
   })
 
-  it('filters suggestions-enabled repos by substring case-insensitively', async () => {
-    const repos = ['github/tommyzed/adventures', 'github/tommyzed/add-to-calendar']
+  it('matches suggestions-enabled repos exactly, not by substring', async () => {
+    const repos = ['github/tommyzed/adventures', 'github/tommyzed/adventures-2', 'github/tommyzed/add-to-calendar']
     const { sandbox, queriedRepos } = setupSuggestionsEnv(repos)
-    await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'Calendar' })
-    assert.deepStrictEqual(queriedRepos, ['github/tommyzed/add-to-calendar'])
+    await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'Tommyzed/Adventures' })
+    assert.deepStrictEqual(queriedRepos, ['github/tommyzed/adventures'])
+
+    queriedRepos.length = 0
+    const result = await sandbox.processSuggestionsForTab(TAB, { opMode: 'suggestions', repoFilter: 'Calendar' })
+    assert.strictEqual(result, 0)
+    assert.deepStrictEqual(queriedRepos, [])
   })
 
   it('returns 0 and logs message if no repos match repoFilter', async () => {
