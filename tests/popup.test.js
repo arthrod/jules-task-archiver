@@ -713,6 +713,24 @@ describe('updateOpModeUI details', () => {
     assert.strictEqual(sandbox.getRunningText(), '⏳ Running Remove Suggestions...')
   })
 
+  it('should label the start button for Batch Agent (Dry)', () => {
+    const { sandbox, elements, radioStates } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    radioStates.mode = 'dry'
+    sandbox.setActiveOpMode('agent_batch')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Dry Run Batch Agent')
+  })
+
+  it('should label the start button for Batch Agent (Live)', () => {
+    const { sandbox, elements, radioStates } = setupPopupSandbox()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    radioStates.mode = 'live'
+    sandbox.setActiveOpMode('agent_batch')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Launch Batch Agent')
+  })
+
   it('should label the start button for Export JSON regardless of dry run', () => {
     const { sandbox, elements, radioStates } = setupPopupSandbox()
     vm.runInContext(popupJs, sandbox, { filename: popupJsPath })

@@ -71,6 +71,8 @@ function getStartButtonText(value, isDry) {
     return isDry ? 'Dry Run Remove Suggestions' : 'Remove Suggestions'
   } else if (value === 'export_suggestions') {
     return 'Export Suggestions JSON'
+  } else if (value === 'agent_batch') {
+    return isDry ? 'Dry Run Batch Agent' : 'Launch Batch Agent'
   } else {
     return isDry ? 'Dry Run Suggestions' : 'Start Suggestions'
   }

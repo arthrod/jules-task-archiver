@@ -1251,7 +1251,7 @@ function buildBatchAgentPrompt(suggestions, repo) {
   body += `Before making any modifications, inspect the current state of each targeted file and line. If a suggestion is already resolved, obsolete, or invalid given recent refactorings, skip it and clearly state why in your notes.\n`
   body += `2. **SYSTEMATIC SEQUENTIAL EXECUTION**: Work through the items sequentially, one by one. Do not rush or batch untested changes across unrelated files.\n`
   body += `3. **PRESERVE ARCHITECTURAL INTEGRITY**: Maintain type safety, multiplatform boundaries (if applicable), and ensure no behavioral regressions are introduced.\n`
-  body += `4. **VERIFICATION**: Run local Gradle/build checks and relevant tests to verify each fix before moving on to the next item.\n\n`
+  body += `4. **VERIFICATION**: Run this repository's own build, lint and test commands (see its README, package scripts, Makefile or CI config) to verify each fix before moving on to the next item.\n\n`
   body += `## AUDITED SUGGESTIONS CHECKLIST (${suggestions.length} items):\n\n`
 
   suggestions.forEach((s, idx) => {
@@ -1866,6 +1866,7 @@ async function processTab(tab, options) {
 
 const OP_MODE_HEADERS = {
   suggestions: '=== SUGGESTIONS MODE ===',
+  agent_batch: '=== BATCH AGENT MODE ===',
   remove_suggestions: '=== REMOVE SUGGESTIONS MODE ===',
   export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ==='
 }

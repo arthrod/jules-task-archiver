@@ -1529,6 +1529,13 @@ describe('startOperation refactoring', () => {
     assert.ok(state.log[0].includes('ARCHIVE MODE'))
   })
 
+  it('initOperationState should log the batch agent header for agent_batch runs', () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.test_initOperationState({ opMode: 'agent_batch', dryRun: false, force: false })
+
+    assert.strictEqual(sandbox.test_state().log[0], '=== BATCH AGENT MODE ===')
+  })
+
   it("initOperationState should drop the previous run's exportData", () => {
     const { sandbox } = setupEnvironment()
     sandbox.test_updateState({ status: 'done', exportData: { totalSuggestions: 3, repositories: [] } })
@@ -2795,6 +2802,16 @@ describe('processExportSuggestionsForTab', () => {
     assert.strictEqual(count, 0)
     assert.deepStrictEqual(queriedRepos, [])
     assert.ok(sandbox.test_state().log.some((l) => l.includes('Invalid repository')))
+  })
+})
+
+describe('buildBatchAgentPrompt', () => {
+  it('keeps the verification step toolchain-neutral', () => {
+    const { sandbox } = setupEnvironment()
+    const prompt = sandbox.buildBatchAgentPrompt([{ title: 'Fix it', filePath: 'src/a.py', line: 3 }], 'github/o/r')
+
+    assert.ok(!/gradle/i.test(prompt), 'prompt must not assume a Gradle project')
+    assert.match(prompt, /this repository's own build, lint and test commands/)
   })
 })
 
