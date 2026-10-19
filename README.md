@@ -63,7 +63,7 @@
 
 - **Reply to waiting sessions** -- sends one reply (editable in the popup, remembered between runs) to every session awaiting your feedback
 - **Approve pending plans** -- approves the plan of every session awaiting plan approval
-- **Retry failed sessions** -- sends every session that stopped with an error a retry prompt (default provided, editable)
+- **Retry failed sessions** -- sends every session that stopped with an error a retry prompt (default provided, editable). A retry starts a new run, so it is capped to the daily sessions you have left
 - Dry Run lists both groups first. Archived sessions are not covered.
 
 ### Start Suggestions
