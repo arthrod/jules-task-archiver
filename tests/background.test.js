@@ -2234,6 +2234,63 @@ describe('executeArchive', () => {
     assert.strictEqual(batches[0][0], 'id-0')
     assert.strictEqual(batches[2][19], 'id-119')
   })
+
+  // Live run (2026-10-19): 2 of 147 fifty-id Tjmm5c batches came back with
+  // RPC error code [4]; the same ids then archived fine in chunks of 10.
+  it('should retry a batch rejected with an RPC error code in smaller chunks', async () => {
+    const { sandbox } = setupEnvironment()
+    const mockTasks = Array.from({ length: 60 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
+    const calls = []
+    sandbox.archiveTasksWithRetry = async (ids) => {
+      calls.push(ids)
+      if (ids.length === 50) throw new Error('RPC Tjmm5c error code [4]')
+    }
+
+    const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
+
+    assert.strictEqual(grandTotal, 60)
+    assert.strictEqual(sandbox.test_state().progress.archived, 60)
+    const retried = calls.filter((ids) => ids.length === 10 && ids[0] !== 'id-50')
+    assert.strictEqual(retried.length, 5)
+    assert.deepStrictEqual(
+      retried.flat().sort(),
+      mockTasks
+        .slice(0, 50)
+        .map((t) => t.id)
+        .sort()
+    )
+  })
+
+  it('should drop only the chunk that still fails after splitting', async () => {
+    const { sandbox } = setupEnvironment()
+    const mockTasks = Array.from({ length: 50 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
+    sandbox.archiveTasksWithRetry = async (ids) => {
+      if (ids.length === 50 || ids.includes('id-23')) throw new Error('RPC Tjmm5c error code [4]')
+    }
+
+    const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
+
+    assert.strictEqual(grandTotal, 40)
+    const log = sandbox.test_state().log
+    assert.ok(log.some((l) => l.includes('retrying in chunks of 10')))
+    assert.ok(log.some((l) => l.includes('ERROR [test-label] archiving batch: RPC Tjmm5c error code [4]')))
+    assert.ok(!log.some((l) => l.includes('[id-23]')), 'the failed chunk must not be logged as archived')
+  })
+
+  it('should not split a batch that failed at the HTTP layer', async () => {
+    const { sandbox } = setupEnvironment()
+    const mockTasks = Array.from({ length: 50 }, (_, i) => ({ id: `id-${i}`, title: `T${i}`, repo: 'owner/repo' }))
+    const calls = []
+    sandbox.archiveTasksWithRetry = async (ids) => {
+      calls.push(ids)
+      throw new Error('HTTP 401')
+    }
+
+    const grandTotal = await sandbox.test_executeArchive('test-label', mockTasks, { at: 'token' })
+
+    assert.strictEqual(grandTotal, 0)
+    assert.strictEqual(calls.length, 1, 'an auth failure would fail every chunk too')
+  })
 })
 
 describe('listTasks', () => {

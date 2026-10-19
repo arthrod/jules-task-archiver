@@ -73,6 +73,7 @@ No Docker, no npm/pypi, no MCP registry.
 - Zero dependencies -- vanilla JS, no build step
 - Biome for linting (biome.json config): single quotes, no semicolons, 120 line width
 - batchexecute responses have XSS prefix `)]}'` and may contain raw control chars in JSON strings
+- Tjmm5c archives in batches of 50; a batch rejected with an RPC error code (e.g. `[4]` DEADLINE_EXCEEDED) is retried in chunks of 10
 - Service worker keepAlive: `setInterval` calling `chrome.runtime.getPlatformInfo()` every 25s
 - State persisted in `chrome.storage.session` -- survives SW restart
 - Tests use `vm.createContext` sandbox to mock Chrome APIs

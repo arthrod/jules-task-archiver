@@ -26,6 +26,11 @@ const GLOBAL_CONCURRENCY = 12
 // Tjmm5c (ArchiveTask) accepts an array of task IDs, so archive in batches to cut
 // the request count (was 1 request per task). One batch = one batchexecute call.
 const ARCHIVE_BATCH_SIZE = 50
+// A 50-id batch can be rejected with an RPC error code (seen live: [4],
+// DEADLINE_EXCEEDED, on 2 of 147 batches) while the same ids succeed in
+// smaller chunks, so a rejected batch is retried at this size.
+const ARCHIVE_SPLIT_SIZE = 10
+const RPC_ERROR_CODE_REGEX = /^RPC \w+ error code \[/
 
 // ⚡ Bolt Optimization: After parsing the URL, use a fast regex test to extract
 // the account ID instead of allocating string arrays via `.split('/')`. This avoids
@@ -1775,6 +1780,41 @@ function logDryRun(label, toArchive) {
   if (dryRunLogs.length > 0) addLog(dryRunLogs.join('\n'))
 }
 
+function getTaskIds(tasks) {
+  const len = tasks.length
+  const taskIds = new Array(len)
+  for (let i = 0; i < len; i++) {
+    taskIds[i] = tasks[i].id
+  }
+  return taskIds
+}
+
+// Returns the tasks that were archived. HTTP-level failures (auth, network)
+// are not split: every chunk would fail the same way.
+async function archiveBatchWithSplit(label, batch, config) {
+  try {
+    await globalLimit(() => archiveTasksWithRetry(getTaskIds(batch), config))
+    return batch
+  } catch (e) {
+    if (batch.length <= ARCHIVE_SPLIT_SIZE || !RPC_ERROR_CODE_REGEX.test(e.message)) {
+      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+      return []
+    }
+    addLog(`  [${label}] Batch of ${batch.length} rejected (${e.message}); retrying in chunks of ${ARCHIVE_SPLIT_SIZE}`)
+  }
+  const archived = []
+  for (let i = 0; i < batch.length; i += ARCHIVE_SPLIT_SIZE) {
+    const chunk = batch.slice(i, i + ARCHIVE_SPLIT_SIZE)
+    try {
+      await globalLimit(() => archiveTasksWithRetry(getTaskIds(chunk), config))
+      archived.push(...chunk)
+    } catch (e) {
+      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+    }
+  }
+  return archived
+}
+
 async function executeArchive(label, toArchive, config) {
   let grandTotal = 0
   let lastUpdate = 0
@@ -1785,29 +1825,21 @@ async function executeArchive(label, toArchive, config) {
   }
 
   await runInPool(batches, PER_ACCOUNT_CONCURRENCY, async (batch) => {
-    const len = batch.length
-    const taskIds = new Array(len)
-    for (let i = 0; i < len; i++) {
-      taskIds[i] = batch[i].id
-    }
     const now = Date.now()
     if (now - lastUpdate > 500) {
       updateState({ currentRepo: batch[0].repo || '(no repo)' })
       lastUpdate = now
     }
-    try {
-      await globalLimit(() => archiveTasksWithRetry(taskIds, config))
-      grandTotal += batch.length
-      state.progress.archived += batch.length
-      if (Date.now() - lastUpdate > 500) {
-        updateState({})
-        lastUpdate = Date.now()
-      }
-      for (const task of batch) {
-        addLog(`  Archived [${label}] [${task.id}] ${task.title}`)
-      }
-    } catch (e) {
-      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+    const archived = await archiveBatchWithSplit(label, batch, config)
+    if (archived.length === 0) return
+    grandTotal += archived.length
+    state.progress.archived += archived.length
+    if (Date.now() - lastUpdate > 500) {
+      updateState({})
+      lastUpdate = Date.now()
+    }
+    for (const task of archived) {
+      addLog(`  Archived [${label}] [${task.id}] ${task.title}`)
     }
   })
   return grandTotal
