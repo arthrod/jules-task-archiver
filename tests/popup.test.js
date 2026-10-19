@@ -789,3 +789,88 @@ describe('updateOpModeUI direct calls', () => {
     assert.strictEqual(opModeButtons[2].getAttribute('aria-pressed'), 'true')
   })
 })
+
+describe('Continue Waiting mode', () => {
+  function setupContinuePopup() {
+    const env = setupPopupSandbox()
+    env.elements['#continueMessage'] = createMockElement('textarea')
+    env.elements['#continueErrorMessage'] = createMockElement('textarea')
+    env.elements['#continueMessageRow'] = createMockElement('div')
+    return env
+  }
+
+  it('labels the start button for a dry run and a live run', () => {
+    const { sandbox, elements, radioStates } = setupContinuePopup()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    radioStates.mode = 'dry'
+    sandbox.setActiveOpMode('continue_waiting')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Dry Run Continue Waiting')
+    assert.strictEqual(sandbox.getRunningText(), '⏳ Dry Running Continue Waiting...')
+
+    radioStates.mode = 'live'
+    sandbox.setActiveOpMode('continue_waiting')
+    assert.strictEqual(elements['#startBtn'].textContent, 'Continue Waiting Tasks')
+    assert.strictEqual(sandbox.getRunningText(), '⏳ Continuing Waiting Tasks...')
+  })
+
+  it('shows the reply box only in Continue Waiting mode', () => {
+    const { sandbox, elements } = setupContinuePopup()
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    sandbox.setActiveOpMode('continue_waiting')
+    assert.ok(!elements['#continueMessageRow'].classList.contains('hidden'))
+    for (const mode of ['archive', 'suggestions', 'agent_batch']) {
+      sandbox.setActiveOpMode(mode)
+      assert.ok(elements['#continueMessageRow'].classList.contains('hidden'), mode)
+    }
+  })
+
+  it('sends the typed reply with the START options', async () => {
+    const { sandbox, elements } = setupContinuePopup()
+    let sentMessage = null
+    sandbox.chrome.runtime.sendMessage = (msg) => {
+      sentMessage = msg
+    }
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    sandbox.setActiveOpMode('continue_waiting')
+    elements['#continueMessage'].value = '  Ship it  '
+    elements['#continueErrorMessage'].value = ' Retry it '
+    await elements['#mainForm'].dispatchEvent('submit', { preventDefault: () => {} })
+
+    assert.strictEqual(sentMessage.action, 'START')
+    assert.strictEqual(sentMessage.options.opMode, 'continue_waiting')
+    assert.strictEqual(sentMessage.options.continueMessage, 'Ship it')
+    assert.strictEqual(sentMessage.options.continueErrorMessage, 'Retry it')
+  })
+
+  it('remembers the reply between popup openings', (_t, done) => {
+    const { sandbox, elements, syncStorage } = setupContinuePopup()
+    syncStorage.continueMessage = 'Saved reply'
+    syncStorage.continueErrorMessage = 'Saved retry'
+    vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
+
+    setTimeout(() => {
+      assert.strictEqual(elements['#continueMessage'].value, 'Saved reply')
+      assert.strictEqual(elements['#continueErrorMessage'].value, 'Saved retry')
+      elements['#continueMessage'].value = 'Edited reply'
+      elements['#continueMessage'].dispatchEvent('change')
+      assert.strictEqual(syncStorage.continueMessage, 'Edited reply')
+      elements['#continueErrorMessage'].value = 'Edited retry'
+      elements['#continueErrorMessage'].dispatchEvent('change')
+      assert.strictEqual(syncStorage.continueErrorMessage, 'Edited retry')
+      done()
+    }, 10)
+  })
+
+  it('has a labelled, length-capped reply box and a mode button in popup.html', () => {
+    const popupHtml = fs.readFileSync(path.join(__dirname, '../popup.html'), 'utf8')
+    assert.ok(popupHtml.includes('data-value="continue_waiting"'), 'mode button')
+    assert.match(popupHtml, /<textarea[^>]*id="continueMessage"[^>]*maxlength="2000"/)
+    assert.ok(popupHtml.includes('<label for="continueMessage">'), 'visible label')
+    assert.match(popupHtml, /<textarea[^>]*id="continueErrorMessage"[^>]*maxlength="2000"/)
+    assert.ok(popupHtml.includes('<label for="continueErrorMessage"'), 'visible retry label')
+    assert.match(popupHtml, /id="continueMessageRow"[^>]*class="[^"]*hidden/)
+  })
+})

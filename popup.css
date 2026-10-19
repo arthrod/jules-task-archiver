@@ -61,7 +61,8 @@ legend {
 
 input[type="text"],
 input[type="password"],
-select {
+select,
+textarea {
   display: block;
   width: 100%;
   padding: 6px 8px;
@@ -79,7 +80,8 @@ select {
 
 input[type="text"]:focus,
 input[type="password"]:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: #4ade80;
 }
 
@@ -361,6 +363,16 @@ input:invalid ~ .validation-error {
 .custom-repo-input {
   margin-top: 6px;
   font-size: 12px;
+}
+
+textarea {
+  resize: vertical;
+  font-family: inherit;
+}
+
+.continue-error-label {
+  display: block;
+  margin-top: 10px;
 }
 
 .download-btn {

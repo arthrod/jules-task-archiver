@@ -211,6 +211,11 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     globalThis.test_SCHEDULE_ALARM_NAME = SCHEDULE_ALARM_NAME;
     globalThis.test_DEFAULT_SCHEDULE = DEFAULT_SCHEDULE;
     globalThis.test_RJA83D = RJA83D;
+    globalThis.test_TASK_STATE = TASK_STATE;
+    globalThis.test_INTERACT_EXPERIMENT_IDS = INTERACT_EXPERIMENT_IDS;
+    globalThis.test_DEFAULT_CONTINUE_MESSAGE = DEFAULT_CONTINUE_MESSAGE;
+    globalThis.test_DEFAULT_ERROR_CONTINUE_MESSAGE = DEFAULT_ERROR_CONTINUE_MESSAGE;
+    globalThis.test_MAX_CONTINUE_MESSAGE_LEN = MAX_CONTINUE_MESSAGE_LEN;
   `
 
   const script = new vm.Script(scriptContent, { filename: bgScriptPath })
@@ -3186,5 +3191,307 @@ describe('ListTasks timeout', () => {
     await sandbox.test_listTasks('', { at: 'a', bl: 'b', fsid: 'f', accountNum: '0' })
     assert.strictEqual(timeouts[0].rpcId, 'p1Takd')
     assert.ok(timeouts[0].timeout >= 180000, `p1Takd timeout was ${timeouts[0].timeout}`)
+  })
+})
+
+describe('continue waiting tasks', () => {
+  const TAB = { id: 1, url: 'https://jules.google.com/u/1/' }
+  const UUID_REGEX = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/
+
+  const task = (id, state, extra = {}) => ({
+    id,
+    title: `Task ${id}`,
+    state,
+    source: 'github/o/r',
+    repo: 'o/r',
+    planId: null,
+    ...extra
+  })
+
+  // GetTask (n74qPd) returns the session with its activity log at [0][3];
+  // the last entry is what the Jules UI threads its reply onto.
+  function setupContinueEnv(tasks, { activities = {}, failInteract = new Set() } = {}) {
+    const { sandbox } = setupEnvironment()
+    sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl_v1', fsid: 'fsid', accountNum: '1' })
+    sandbox.listTasks = async () => tasks
+    const calls = []
+    sandbox.callBatchExecute = async (rpcId, payload) => {
+      calls.push({ rpcId, payload: JSON.parse(JSON.stringify(payload)) })
+      if (rpcId === 'n74qPd') {
+        const acts = activities[payload[0]] ?? [
+          ['act-old', [1, 0]],
+          [`act-last-${payload[0]}`, [2, 0]]
+        ]
+        return [[payload[0], null, 'prompt', acts]]
+      }
+      if (rpcId === 'SLmX6' && failInteract.has(payload[0])) throw new Error('batchexecute SLmX6 failed: HTTP 500')
+      return []
+    }
+    const interactCalls = () => calls.filter((c) => c.rpcId === 'SLmX6')
+    return { sandbox, calls, interactCalls }
+  }
+
+  describe('getWaitingKind', () => {
+    it('maps Jules state 12 to a reply and 10 to a plan approval', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(sandbox.getWaitingKind({ state: 12 }), 'feedback')
+      assert.strictEqual(sandbox.getWaitingKind({ state: 10 }), 'plan')
+    })
+
+    it('maps Jules state 4 (Error) to a retry', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(sandbox.getWaitingKind({ state: 4 }), 'error')
+    })
+
+    it('leaves running, finished and paused tasks alone', () => {
+      const { sandbox } = setupEnvironment()
+      for (const state of [1, 2, 3, 7, 8, 9, 11, null, undefined]) {
+        assert.strictEqual(sandbox.getWaitingKind({ state }), null, `state ${state}`)
+      }
+    })
+  })
+
+  describe('parseTask plan id', () => {
+    it('reads the current plan id from row[10][0]', () => {
+      const { sandbox } = setupEnvironment()
+      const raw = new Array(31).fill(null)
+      raw[0] = '1'
+      raw[5] = 10
+      raw[10] = ['plan-abc', [['step-1', 'Read the code']]]
+      assert.strictEqual(sandbox.test_parseTask(raw).planId, 'plan-abc')
+    })
+
+    it('is null when the task has no plan yet', () => {
+      const { sandbox } = setupEnvironment()
+      const raw = new Array(31).fill(null)
+      raw[0] = '1'
+      assert.strictEqual(sandbox.test_parseTask(raw).planId, null)
+    })
+  })
+
+  describe('buildInteractPayload', () => {
+    it('builds the reply exactly as the Jules UI sends it', () => {
+      const { sandbox } = setupEnvironment()
+      const payload = sandbox.buildInteractPayload(task('t1', 12), 'Keep going', 'act-9')
+      assert.strictEqual(payload.length, 4)
+      assert.strictEqual(payload[0], 't1')
+      const [planSlot, approvalSlot, message, activityId] = payload[1]
+      assert.strictEqual(planSlot, null)
+      assert.strictEqual(approvalSlot, null)
+      assert.strictEqual(message[0], 'Keep going')
+      assert.strictEqual(message[1], null)
+      assert.match(message[2], UUID_REGEX)
+      assert.strictEqual(activityId, 'act-9')
+      assert.strictEqual(payload[2], null)
+      assert.deepStrictEqual(Array.from(payload[3][0]), Array.from(sandbox.test_INTERACT_EXPERIMENT_IDS))
+    })
+
+    it('approves the plan for a task awaiting plan approval', () => {
+      const { sandbox } = setupEnvironment()
+      const payload = sandbox.buildInteractPayload(task('t2', 10, { planId: 'plan-7' }), 'ignored', 'act-3')
+      assert.strictEqual(JSON.stringify(payload[1]), JSON.stringify([null, ['plan-7'], null, 'act-3']))
+    })
+
+    it('uses a fresh message id for every reply', () => {
+      const { sandbox } = setupEnvironment()
+      const a = sandbox.buildInteractPayload(task('t1', 12), 'x', 'act')
+      const b = sandbox.buildInteractPayload(task('t1', 12), 'x', 'act')
+      assert.notStrictEqual(a[1][2][2], b[1][2][2])
+    })
+  })
+
+  describe('normalizeContinueMessage', () => {
+    it('falls back to the default message when none is given', () => {
+      const { sandbox } = setupEnvironment()
+      for (const value of [undefined, null, '', '   ', 42]) {
+        assert.strictEqual(sandbox.normalizeContinueMessage(value), sandbox.test_DEFAULT_CONTINUE_MESSAGE)
+      }
+    })
+
+    it('falls back to the given default for failed sessions', () => {
+      const { sandbox } = setupEnvironment()
+      const fallback = sandbox.test_DEFAULT_ERROR_CONTINUE_MESSAGE
+      assert.strictEqual(sandbox.normalizeContinueMessage('', fallback), fallback)
+      assert.strictEqual(sandbox.normalizeContinueMessage('x', fallback), 'x')
+    })
+
+    it('trims the message and caps its length', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(sandbox.normalizeContinueMessage('  go on  '), 'go on')
+      const long = 'a'.repeat(sandbox.test_MAX_CONTINUE_MESSAGE_LEN + 50)
+      assert.strictEqual(sandbox.normalizeContinueMessage(long).length, sandbox.test_MAX_CONTINUE_MESSAGE_LEN)
+    })
+  })
+
+  describe('processContinueForTab', () => {
+    it('dry run lists the waiting tasks without calling Jules', async () => {
+      const tasks = [
+        task('fb', 12),
+        task('plan', 10, { planId: 'p1' }),
+        task('err', 4),
+        task('run', 2),
+        task('done', 3)
+      ]
+      const { sandbox, calls } = setupContinueEnv(tasks)
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: true })
+
+      assert.strictEqual(count, 0)
+      assert.deepStrictEqual(calls, [])
+      const log = sandbox.test_state().log
+      assert.ok(log.some((l) => l.includes('1 awaiting your reply, 1 awaiting plan approval, 1 failed')))
+      assert.ok(log.some((l) => l.includes('[DRY] Would reply to [u/1] [fb] Task fb')))
+      assert.ok(log.some((l) => l.includes('[DRY] Would approve plan for [u/1] [plan] Task plan')))
+      assert.ok(log.some((l) => l.includes('[DRY] Would retry [u/1] [err] Task err')))
+      assert.ok(!log.some((l) => l.includes('[run]') || l.includes('[done]')))
+    })
+
+    it('replies to tasks awaiting feedback and approves pending plans', async () => {
+      const tasks = [task('fb', 12), task('plan', 10, { planId: 'p1' }), task('run', 2)]
+      const { sandbox, calls, interactCalls } = setupContinueEnv(tasks)
+      const count = await sandbox.processContinueForTab(TAB, {
+        opMode: 'continue_waiting',
+        dryRun: false,
+        continueMessage: 'Proceed'
+      })
+
+      assert.strictEqual(count, 2)
+      const sessionReads = calls.filter((c) => c.rpcId === 'n74qPd').map((c) => c.payload)
+      assert.deepStrictEqual(sessionReads.sort(), [
+        ['fb', 3],
+        ['plan', 3]
+      ])
+      const byTask = Object.fromEntries(interactCalls().map((c) => [c.payload[0], c.payload]))
+      assert.deepStrictEqual(Object.keys(byTask).sort(), ['fb', 'plan'])
+      assert.strictEqual(byTask.fb[1][2][0], 'Proceed')
+      assert.strictEqual(byTask.fb[1][3], 'act-last-fb')
+      assert.deepStrictEqual(byTask.plan[1], [null, ['p1'], null, 'act-last-plan'])
+
+      const state = sandbox.test_state()
+      assert.strictEqual(state.progress.archived, 2)
+      assert.strictEqual(state.progress.total, 2)
+      assert.ok(state.log.some((l) => l.includes('Replied to [u/1] [fb] Task fb')))
+      assert.ok(state.log.some((l) => l.includes('Approved plan for [u/1] [plan] Task plan')))
+      assert.ok(state.log.some((l) => l.includes('TOTAL: 2 tasks continued')))
+    })
+
+    it('only touches tasks in the selected repository', async () => {
+      const tasks = [task('mine', 12), task('other', 12, { source: 'github/o/other', repo: 'o/other' })]
+      const { sandbox, interactCalls } = setupContinueEnv(tasks)
+      const count = await sandbox.processContinueForTab(TAB, {
+        opMode: 'continue_waiting',
+        dryRun: false,
+        repoFilter: 'o/r'
+      })
+
+      assert.strictEqual(count, 1)
+      assert.deepStrictEqual(
+        interactCalls().map((c) => c.payload[0]),
+        ['mine']
+      )
+    })
+
+    it('sends failed sessions the retry prompt, not the reply', async () => {
+      const { sandbox, interactCalls } = setupContinueEnv([task('fb', 12), task('err', 4)])
+      const count = await sandbox.processContinueForTab(TAB, {
+        opMode: 'continue_waiting',
+        dryRun: false,
+        continueMessage: 'Proceed',
+        continueErrorMessage: ''
+      })
+
+      assert.strictEqual(count, 2)
+      const byTask = Object.fromEntries(interactCalls().map((c) => [c.payload[0], c.payload]))
+      assert.strictEqual(byTask.fb[1][2][0], 'Proceed')
+      assert.strictEqual(byTask.err[1][2][0], sandbox.test_DEFAULT_ERROR_CONTINUE_MESSAGE)
+      assert.strictEqual(byTask.err[1][3], 'act-last-err')
+      assert.ok(sandbox.test_state().log.some((l) => l.includes('Retried [u/1] [err] Task err')))
+    })
+
+    it('uses a custom retry prompt when one is given', async () => {
+      const { sandbox, interactCalls } = setupContinueEnv([task('err', 4)])
+      await sandbox.processContinueForTab(TAB, {
+        opMode: 'continue_waiting',
+        dryRun: false,
+        continueErrorMessage: ' Try again without the submodule '
+      })
+      assert.strictEqual(interactCalls()[0].payload[1][2][0], 'Try again without the submodule')
+    })
+
+    it('sends the default message when the popup left it empty', async () => {
+      const { sandbox, interactCalls } = setupContinueEnv([task('fb', 12)])
+      await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false, continueMessage: '' })
+      assert.strictEqual(interactCalls()[0].payload[1][2][0], sandbox.test_DEFAULT_CONTINUE_MESSAGE)
+    })
+
+    it('skips a plan approval when the task carries no plan id', async () => {
+      const { sandbox, interactCalls } = setupContinueEnv([task('plan', 10)])
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 0)
+      assert.strictEqual(interactCalls().length, 0)
+      assert.ok(sandbox.test_state().log.some((l) => l.includes('SKIP [u/1] [plan]') && l.includes('no plan id')))
+    })
+
+    it('skips a task whose session has no activity to reply to', async () => {
+      const { sandbox, interactCalls } = setupContinueEnv([task('fb', 12)], { activities: { fb: [] } })
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 0)
+      assert.strictEqual(interactCalls().length, 0)
+      assert.ok(sandbox.test_state().log.some((l) => l.includes('SKIP [u/1] [fb]') && l.includes('no activity')))
+    })
+
+    it('keeps going after one reply fails and never re-sends it', async () => {
+      const tasks = [task('bad', 12), task('good', 12)]
+      const { sandbox, interactCalls } = setupContinueEnv(tasks, { failInteract: new Set(['bad']) })
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 1)
+      assert.strictEqual(
+        interactCalls().filter((c) => c.payload[0] === 'bad').length,
+        1,
+        'a reply is sent at most once'
+      )
+      const state = sandbox.test_state()
+      assert.strictEqual(state.progress.skipped, 1)
+      assert.ok(state.log.some((l) => l.includes('ERROR [u/1] continuing [bad]') && l.includes('HTTP 500')))
+    })
+
+    it('reports when nothing is waiting', async () => {
+      const { sandbox, calls } = setupContinueEnv([task('run', 2), task('done', 3)])
+      const count = await sandbox.processContinueForTab(TAB, { opMode: 'continue_waiting', dryRun: false })
+
+      assert.strictEqual(count, 0)
+      assert.deepStrictEqual(calls, [])
+      assert.ok(sandbox.test_state().log.some((l) => l.includes('No tasks are waiting on you')))
+    })
+  })
+
+  describe('run wiring', () => {
+    it('routes continue_waiting to processContinueForTab', async () => {
+      const { sandbox } = setupEnvironment()
+      const called = []
+      sandbox.processContinueForTab = async () => {
+        called.push('continue')
+        return 3
+      }
+      sandbox.processTab = async () => {
+        called.push('archive')
+        return 0
+      }
+      const results = await sandbox.test_processAllTabs([TAB], { opMode: 'continue_waiting' })
+      assert.deepStrictEqual(called, ['continue'])
+      assert.strictEqual(results[0].count, 3)
+    })
+
+    it('labels the run and its summary', () => {
+      const { sandbox } = setupEnvironment()
+      sandbox.test_initOperationState({ opMode: 'continue_waiting', dryRun: false })
+      sandbox.finalizeOperation([{ label: 'u/1', count: 4 }], { opMode: 'continue_waiting' })
+      const log = sandbox.test_state().log
+      assert.ok(log.includes('=== CONTINUE WAITING MODE ==='))
+      assert.ok(log.some((l) => l.includes('u/1: 4 continued')))
+      assert.ok(log.some((l) => l.includes('GRAND TOTAL: 4 tasks continued')))
+    })
   })
 })

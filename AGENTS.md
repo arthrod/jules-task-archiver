@@ -23,12 +23,13 @@ popup.js (UI) <-> background.js (batchexecute client) <-> content.js (token extr
                 chrome.storage.sync (settings)
 ```
 
-Five operation modes:
+Six operation modes:
 1. **Archive Tasks** -- ListTasks (p1Takd) -> check GitHub PRs -> ArchiveTask (Tjmm5c)
 2. **Start Suggestions** -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> cap to remaining daily quota (KQOO7) -> StartSuggestion (Rja83d)
 3. **Batch Agent** -- ListSources -> ListSuggestions (hQP40d) per repo -> ONE StartSuggestion (Rja83d) per repo whose prompt carries every suggestion; same toggle + daily-quota (KQOO7) rules as Start Suggestions, except an explicitly chosen owner/repo is used as-is.
 4. **Remove Suggestions** -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> DismissSuggestion (sc1vFf) per suggestion.
 5. **Export Suggestions JSON** -- ListSources (all connected repos, read-only) -> ListSuggestions (hQP40d) per repo -> JSON file via chrome.downloads (re-downloadable from the popup).
+6. **Continue Waiting** -- ListTasks (p1Takd) -> tasks in state 12 (awaiting user feedback), 10 (awaiting plan approval) or 4 (error) -> GetTask (n74qPd, view 3) for the newest activity id -> Interact (SLmX6): the reply for state 12, a plan approval for state 10, the retry prompt for state 4. The reply is never retried (a 5xx may still have delivered it); a re-run only finds tasks still waiting. Archived tasks are not covered.
 
 Every mode accepts an optional repository filter (popup dropdown or typed `owner/repo`); empty = all repos. Matching is exact and case-insensitive (`owner/plate` never matches `owner/plate-docs`).
 
@@ -43,6 +44,8 @@ Background service worker makes all API calls. No DOM automation.
 - `hQP40d` -- ListSuggestions (repo)
 - `Rja83d` -- StartSuggestion (prompt, model config, repo, experiment IDs)
 - `sc1vFf` -- DismissSuggestion (suggestionId, [1]=2 dismiss)
+- `n74qPd` -- GetTask `[taskId, 3]`; view 3 includes the activity log at `[0][3]`
+- `SLmX6` -- Interact `[taskId, [_, [planId], [text, null, clientUuid], lastActivityId], null, [experimentIds]]`; `[1]` approves a plan, `[2]` sends a reply
 
 ## Development
 

@@ -59,6 +59,13 @@
 - **GitHub PR check** -- skips repos with open PRs to avoid archiving active work
 - **Force mode** -- skip PR check and archive everything
 
+### Continue Waiting
+
+- **Reply to waiting sessions** -- sends one reply (editable in the popup, remembered between runs) to every session awaiting your feedback
+- **Approve pending plans** -- approves the plan of every session awaiting plan approval
+- **Retry failed sessions** -- sends every session that stopped with an error a retry prompt (default provided, editable)
+- Dry Run lists both groups first. Archived sessions are not covered.
+
 ### Start Suggestions
 
 - **Bulk start** -- start all recommended code suggestions (security, performance, testing, cleanup) across repos
@@ -99,7 +106,8 @@
 1. Open one or more `jules.google.com` tabs (supports multiple accounts)
 2. Click the extension icon in the toolbar
 3. Configure:
-   - **Operation** -- Archive Tasks, Start (Separate), Batch to 1 Agent, Remove, or Export JSON
+   - **Operation** -- Archive Tasks, Continue Waiting, Start (Separate), Batch to 1 Agent, Remove, or Export JSON
+   - **Reply** / **Reply to failed sessions** -- the messages Continue Waiting sends (Continue Waiting only)
    - **GitHub Owner** -- your GitHub username (for PR checks in archive mode)
    - **GitHub Token** -- optional, for private repos
    - **Mode** -- Dry Run (preview) or Run (execute)
