@@ -179,7 +179,11 @@ async function jFetch(url, options = {}) {
     const finalRedirect = token ? 'error' : rest.redirect || 'follow'
     const res = await fetch(url, { headers: safeHeaders, signal: controller.signal, ...rest, redirect: finalRedirect })
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`)
+      // Callers that need the error body (e.g. the XSRF refresh) read it here.
+      const err = new Error(`HTTP ${res.status}`)
+      err.status = res.status
+      err.response = res
+      throw err
     }
     return res
   } catch (e) {
@@ -276,18 +280,58 @@ function buildBatchRequest(rpcId, payload, config) {
   }
 }
 
-async function callBatchExecute(rpcId, payload, config) {
+function postBatchExecute(rpcId, payload, config, timeout) {
   const { url, body } = buildBatchRequest(rpcId, payload, config)
+  return jFetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      'x-same-domain': '1'
+    },
+    credentials: 'include',
+    body,
+    ...(timeout ? { timeout } : {})
+  })
+}
+
+// The XSRF token (WIZ_global_data.SNlM0e) is frozen at page load, while the
+// Jules page silently renews its own. A tab left open for hours therefore
+// hands us an expired `at`, and every batchexecute call answers HTTP 400.
+// Jules puts a replacement in the 400 body as ["xsrf","<token>"]; when it
+// doesn't, a read-only KQOO7 call sent WITHOUT `at` returns one.
+const XSRF_TOKEN_REGEX = /"xsrf","([^"]+)"/
+
+async function readXsrfToken(err) {
   try {
-    const res = await jFetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-        'x-same-domain': '1'
-      },
-      credentials: 'include',
-      body
-    })
+    const text = await err?.response?.text()
+    return XSRF_TOKEN_REGEX.exec(text || '')?.[1] || null
+  } catch {
+    return null
+  }
+}
+
+async function mintXsrfToken(config) {
+  try {
+    await postBatchExecute('KQOO7', [], { ...config, at: '' })
+    return null
+  } catch (e) {
+    return e.status === 400 ? readXsrfToken(e) : null
+  }
+}
+
+async function callBatchExecute(rpcId, payload, config, { timeout } = {}) {
+  try {
+    let res
+    try {
+      res = await postBatchExecute(rpcId, payload, config, timeout)
+    } catch (e) {
+      if (e.status !== 400) throw e
+      const fresh = (await readXsrfToken(e)) || (await mintXsrfToken(config))
+      if (!fresh) throw e
+      // Mutate the run's config so every later call reuses the fresh token.
+      config.at = fresh
+      res = await postBatchExecute(rpcId, payload, config, timeout)
+    }
     return parseResponse(await res.text(), rpcId)
   } catch (e) {
     throw new Error(`batchexecute ${rpcId} failed: ${e.message}`)
@@ -491,9 +535,14 @@ function groupTasksByRepo(tasks) {
   return map
 }
 
+// ListTasks returns every task with its full prompt in one response — 121 MB
+// and ~85 s for a 7,355-task account (measured 2026-10-19). The 30 s default
+// would abort it before the headers even arrive.
+const LIST_TASKS_TIMEOUT_MS = 5 * 60 * 1000
+
 async function listTasks(filter, config) {
   const payload = [filter, 4]
-  const result = await callBatchExecute('p1Takd', payload, config)
+  const result = await callBatchExecute('p1Takd', payload, config, { timeout: LIST_TASKS_TIMEOUT_MS })
   if (!result?.[0]) return []
 
   const arr = result[0]

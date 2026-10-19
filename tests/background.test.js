@@ -2887,3 +2887,86 @@ describe('opMode dispatch and run state', () => {
     assert.deepStrictEqual(await sandbox.getAllSourceNames(), ['a/first', 'z/last'])
   })
 })
+
+describe('stale XSRF token recovery (HTTP 400)', () => {
+  const CONFIG = () => ({ at: 'STALE:1', bl: 'bl_v1', fsid: 'fsid', accountNum: '0' })
+  const OK_BODY = (rpcId) => `)]}'\n\n60\n[["wrb.fr","${rpcId}","[[\\"ok\\"]]",null,null,null,"generic"]]`
+  // Shape captured live: a rejected token answers 400 with an "er" envelope;
+  // when Jules can mint a replacement it is carried as ["xsrf","<token>"].
+  const XSRF_BODY = (token) =>
+    `)]}'\n\n120\n[["er",null,null,null,null,400,null,null,null,3,[{"48448350":["xsrf","${token}"]}]]]`
+  const NO_TOKEN_BODY = `)]}'\n\n60\n[["er",null,null,null,null,400,null,null,null,3]]`
+
+  function scriptedFetch(sandbox, responses) {
+    const calls = []
+    sandbox.fetch = async (url, opts) => {
+      const body = new URLSearchParams(opts.body)
+      calls.push({ rpcId: new URL(url).searchParams.get('rpcids'), at: body.get('at') })
+      const { status, text } = responses[Math.min(calls.length - 1, responses.length - 1)]
+      return { ok: status >= 200 && status < 300, status, text: async () => text }
+    }
+    return calls
+  }
+
+  it('retries once with the fresh token carried in the 400 body', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [
+      { status: 400, text: XSRF_BODY('FRESH:2') },
+      { status: 200, text: OK_BODY('p1Takd') }
+    ])
+    const config = CONFIG()
+    const result = await sandbox.test_callBatchExecute('p1Takd', ['', 4], config)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(result)), [['ok']])
+    assert.deepStrictEqual(
+      calls.map((c) => c.at),
+      ['STALE:1', 'FRESH:2']
+    )
+    assert.strictEqual(config.at, 'FRESH:2', 'later calls in the run reuse the fresh token')
+  })
+
+  it('mints a token with a read-only KQOO7 probe when the 400 body carries none', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [
+      { status: 400, text: NO_TOKEN_BODY },
+      { status: 400, text: XSRF_BODY('FRESH:3') },
+      { status: 200, text: OK_BODY('Tjmm5c') }
+    ])
+    const config = CONFIG()
+    await sandbox.test_callBatchExecute('Tjmm5c', [['t1'], 1], config)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(calls)), [
+      { rpcId: 'Tjmm5c', at: 'STALE:1' },
+      { rpcId: 'KQOO7', at: '' },
+      { rpcId: 'Tjmm5c', at: 'FRESH:3' }
+    ])
+  })
+
+  it('gives up after a single refresh', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [{ status: 400, text: XSRF_BODY('FRESH:4') }])
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', ['', 4], CONFIG()), /HTTP 400/)
+    assert.strictEqual(calls.length, 2)
+  })
+
+  it('does not touch the token on non-400 failures', async () => {
+    const { sandbox } = setupEnvironment()
+    const calls = scriptedFetch(sandbox, [{ status: 500, text: 'oops' }])
+    const config = CONFIG()
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', ['', 4], config), /HTTP 500/)
+    assert.strictEqual(calls.length, 1)
+    assert.strictEqual(config.at, 'STALE:1')
+  })
+})
+
+describe('ListTasks timeout', () => {
+  it('gives p1Takd a long timeout (multi-minute, 100MB+ responses on big accounts)', async () => {
+    const { sandbox } = setupEnvironment()
+    const timeouts = []
+    sandbox.jFetch = async (url, opts) => {
+      timeouts.push({ rpcId: new URL(url).searchParams.get('rpcids'), timeout: opts.timeout })
+      return { ok: true, status: 200, text: async () => ")]}'\n\n4\n[[]]" }
+    }
+    await sandbox.test_listTasks('', { at: 'a', bl: 'b', fsid: 'f', accountNum: '0' })
+    assert.strictEqual(timeouts[0].rpcId, 'p1Takd')
+    assert.ok(timeouts[0].timeout >= 180000, `p1Takd timeout was ${timeouts[0].timeout}`)
+  })
+})
