@@ -1406,7 +1406,18 @@ async function processExportSuggestionsForTab(tab, options) {
     repositories: exportResults
   }
 
-  updateState({ exportData: exportPayload })
+  // Accounts export in parallel; fold each one into the popup's re-download
+  // instead of letting the last account overwrite the others.
+  const prev = state.exportData
+  updateState({
+    exportData: prev
+      ? {
+          exportedAt: exportPayload.exportedAt,
+          totalSuggestions: prev.totalSuggestions + totalFound,
+          accounts: [...(prev.accounts || [prev]), exportPayload]
+        }
+      : exportPayload
+  })
   persistNow()
   downloadExport(label, exportPayload)
 
@@ -1941,16 +1952,10 @@ function initOperationState(options) {
   return isSuggestions
 }
 
-async function discoverTabs(options) {
-  let tabs = await getJulesTabs()
-
-  if (options.scope === 'current' && options.activeTabId) {
-    tabs = tabs.filter((t) => t.id === options.activeTabId)
-  }
-
-  // Tabs are processed in parallel. Two tabs on one account would each read
-  // the same remaining daily quota (and repeat the same archive/dismiss
-  // calls), so keep only the first tab per account.
+// Tabs are processed in parallel. Two tabs on one account would each read
+// the same remaining daily quota (and repeat the same archive/dismiss calls),
+// so only the first tab per account is used.
+function keepFirstTabPerAccount(tabs) {
   const seenAccounts = new Set()
   const uniqueTabs = []
   for (const t of tabs) {
@@ -1959,6 +1964,17 @@ async function discoverTabs(options) {
     seenAccounts.add(num)
     uniqueTabs.push(t)
   }
+  return uniqueTabs
+}
+
+async function discoverTabs(options) {
+  let tabs = await getJulesTabs()
+
+  if (options.scope === 'current' && options.activeTabId) {
+    tabs = tabs.filter((t) => t.id === options.activeTabId)
+  }
+
+  const uniqueTabs = keepFirstTabPerAccount(tabs)
   if (uniqueTabs.length < tabs.length) {
     addLog(`Skipping ${tabs.length - uniqueTabs.length} duplicate tab(s) for an already-listed account`)
   }
@@ -2067,12 +2083,20 @@ async function startOperation(options) {
 
 // Repo picker source for the popup: every connected repo of the first Jules
 // tab's account, as sorted "owner/repo" display names.
+// Union of every signed-in account's connected repos, one lookup per account.
+// An account whose lookup fails is skipped; it only throws if all of them fail.
 async function getAllSourceNames() {
-  const tabs = await getJulesTabs()
+  const tabs = keepFirstTabPerAccount(await getJulesTabs())
   if (!tabs.length) return []
-  const config = await getTabConfig(tabs[0].id)
-  const allRepos = await listAllSources(config)
-  return allRepos.map((r) => r.replace(/^github\//, '')).sort()
+  const settled = await Promise.allSettled(tabs.map(async (tab) => listAllSources(await getTabConfig(tab.id))))
+  const names = new Set()
+  for (const result of settled) {
+    if (result.status !== 'fulfilled') continue
+    for (const repo of result.value) names.add(repo.replace(/^github\//, ''))
+  }
+  const failure = settled.find((result) => result.status === 'rejected')
+  if (names.size === 0 && failure) throw failure.reason
+  return [...names].sort()
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

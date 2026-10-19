@@ -2888,6 +2888,21 @@ describe('processExportSuggestionsForTab', () => {
     assert.match(downloads[0].filename, /^jules-suggestions-\d{4}-\d{2}-\d{2}\.json$/)
   })
 
+  it('keeps every account in exportData when several accounts export in one run', async () => {
+    const { sandbox, downloads } = setupExportEnv(['github/o/a'], { 'github/o/a': [{ id: 's1', title: 'One' }] })
+    await sandbox.processExportSuggestionsForTab(TAB, { opMode: 'export_suggestions' })
+    await sandbox.processExportSuggestionsForTab(
+      { id: 2, url: 'https://jules.google.com/u/1/' },
+      { opMode: 'export_suggestions' }
+    )
+
+    const exportData = sandbox.test_state().exportData
+    assert.strictEqual(exportData.totalSuggestions, 2)
+    assert.strictEqual(exportData.accounts.length, 2)
+    assert.strictEqual(exportData.accounts[1].repositories[0].repo, 'github/o/a')
+    assert.strictEqual(downloads.length, 2, 'each account still gets its own file')
+  })
+
   it('queries a typed owner/repo directly when it is not among the listed sources', async () => {
     const { sandbox, queriedRepos } = setupExportEnv(['github/o/a'])
     await sandbox.processExportSuggestionsForTab(TAB, { opMode: 'export_suggestions', repoFilter: 'other/repo' })
@@ -3054,7 +3069,40 @@ describe('opMode dispatch and run state', () => {
     sandbox.getJulesTabs = async () => [{ id: 7, url: 'https://jules.google.com/u/0/' }]
     sandbox.getTabConfig = async () => ({ at: 'at', bl: 'bl', fsid: 'f', accountNum: '0' })
     sandbox.listAllSources = async () => ['github/z/last', 'github/a/first']
-    assert.deepStrictEqual(await sandbox.getAllSourceNames(), ['a/first', 'z/last'])
+    assert.deepStrictEqual(Array.from(await sandbox.getAllSourceNames()), ['a/first', 'z/last'])
+  })
+
+  it('getAllSourceNames merges the repos of every signed-in account', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 7, url: 'https://jules.google.com/u/0/' },
+      { id: 8, url: 'https://jules.google.com/u/0/repo/x' },
+      { id: 9, url: 'https://jules.google.com/u/1/' }
+    ]
+    sandbox.getTabConfig = async (tabId) => ({ at: 'at', bl: 'bl', fsid: 'f', accountNum: tabId === 9 ? '1' : '0' })
+    const queried = []
+    sandbox.listAllSources = async (config) => {
+      queried.push(config.accountNum)
+      return config.accountNum === '1' ? ['github/b/second', 'github/a/first'] : ['github/a/first', 'github/z/last']
+    }
+
+    assert.deepStrictEqual(Array.from(await sandbox.getAllSourceNames()), ['a/first', 'b/second', 'z/last'])
+    assert.deepStrictEqual(queried.sort(), ['0', '1'], 'one lookup per account, not per tab')
+  })
+
+  it('getAllSourceNames keeps the accounts that answered when one fails', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.chrome.tabs.query = async () => [
+      { id: 7, url: 'https://jules.google.com/u/0/' },
+      { id: 9, url: 'https://jules.google.com/u/1/' }
+    ]
+    sandbox.getTabConfig = async (tabId) => ({ at: 'at', bl: 'bl', fsid: 'f', accountNum: tabId === 9 ? '1' : '0' })
+    sandbox.listAllSources = async (config) => {
+      if (config.accountNum === '1') throw new Error('HTTP 401')
+      return ['github/a/first']
+    }
+
+    assert.deepStrictEqual(Array.from(await sandbox.getAllSourceNames()), ['a/first'])
   })
 })
 

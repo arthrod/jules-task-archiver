@@ -69,7 +69,7 @@
 
 - **Batch to 1 Agent** -- one Jules session per repo whose prompt carries every queued suggestion, instead of one session per suggestion (counts against the daily session quota like Start Suggestions)
 - **Remove Suggestions** -- bulk-dismiss queued suggestions on Suggestions-enabled repos (Dry Run previews the list)
-- **Export Suggestions JSON** -- save every suggestion across all connected repos to `jules-suggestions-YYYY-MM-DD.json`; re-download from the popup
+- **Export Suggestions JSON** -- save every suggestion across all connected repos to `jules-suggestions-YYYY-MM-DD.json` (one file per account); the popup's re-download combines all accounts under `accounts`
 - **Repository filter** -- every mode can be narrowed to one repo from the dropdown or a typed `owner/repo`
 
 ### Scheduled Operations
