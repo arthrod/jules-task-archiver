@@ -316,7 +316,8 @@ button.secondary:active:not(:disabled) {
 
 /* CSP compliance additions */
 .hidden {
-  display: none;
+  /* biome-ignore lint/complexity/noImportantStyles: utility must beat button.primary/.secondary (0,1,1) display:block */
+  display: none !important;
 }
 
 .fieldset-reset {

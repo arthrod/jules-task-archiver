@@ -129,3 +129,37 @@ describe('Apache 2.0 License Compliance', () => {
     }
   })
 })
+
+describe('Extension page CSP compliance', () => {
+  // manifest.json: extension_pages CSP is `style-src 'self'`, which blocks
+  // inline <style> blocks and style="" attributes on extension pages.
+  const licenseHtml = fs.readFileSync(path.join(rootDir, 'license.html'), 'utf8')
+
+  it('license.html has no inline <style> block or style attributes', () => {
+    assert.ok(!/<style[\s>]/i.test(licenseHtml), 'inline <style> is blocked by the extension CSP')
+    assert.ok(!/\sstyle=/i.test(licenseHtml), 'style="" attributes are blocked by the extension CSP')
+  })
+
+  it('license.html loads its styles from license.css', () => {
+    assert.ok(/<link rel="stylesheet" href="license\.css"/.test(licenseHtml))
+    assert.ok(fs.existsSync(path.join(rootDir, 'license.css')), 'license.css must exist')
+  })
+
+  it('popup .hidden wins over button display rules', () => {
+    // button.primary / button.secondary set display:block with higher
+    // specificity than .hidden, so without !important hidden buttons show.
+    const popupCss = fs.readFileSync(path.join(rootDir, 'popup.css'), 'utf8')
+    assert.match(popupCss, /\.hidden\s*\{[^}]*display:\s*none\s*!important/)
+  })
+})
+
+describe('Release packaging', () => {
+  const cdYml = fs.readFileSync(path.join(rootDir, '.github', 'workflows', 'cd.yml'), 'utf8')
+  const zipBlock = cdYml.slice(cdYml.indexOf('zip -r'), cdYml.indexOf('icons/', cdYml.indexOf('zip -r')))
+
+  for (const file of ['license.html', 'license.css', 'LICENSE']) {
+    it(`release zip ships ${file}`, () => {
+      assert.ok(new RegExp(`\\s${file.replace('.', '\\.')}\\s`).test(zipBlock), `${file} missing from zip command`)
+    })
+  }
+})

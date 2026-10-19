@@ -2017,6 +2017,10 @@ async function getAllSourceNames() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.action) {
     case 'GET_ALL_SOURCES':
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
       getAllSourceNames()
         .then((repos) => sendResponse({ repos }))
         .catch((err) => {
