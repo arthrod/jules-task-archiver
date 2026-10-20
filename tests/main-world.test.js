@@ -62,7 +62,8 @@ describe('main-world.js', () => {
       SNlM0e: 'at-token',
       cfb2h: 'bl-label',
       FdrFJe: 'fsid-token',
-      TSDtV: 'beyond:models/gemini-pro'
+      TSDtV: 'beyond:models/gemini-pro',
+      S06Grb: '123456789012345678901'
     })
 
     vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
@@ -75,6 +76,8 @@ describe('main-world.js', () => {
     assert.strictEqual(messages[0].data.config.fsid, 'fsid-token')
     assert.strictEqual(messages[0].data.config.modelId, 'beyond:models/gemini-pro')
     assert.strictEqual(messages[0].data.config.timestamp, 1234567890)
+    // The signed-in Google account: the More Actions cache is kept per account.
+    assert.strictEqual(messages[0].data.config.user, '123456789012345678901')
   })
 
   it('should handle missing WIZ_global_data', () => {
@@ -97,6 +100,7 @@ describe('main-world.js', () => {
     assert.strictEqual(messages[0].data.config.at, 'at-token')
     assert.strictEqual(messages[0].data.config.bl, null)
     assert.strictEqual(messages[0].data.config.modelId, null)
+    assert.strictEqual(messages[0].data.config.user, null)
   })
 
   it('should handle non-matching modelId string', () => {

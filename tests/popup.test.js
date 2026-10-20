@@ -223,6 +223,7 @@ function createMockSelect() {
 }
 
 const ELEMENT_IDS = [
+  'moreRefresh',
   'moreToggle',
   'morePanel',
   'moreAll',
@@ -320,6 +321,7 @@ function setupPopupSandbox({
   elements['#moreAll'].checked = true
   elements['#moreCategory'].value = 'all'
   elements['#morePanel'].classList.add('hidden')
+  elements['#moreRefresh'].classList.add('hidden')
   elements['#message'].disabled = true
   elements['#oneSessionRow'].classList.add('hidden')
   elements['#settingsPanel'].classList.add('hidden')
@@ -1220,8 +1222,6 @@ describe('Schedule settings', () => {
 describe('Settings panel', () => {
   const rpcInput = (env, i) => env.elements['#rpcInputs'].children[i].children[1]
 
-  it('shows the defaults when nothing is saved', () => {
-    const env = setupPopupSandbox()
   it('gives every Jules method a short name, so no id box is squeezed by a long one', () => {
     const env = setupPopupSandbox()
     env.load()
@@ -1249,6 +1249,8 @@ describe('Settings panel', () => {
     assert.match(popupCss, /\.xb \.rpcs input\[type="text"\] \{[^}]*flex: none;/)
   })
 
+  it('shows the defaults when nothing is saved', () => {
+    const env = setupPopupSandbox()
     env.load()
     assert.strictEqual(env.elements['#requestTimeoutSec'].value, '30')
     assert.strictEqual(env.elements['#listTimeoutSec'].value, '300')
@@ -1776,6 +1778,83 @@ describe('More Actions popup edge cases', () => {
     await env.tick()
   }
 
+  const cacheAccounts = [
+    {
+      account: 'u/1',
+      tasks: [
+        { id: 'run', title: 'Running title', state: 2, repo: 'org/repo' },
+        { id: 'done', title: 'Completed title', state: null, repo: 'org/repo' }
+      ],
+      schedules: [{ id: 'sched', title: 'Schedule title', state: 2, repo: 'org/repo' }],
+      archived: [{ id: 'old', title: 'Archived title', state: 3, repo: 'org/repo' }],
+      notes: ['Archived listing note']
+    }
+  ]
+
+  it('says how old a cached load is and offers Refresh, which lists live', async () => {
+    assert.match(popupHtml, /id="moreLoad">Load<\/button>\s*<button type="button" class="sb hidden" id="moreRefresh"/)
+    const env = setupPopupSandbox()
+    const at = Date.now() - 12 * 60000
+    const reply = moreReplies(cacheAccounts)
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      const answer = reply(msg)
+      if (cb) cb(msg.action.startsWith('LOAD_') && !msg.fresh ? { ...answer, cachedAt: at } : answer)
+    }
+    env.load()
+    await env.tick()
+    const el = env.elements
+    const loads = () => env.sent.filter((msg) => msg.action.startsWith('LOAD_')).map((msg) => [msg.action, msg.fresh])
+    assert.ok(el['#moreRefresh'].classList.contains('hidden'))
+    el['#moreCategory'].value = 'archive'
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.deepStrictEqual(loads(), [
+      ['LOAD_ITEMS', false],
+      ['LOAD_ARCHIVED', false]
+    ])
+    assert.strictEqual(
+      el['#moreStatus'].textContent,
+      '1 archived tasks · from the cache, 12 min old · Archived listing note'
+    )
+    assert.ok(!el['#moreRefresh'].classList.contains('hidden'))
+    assert.strictEqual(el['#moreRefresh'].disabled, false)
+    env.sent.length = 0
+    await el['#moreRefresh'].dispatchEvent('click')
+    await env.tick()
+    assert.deepStrictEqual(loads(), [
+      ['LOAD_ITEMS', true],
+      ['LOAD_ARCHIVED', true]
+    ])
+    assert.strictEqual(el['#moreStatus'].textContent, '1 archived tasks · Archived listing note')
+    assert.ok(el['#moreRefresh'].classList.contains('hidden'), 'a live load needs no Refresh')
+  })
+
+  it('calls a cache under a minute old just that, and takes the older of the two parts', async () => {
+    const env = setupPopupSandbox()
+    const reply = moreReplies(cacheAccounts)
+    const ages = { LOAD_ITEMS: 20000, LOAD_ARCHIVED: 60000 }
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      if (cb) cb(ages[msg.action] ? { ...reply(msg), cachedAt: Date.now() - ages[msg.action] } : reply(msg))
+    }
+    env.load()
+    await env.tick()
+    const el = env.elements
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules · from the cache, under a minute old')
+    ages.LOAD_ITEMS = 7 * 60000
+    el['#moreCategory'].value = 'archive'
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.match(
+      el['#moreStatus'].textContent,
+      /from the cache, 7 min old/,
+      'the older part, not the newer archived one'
+    )
+  })
+
   it('Archived waits for LOAD_ARCHIVED, with Load free meanwhile', async () => {
     const env = heldArchived(archivedOnly)
     await loadArchived(env)
@@ -1788,7 +1867,8 @@ describe('More Actions popup edge cases', () => {
     assert.deepStrictEqual(JSON.parse(JSON.stringify(msg)), {
       action: 'LOAD_ARCHIVED',
       protocol: RUN_PROTOCOL,
-      loadId: 'L1'
+      loadId: 'L1',
+      fresh: false
     })
     cb(moreReplies(archivedOnly, 'L1')(msg))
     await env.tick()

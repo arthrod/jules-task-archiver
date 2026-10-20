@@ -22,6 +22,8 @@ function broadcastConfig() {
             bl: w.cfb2h || null,
             fsid: w.FdrFJe || null,
             modelId: modelMatch ? modelMatch[0] : null,
+            // The signed-in Google account: u/N can be another one after a sign-in change.
+            user: typeof w.S06Grb === 'string' && w.S06Grb ? w.S06Grb : null,
             timestamp: Date.now()
           }
         : null
