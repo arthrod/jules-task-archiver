@@ -964,6 +964,7 @@ button.sb:hover {
 
 /* --- Settings panel: compact RPC inputs and buttons (after the base rules) --- */
 .xb .rpcs input[type="text"] {
+  flex: none;
   width: 70px;
   height: 22px;
   font-size: 11px;

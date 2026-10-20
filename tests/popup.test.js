@@ -12,6 +12,7 @@ const itemsJs = fs.readFileSync(itemsJsPath, 'utf8')
 const settingsJsPath = path.join(__dirname, '../settings.js')
 const settingsJs = fs.readFileSync(settingsJsPath, 'utf8')
 const popupHtml = fs.readFileSync(path.join(__dirname, '../popup.html'), 'utf8')
+const popupCss = fs.readFileSync(path.join(__dirname, '../popup.css'), 'utf8')
 const { RUN_PROTOCOL, START_OPTION_KEYS } = require('../settings.js')
 
 /**
@@ -1221,6 +1222,33 @@ describe('Settings panel', () => {
 
   it('shows the defaults when nothing is saved', () => {
     const env = setupPopupSandbox()
+  it('gives every Jules method a short name, so no id box is squeezed by a long one', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    assert.deepStrictEqual(
+      env.elements['#rpcInputs'].children.map((label) => label.children[0].textContent),
+      [
+        'List tasks',
+        'Archive',
+        'Resume',
+        'Pause',
+        'List schedules',
+        'Pause schedule',
+        'Resume schedule',
+        'Delete schedule',
+        'Delete task',
+        'Get task',
+        'Reply',
+        'Daily quota',
+        'Start session',
+        'List repos',
+        'Suggestions',
+        'Dismiss'
+      ]
+    )
+    assert.match(popupCss, /\.xb \.rpcs input\[type="text"\] \{[^}]*flex: none;/)
+  })
+
     env.load()
     assert.strictEqual(env.elements['#requestTimeoutSec'].value, '30')
     assert.strictEqual(env.elements['#listTimeoutSec'].value, '300')
