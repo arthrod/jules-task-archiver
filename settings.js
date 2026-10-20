@@ -15,7 +15,7 @@
 // RUN_PROTOCOL before every run, and the background refuses a START with
 // another protocol or an option it doesn't know. Bump RUN_PROTOCOL whenever a
 // message between the two changes meaning.
-const RUN_PROTOCOL = 5
+const RUN_PROTOCOL = 6
 // Every option the popup may put in a START message.
 const START_OPTION_KEYS = [
   'action',

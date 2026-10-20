@@ -296,8 +296,9 @@ describe('applyDiscovery', () => {
 })
 
 describe('More Actions protocol', () => {
-  it('requires protocol 5 and exposes rediscoverable action methods', () => {
-    assert.strictEqual(RUN_PROTOCOL, 5)
+  it('requires protocol 6 and exposes rediscoverable action methods', () => {
+    // 6: LOAD_ITEMS and LOAD_ARCHIVED take `fresh` (Refresh, past the cache).
+    assert.strictEqual(RUN_PROTOCOL, 6)
     for (const [method, id] of Object.entries({
       ListScheduledTasks: 'hvmRxc',
       PauseScheduledTask: 'gBUOb',

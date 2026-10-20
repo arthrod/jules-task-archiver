@@ -59,7 +59,8 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}, { sessio
       },
       local: {
         get: async () => ({}),
-        set: async () => {}
+        set: async () => {},
+        remove: async () => {}
       },
       onChanged: {
         addListener: (cb) => storageChangeListeners.push(cb)
@@ -4961,9 +4962,12 @@ function setupMoreEnvironment(sync = {}, storage = {}) {
     env.prChecks.push(`${owner}/${repo}`)
     return []
   }
-  env.load = (repo = '', category = 'all') =>
-    moreMessage(env, { action: 'LOAD_ITEMS', protocol: RUN_PROTOCOL, repo, category })
-  env.loadArchived = (loadId) => moreMessage(env, { action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId })
+  // `fresh` is Refresh: past the cache. Left out, as an older popup would.
+  const freshness = (fresh) => (fresh === undefined ? {} : { fresh })
+  env.load = (repo = '', category = 'all', fresh) =>
+    moreMessage(env, { action: 'LOAD_ITEMS', protocol: RUN_PROTOCOL, repo, category, ...freshness(fresh) })
+  env.loadArchived = (loadId, fresh) =>
+    moreMessage(env, { action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId, ...freshness(fresh) })
   // Both parts, as the popup sends them: the archived tasks come second.
   env.loadAll = async (repo = '') => {
     const load = await env.load(repo)
@@ -5869,11 +5873,12 @@ describe('More Actions Delete schedule and Copy session URL', () => {
     assert.deepStrictEqual(env.calls, [])
   })
 
-  it('Delete permanently sends one archived task per request and drops each from the load', async () => {
+  it('Delete permanently checks the archive live, sends one task per request and drops each from the load', async () => {
     const env = setupMoreEnvironment()
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && archivedFilter(payload[0]) && payload[0].includes('Org/Repo')) {
+        env.calls.push({ rpc, payload: JSON.parse(JSON.stringify(payload)), account: config.accountNum })
         return [
           [
             ['a1', 'One', null, null, 'github/Org/Repo', 3],
@@ -5889,7 +5894,11 @@ describe('More Actions Delete schedule and Copy session URL', () => {
     await env.apply('deleteTask', pick)
     assert.deepStrictEqual(
       Array.from(env.calls, (call) => JSON.stringify([call.rpc, call.payload, call.account])),
-      ['["rist8",[["a1"]],"1"]', '["rist8",[["a2"]],"1"]']
+      [
+        '["p1Takd",["source_id=github/Org/Repo AND is_archived=true",4],"1"]',
+        '["rist8",[["a1"]],"1"]',
+        '["rist8",[["a2"]],"1"]'
+      ]
     )
     env.calls.length = 0
     await env.apply('unarchive', pick)
@@ -6172,8 +6181,283 @@ describe('More Actions smoke', () => {
     const env = setupEnvironment()
     const hello = await moreMessage(env, { action: 'HELLO' })
     const state = await moreMessage(env, { action: 'GET_STATE' })
-    assert.strictEqual(hello.protocol, 5)
+    assert.strictEqual(hello.protocol, RUN_PROTOCOL)
     assert.strictEqual(state.status, 'idle')
     assert.ok(Array.isArray(state.log))
+  })
+})
+
+describe('More Actions cache', () => {
+  const plain = (value) => JSON.parse(JSON.stringify(value))
+  const LIST_RPCS = ['p1Takd', 'YqkSHd', 'hvmRxc']
+
+  // Accounts with Google ids (WIZ_global_data S06Grb), and a
+  // chrome.storage.local that keeps what it is given.
+  function setupCacheEnvironment(local = {}, { users = true } = {}) {
+    const env = setupMoreEnvironment()
+    env.local = plain(local)
+    env.sandbox.chrome.storage.local = {
+      get: async (key) => (typeof key === 'string' ? { [key]: env.local[key] } : { ...env.local }),
+      set: async (data) => {
+        Object.assign(env.local, plain(data))
+      },
+      remove: async (key) => {
+        delete env.local[key]
+      }
+    }
+    env.sandbox.prepareTab = async (tab) => ({
+      config: { accountNum: String(tab.id), bl: 'build', at: 'token', ...(users ? { user: `g${tab.id}` } : {}) },
+      label: `u/${tab.id}`
+    })
+    env.reads = () => env.calls.filter((call) => LIST_RPCS.includes(call.rpc))
+    env.listed = () => env.calls.filter((call) => call.rpc === 'p1Takd').map((call) => [call.account, call.payload[0]])
+    return env
+  }
+  const task = (id, at, user = 'g1', list = 'tasks', source = '') => ({
+    user,
+    list,
+    source,
+    at,
+    items: [{ id, title: `Cached ${id}`, state: 3, repo: 'Org/Repo', source: 'github/Org/Repo' }]
+  })
+
+  it('keeps 30 minutes, 20,000 items and 4 MB', () => {
+    const env = setupCacheEnvironment()
+    assert.deepStrictEqual(plain(vm.runInContext('MORE_CACHE', env.sandbox)), {
+      ttlMs: 30 * 60 * 1000,
+      maxItems: 20000,
+      maxBytes: 4 * 1024 * 1024
+    })
+  })
+
+  it('answers a second Load within 30 minutes from the cache, and says how old it is', async () => {
+    const env = setupCacheEnvironment()
+    const first = await env.loadAll()
+    assert.strictEqual(first.load.cachedAt, null)
+    assert.strictEqual(first.archived.cachedAt, null)
+    assert.ok(env.reads().length > 0)
+    env.calls.length = 0
+    const before = Date.now()
+    const second = await env.loadAll()
+    assert.deepStrictEqual(env.reads(), [], 'nothing is listed again')
+    assert.ok(second.load.cachedAt <= before && second.load.cachedAt > before - 60000, String(second.load.cachedAt))
+    assert.ok(second.archived.cachedAt <= before && second.archived.cachedAt > before - 60000)
+    assert.notStrictEqual(second.load.loadId, first.load.loadId)
+    assert.deepStrictEqual(plain(second.load.accounts), plain(first.load.accounts))
+    assert.deepStrictEqual(plain(second.archived.accounts), plain(first.archived.accounts))
+    env.calls.length = 0
+    await env.apply('unarchive', [{ account: 'u/2', kind: 'archived', id: 'archived' }])
+    assert.ok(
+      env.calls.some((call) => call.rpc === 'Tjmm5c'),
+      'a cached load can be acted on'
+    )
+  })
+
+  it('Refresh lists live again and keeps what it listed', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    env.calls.length = 0
+    const load = await env.load('', 'archive', true)
+    const archived = await env.loadArchived(load.loadId, true)
+    assert.strictEqual(load.cachedAt, null)
+    assert.strictEqual(archived.cachedAt, null)
+    assert.ok(env.calls.some((call) => call.rpc === 'YqkSHd'))
+    assert.ok(env.calls.some((call) => call.rpc === 'p1Takd' && archivedFilter(call.payload[0])))
+    env.calls.length = 0
+    const again = await env.load('', 'archive')
+    await env.loadArchived(again.loadId)
+    assert.deepStrictEqual(env.reads(), [])
+  })
+
+  it('refuses a fresh option that is not true or false', async () => {
+    const env = setupCacheEnvironment()
+    assert.match((await env.load('', 'all', 'yes')).error, /fresh/i)
+    assert.match((await env.loadArchived('L1', 1)).error, /fresh/i)
+    assert.deepStrictEqual(env.calls, [])
+  })
+
+  it('outlives the worker, and lists an entry older than 30 minutes again', async () => {
+    const now = Date.now()
+    const env = setupCacheEnvironment({
+      moreCache: { version: 1, entries: [task('kept', now - 60000), task('stale', now - 31 * 60000, 'g2')] }
+    })
+    const load = await env.load('', 'complete')
+    assert.deepStrictEqual(plain(load.accounts[0].tasks), [
+      { id: 'kept', title: 'Cached kept', state: 3, repo: 'Org/Repo' }
+    ])
+    assert.deepStrictEqual(env.listed(), [['2', '']], 'only the stale entry is listed again')
+    assert.strictEqual(load.cachedAt, now - 60000)
+    assert.ok(!load.accounts[1].tasks.some((item) => item.id === 'stale'))
+  })
+
+  it("keys by Google account: a u/1 that is now another account doesn't get its lists", async () => {
+    const env = setupCacheEnvironment({ moreCache: { version: 1, entries: [task('theirs', Date.now(), 'gOther')] } })
+    const load = await env.load('', 'complete')
+    assert.ok(!load.accounts[0].tasks.some((item) => item.id === 'theirs'))
+    assert.deepStrictEqual(env.listed(), [
+      ['1', ''],
+      ['2', '']
+    ])
+    assert.strictEqual(load.cachedAt, null)
+  })
+
+  it('caches nothing for an account without a Google id', async () => {
+    const env = setupCacheEnvironment({}, { users: false })
+    await env.loadAll()
+    env.calls.length = 0
+    const again = await env.loadAll()
+    assert.ok(env.reads().length > 0)
+    assert.strictEqual(again.load.cachedAt, null)
+    assert.strictEqual(env.local.moreCache?.entries?.length ?? 0, 0)
+  })
+
+  it("listing every repo's archived tasks fills the entries a one-repo Load uses", async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    env.calls.length = 0
+    const load = await env.load('org/repo', 'archive')
+    const archived = await env.loadArchived(load.loadId)
+    assert.deepStrictEqual(env.reads(), [], 'the repo list and its archived tasks come from the cache')
+    assert.deepStrictEqual(
+      archived.accounts.map((account) => account.archived.map((item) => item.id)),
+      [['archived'], ['archived']]
+    )
+  })
+
+  it('drops the oldest entries first to stay within 20,000 items, and drops expired ones', async () => {
+    const now = Date.now()
+    const many = (user, at, n) => ({
+      ...task('x', at, user),
+      items: Array.from({ length: n }, (_, i) => ({
+        id: `t${i}`,
+        title: 't',
+        state: 3,
+        repo: 'o/r',
+        source: 'github/o/r'
+      }))
+    })
+    const env = setupCacheEnvironment({
+      moreCache: {
+        version: 1,
+        entries: [many('gA', now - 120000, 15000), many('gB', now - 60000, 5000), task('gone', now - 40 * 60000, 'gC')]
+      }
+    })
+    // Two schedules for each of two accounts: 20,004 items in all.
+    await env.load('', 'scheduled')
+    const kept = env.local.moreCache.entries.map((entry) => entry.user)
+    assert.deepStrictEqual(kept.sort(), ['g1', 'g2', 'gB'])
+  })
+
+  it('drops the oldest entries first to stay within the byte limit', async () => {
+    const now = Date.now()
+    const big = (user, at) => ({ ...task('x', at, user), items: [{ id: 'x', title: 'y'.repeat(1000), source: '' }] })
+    const env = setupCacheEnvironment({
+      moreCache: { version: 1, entries: [big('gA', now - 120000), big('gB', now - 60000)] }
+    })
+    vm.runInContext('MORE_CACHE.maxBytes = 2500', env.sandbox)
+    await env.load('', 'scheduled')
+    const kept = env.local.moreCache.entries.map((entry) => entry.user)
+    assert.deepStrictEqual(kept.sort(), ['g1', 'g2', 'gB'])
+    assert.ok(JSON.stringify(env.local.moreCache.entries).length <= 2500)
+  })
+
+  it('an action drops the lists it changed, for its repo and for all repos, of its account only', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }])
+    env.calls.length = 0
+    await env.loadAll()
+    assert.deepStrictEqual(env.listed().sort(), [
+      ['1', ''],
+      ['1', 'source_id=github/Org/Repo AND is_archived=true']
+    ])
+    assert.ok(!env.calls.some((call) => call.rpc === 'hvmRxc' || call.rpc === 'YqkSHd'), 'schedules and repos stay')
+  })
+
+  it("a schedule action drops that account's schedules", async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    await env.apply('pauseSchedule', [{ account: 'u/2', kind: 'schedule', id: 'active' }])
+    env.calls.length = 0
+    await env.loadAll()
+    assert.deepStrictEqual(
+      env.reads().map((call) => [call.rpc, call.account]),
+      [['hvmRxc', '2']]
+    )
+  })
+
+  it('a dry run keeps the cache', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }], true)
+    env.calls.length = 0
+    await env.loadAll()
+    assert.deepStrictEqual(env.reads(), [])
+  })
+
+  it('a START that acts clears the whole cache; a dry START keeps it', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/1/' }]
+    env.sandbox.processAllTabs = async () => []
+    const start = (dryRun) =>
+      env.sandbox.startOperation({ action: 'archive', item: 'Completed', dryRun, force: false, scope: 'all' })
+    await start(true)
+    env.calls.length = 0
+    await env.loadAll()
+    assert.deepStrictEqual(env.reads(), [], 'a dry run changes nothing in Jules')
+    await start(false)
+    assert.strictEqual(env.local.moreCache, undefined)
+    env.calls.length = 0
+    await env.loadAll()
+    assert.ok(env.listed().length >= 4)
+  })
+
+  it('Delete permanently deletes only the tasks Jules still lists as archived', async () => {
+    const env = setupCacheEnvironment()
+    const original = env.sandbox.callBatchExecute
+    let archivedNow = ['a1', 'a2']
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && archivedFilter(payload[0]) && payload[0].includes('Org/Repo')) {
+        return [archivedNow.map((id) => [id, `Title ${id}`, null, null, 'github/Org/Repo', 3])]
+      }
+      return original(rpc, payload, config)
+    }
+    await env.loadAll()
+    // a1 was unarchived in Jules after the (cached) load.
+    archivedNow = ['a2']
+    env.calls.length = 0
+    const pick = ['a1', 'a2'].map((id) => ({ account: 'u/1', kind: 'archived', id }))
+    await env.apply('deleteTask', pick)
+    assert.deepStrictEqual(
+      env.calls.filter((call) => call.rpc === 'rist8').map((call) => call.payload),
+      [[['a2']]]
+    )
+    const log = env.sandbox.test_state().log.join('\n')
+    assert.match(log, /\[u\/1\] \[a1\] Title a1: Jules no longer lists it as archived; not deleted/)
+    assert.deepStrictEqual(plain(env.sandbox.test_state().progress), { archived: 1, skipped: 1, total: 2 })
+  })
+
+  it('Delete permanently deletes nothing of a repo whose archived tasks it cannot list', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    const original = env.sandbox.callBatchExecute
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && archivedFilter(payload[0])) throw new Error('RPC error [4]')
+      return original(rpc, payload, config)
+    }
+    env.calls.length = 0
+    await env.apply('deleteTask', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
+    assert.ok(!env.calls.some((call) => call.rpc === 'rist8'))
+    const log = env.sandbox.test_state().log.join('\n')
+    assert.match(
+      log,
+      /Could not check the archived tasks of Org\/Repo, so none of its 1 task\(s\) are deleted: RPC error \[4\]/
+    )
+    assert.doesNotMatch(
+      log,
+      /no longer lists it as archived/,
+      'an archive it could not read says nothing about the task'
+    )
   })
 })

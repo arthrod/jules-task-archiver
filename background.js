@@ -2802,6 +2802,8 @@ async function startOperation(rawOptions) {
   const isSuggestions = initOperationState(options)
 
   try {
+    // A run that may change Jules leaves no cached load behind; Export reads only.
+    if (options.dryRun !== true && options.opMode !== 'export_suggestions') await clearMoreCache()
     // After initOperationState, so a second START already sees the run going.
     await settingsReadyPromise
     options.defaultReply = settings.defaultReply
@@ -2874,9 +2876,10 @@ async function saveMoreLoadOrNote(notes) {
   }
 }
 
+// `fresh` is Refresh: list again past the cache (see cachedMoreRead).
 const MORE_MESSAGE_KEYS = {
-  LOAD_ITEMS: ['action', 'protocol', 'repo', 'category'],
-  LOAD_ARCHIVED: ['action', 'protocol', 'loadId'],
+  LOAD_ITEMS: ['action', 'protocol', 'repo', 'category', 'fresh'],
+  LOAD_ARCHIVED: ['action', 'protocol', 'loadId', 'fresh'],
   APPLY_ACTION: ['action', 'protocol', 'operation', 'dryRun', 'force', 'items']
 }
 
@@ -2887,6 +2890,7 @@ function moreMessageProblem(msg) {
   const keys = MORE_MESSAGE_KEYS[msg.action]
   const unknown = Object.keys(msg).filter((key) => !keys.includes(key))
   if (unknown.length) return `Unknown option ${unknown.join(', ')}. Reload the extension.`
+  if ('fresh' in msg && typeof msg.fresh !== 'boolean') return 'Invalid fresh option.'
   if (msg.action === 'LOAD_ITEMS') {
     if (typeof msg.repo !== 'string' || (msg.repo !== '' && !/^[\w.-]+\/[\w.-]+$/.test(msg.repo))) {
       return 'Enter a repo in org/repo format.'
@@ -2935,21 +2939,169 @@ function moreScheduleItem(row) {
   }
 }
 
+// A load's task or schedule with the source Jules gave it, as the cache keeps
+// it: a load for one repo picks its items by source.
+function moreTaskEntry(task) {
+  return { ...moreTaskItem(task), source: task.source }
+}
+
+function moreScheduleEntry(row) {
+  return { ...moreScheduleItem(row), source: String(row[1] || '') }
+}
+
+function moreItemOfEntry(entry) {
+  const { source: _source, ...item } = entry
+  return item
+}
+
+// =============================================================================
+// More Actions cache
+// =============================================================================
+
+// What a Load read, so a Load within ttlMs answers at once: an account's
+// tasks (of every repo or of one source), its schedules, each repo's archived
+// tasks and its repo list. Kept in chrome.storage.local per Google account
+// (WIZ_global_data S06Grb, content.js's `user`): u/N can be another account
+// after a sign-in change, and an account without the id is not cached. Only
+// Loads read it; the checks behind actions (Delete permanently's, the
+// Unarchive check, open PRs) list live.
+const MORE_CACHE_KEY = 'moreCache'
+const MORE_CACHE = { ttlMs: 30 * 60 * 1000, maxItems: 20000, maxBytes: 4 * 1024 * 1024 }
+
+// The entries, oldest first: a read that is kept goes to the end.
+let moreCachePromise = null
+
+function moreCacheKey(user, list, source) {
+  return JSON.stringify([user, list, source])
+}
+
+function validMoreCacheEntry(entry) {
+  return (
+    typeof entry?.user === 'string' &&
+    entry.user !== '' &&
+    typeof entry.list === 'string' &&
+    typeof entry.source === 'string' &&
+    Number.isFinite(entry.at) &&
+    Array.isArray(entry.items)
+  )
+}
+
+function moreCacheEntries() {
+  moreCachePromise ??= chrome.storage.local.get(MORE_CACHE_KEY).then(
+    (data) => {
+      const saved = data?.[MORE_CACHE_KEY]?.entries
+      const entries = (Array.isArray(saved) ? saved : []).filter(validMoreCacheEntry).sort((a, b) => a.at - b.at)
+      return new Map(entries.map((entry) => [moreCacheKey(entry.user, entry.list, entry.source), entry]))
+    },
+    () => new Map()
+  )
+  return moreCachePromise
+}
+
+function freshMoreCacheEntry(entry) {
+  const age = Date.now() - entry.at
+  return age >= 0 && age < MORE_CACHE.ttlMs
+}
+
+// One read of a Load: the cached answer while it is fresh, else the read's
+// own, which is kept, dated from when the read began. `cache.fresh`
+// (Refresh) skips the cache and still keeps the answer; `cache.cachedAt`
+// gets the date of the oldest answer used. A read that fails keeps nothing.
+async function cachedMoreRead(cache, user, list, source, read) {
+  if (typeof user !== 'string' || user === '') return read()
+  const entries = await moreCacheEntries()
+  const key = moreCacheKey(user, list, source)
+  const hit = entries.get(key)
+  if (!cache.fresh && hit && freshMoreCacheEntry(hit)) {
+    cache.cachedAt = Math.min(cache.cachedAt ?? hit.at, hit.at)
+    return hit.items
+  }
+  const at = Date.now()
+  const items = await read()
+  // A run that cleared the cache meanwhile left these entries behind.
+  entries.delete(key)
+  entries.set(key, { user, list, source, at, items })
+  return items
+}
+
+// Saves the newest entries within MORE_CACHE's limits; expired ones go.
+async function saveMoreCache() {
+  const entries = await moreCacheEntries()
+  const sizes = new Map()
+  let items = 0
+  let bytes = 0
+  for (const [key, entry] of entries) {
+    if (!freshMoreCacheEntry(entry)) {
+      entries.delete(key)
+      continue
+    }
+    sizes.set(key, JSON.stringify(entry).length)
+    items += entry.items.length
+    bytes += sizes.get(key)
+  }
+  for (const [key, entry] of entries) {
+    if (items <= MORE_CACHE.maxItems && bytes <= MORE_CACHE.maxBytes) break
+    entries.delete(key)
+    items -= entry.items.length
+    bytes -= sizes.get(key)
+  }
+  try {
+    await chrome.storage.local.set({ [MORE_CACHE_KEY]: { version: 1, entries: [...entries.values()] } })
+  } catch {
+    // Chrome could not keep it (its quota, say): the next Load lists live.
+    entries.clear()
+    await chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
+  }
+}
+
+// The lists of a load each action changes.
+const MORE_ACTION_LISTS = {
+  pauseTask: ['tasks'],
+  resumeTask: ['tasks'],
+  archive: ['tasks', 'archived'],
+  unarchive: ['tasks', 'archived'],
+  deleteTask: ['archived'],
+  pauseSchedule: ['schedules'],
+  resumeSchedule: ['schedules'],
+  deleteSchedule: ['schedules']
+}
+
+// Before an action: its account's entries of the lists it changes go, for
+// its items' repos and for every repo, so the next Load lists them live.
+async function dropMoreCache(user, operation, items) {
+  if (typeof user !== 'string' || user === '') return
+  const entries = await moreCacheEntries()
+  const lists = MORE_ACTION_LISTS[operation] || []
+  const sources = new Set(items.map((item) => `github/${item.repo}`.toLowerCase()))
+  let dropped = false
+  for (const [key, entry] of entries) {
+    if (entry.user !== user || !lists.includes(entry.list)) continue
+    if (entry.source !== '' && !sources.has(entry.source.toLowerCase())) continue
+    entries.delete(key)
+    dropped = true
+  }
+  if (dropped) await saveMoreCache()
+}
+
+// A run can change any list of any account.
+function clearMoreCache() {
+  moreCachePromise = Promise.resolve(new Map())
+  return chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
+}
+
 // Every archived task of the account, one repo at a time: Jules
 // gives up (RPC error [4], after about 90 s) on a large account's whole
 // archive, but lists one repo's in seconds. A repo it can't list goes into a
 // note; the others still load. Once a newer Load replaces this one, no
 // more repos are asked for.
-async function listArchivedByRepo(account, config, notes, progress) {
-  const sources = await listEverySource(config)
+async function listArchivedByRepo(config, { account, notes, progress, cache }) {
+  const sources = await moreSources(config, cache)
   progress.add(sources.length)
   const failed = []
   const lists = await runInPool(sources, settings.perAccountParallel, async (source) => {
     if (progress.replaced()) return []
     try {
-      return await withRetry(() =>
-        progress.replaced() ? [] : listTasks(`source_id=${source} AND is_archived=true`, config)
-      )
+      return await withRetry(() => (progress.replaced() ? [] : moreArchivedOf(source, config, cache)))
     } catch (e) {
       failed.push(`${source.replace(/^github\//, '')} (${e.message})`)
       return []
@@ -2968,26 +3120,42 @@ async function listArchivedByRepo(account, config, notes, progress) {
   return lists.flat()
 }
 
-// What each list of a load reads, and the kind its items get. With a repo,
-// Jules is asked for that repo's source only.
+// One repo's archived tasks, as entries.
+function moreArchivedOf(source, config, cache) {
+  return cachedMoreRead(cache, config.user, 'archived', source, async () =>
+    (await listTasks(`source_id=${source} AND is_archived=true`, config)).map(moreTaskEntry)
+  )
+}
+
+// The account's repos, the disconnected ones too (see listEverySource).
+function moreSources(config, cache) {
+  return cachedMoreRead(cache, config.user, 'sources', '', () => listEverySource(config))
+}
+
+// What each list of a load reads, as entries, and the kind its items get.
+// With a repo, Jules is asked for that repo's source only.
 const MORE_LISTS = {
   tasks: {
     kind: 'task',
     label: 'tasks',
-    read: (config, source) => listTasks(source ? `source_id=${source} AND is_archived=false` : '', config)
+    read: (config, source, { cache }) =>
+      cachedMoreRead(cache, config.user, 'tasks', source, async () =>
+        (await listTasks(source ? `source_id=${source} AND is_archived=false` : '', config)).map(moreTaskEntry)
+      )
   },
   schedules: {
     kind: 'schedule',
     label: 'schedules',
-    read: async (config) => (await callBatchExecute(rpc('ListScheduledTasks'), [], config))?.[0] || []
+    read: (config, _source, { cache }) =>
+      cachedMoreRead(cache, config.user, 'schedules', '', async () =>
+        ((await callBatchExecute(rpc('ListScheduledTasks'), [], config))?.[0] || []).map(moreScheduleEntry)
+      )
   },
   archived: {
     kind: 'archived',
     label: 'archived tasks',
-    read: (config, source, { account, notes, progress }) =>
-      source
-        ? listTasks(`source_id=${source} AND is_archived=true`, config)
-        : listArchivedByRepo(account, config, notes, progress)
+    read: (config, source, context) =>
+      source ? moreArchivedOf(source, config, context.cache) : listArchivedByRepo(config, context)
   }
 }
 
@@ -3027,10 +3195,10 @@ const NO_PROGRESS = { add() {}, done() {}, finish() {}, replaced: () => false }
 // The repo's source id as the account's repos spell it (a disconnected one
 // too): Jules matches source_id by exact case. null when the account
 // doesn't have it.
-async function moreRepoSource(account, repo, config, notes) {
+async function moreRepoSource(repo, config, { account, notes, cache }) {
   const wanted = `github/${repo}`
   try {
-    const source = (await listEverySource(config)).find((s) => s.toLowerCase() === wanted.toLowerCase())
+    const source = (await moreSources(config, cache)).find((s) => s.toLowerCase() === wanted.toLowerCase())
     if (!source) notes.push(`${account} has no repo ${repo}.`)
     return source || null
   } catch (e) {
@@ -3051,7 +3219,8 @@ const MORE_LOAD_CATEGORIES = {
 
 // Every signed-in account's `lists`, for one repo or all of them. A list
 // Jules can't give becomes a note for that account; the rest still load.
-async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGRESS) {
+// `cache` is { fresh, cachedAt } (see cachedMoreRead).
+async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGRESS, cache = { fresh: false }) {
   const tabs = keepFirstTabPerAccount(await getJulesTabs())
   if (!tabs.length) throw new Error('No Jules tabs found. Open jules.google.com first.')
   const matches = (source) => !repo || String(source).toLowerCase() === `github/${repo}`.toLowerCase()
@@ -3065,12 +3234,10 @@ async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGR
         result.notes.push(`Could not prepare ${account}. Open that Jules tab, check you are signed in.`)
         return result
       }
+      const context = { account, notes: result.notes, progress, cache }
       // Schedules are filtered here; only the task lists need the source id.
       const source =
-        repo && lists.some((list) => list !== 'schedules')
-          ? await moreRepoSource(account, repo, prepared.config, result.notes)
-          : ''
-      const context = { account, notes: result.notes, progress }
+        repo && lists.some((list) => list !== 'schedules') ? await moreRepoSource(repo, prepared.config, context) : ''
       const reads = await Promise.allSettled(
         lists.map((list) =>
           list !== 'schedules' && source === null ? [] : MORE_LISTS[list].read(prepared.config, source, context)
@@ -3081,9 +3248,9 @@ async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGR
         if (read.status === 'rejected') {
           result.notes.push(`Jules could not list the ${MORE_LISTS[list].label} of ${account}: ${read.reason.message}.`)
         } else if (list === 'schedules') {
-          result.schedules = read.value.filter((row) => matches(row[1])).map(moreScheduleItem)
+          result.schedules = read.value.filter((entry) => matches(entry.source)).map(moreItemOfEntry)
         } else {
-          result[list] = read.value.filter((task) => matches(task.source) && keep(task)).map(moreTaskItem)
+          result[list] = read.value.filter((entry) => matches(entry.source) && keep(entry)).map(moreItemOfEntry)
         }
       }
       return result
@@ -3100,13 +3267,16 @@ function moreItemsOf(accounts, lists) {
 }
 
 // A load answers with the lists of its category; LOAD_ARCHIVED adds the
-// archived tasks to it.
-async function loadMoreItems(repo, category) {
+// archived tasks to it. `cachedAt` dates the oldest cached list it used
+// (null: all live).
+async function loadMoreItems(repo, category, fresh = false) {
   startKeepAlive()
   resetRunLimits()
   try {
     const { lists, keep } = MORE_LOAD_CATEGORIES[category]
-    const accounts = await listMoreItems(repo, lists, keep)
+    const cache = { fresh, cachedAt: null }
+    const accounts = await listMoreItems(repo, lists, keep, NO_PROGRESS, cache)
+    await saveMoreCache()
     // The new load replaces the old one before its save starts: an older
     // load's archived answer arriving meanwhile is then stale.
     const id = crypto.randomUUID()
@@ -3118,7 +3288,7 @@ async function loadMoreItems(repo, category) {
     moreItemsError = null
     const notes = []
     await saveMoreLoadOrNote(notes)
-    return { loadId: id, accounts, notes }
+    return { loadId: id, accounts, notes, cachedAt: cache.cachedAt }
   } finally {
     stopKeepAlive()
   }
@@ -3126,7 +3296,7 @@ async function loadMoreItems(repo, category) {
 
 // Read-only, so a run may start meanwhile. It keeps the worker alive on its
 // own: the run's keep-alive stops when the run ends, and this must not stop it.
-async function loadMoreArchived(loadId) {
+async function loadMoreArchived(loadId, fresh = false) {
   const replaced = () => new Error('A newer load replaced this one. Load again.')
   if (loadId !== moreLoadId) throw replaced()
   if (moreArchivedFor === loadId) throw new Error('The archived tasks of this load are already listed. Load again.')
@@ -3134,13 +3304,16 @@ async function loadMoreArchived(loadId) {
   const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo(), 25000)
   const progress = moreArchivedProgress(loadId)
   try {
-    const accounts = await listMoreItems(moreLoadRepo, ['archived'], undefined, progress)
+    const cache = { fresh, cachedAt: null }
+    const accounts = await listMoreItems(moreLoadRepo, ['archived'], undefined, progress, cache)
+    // What was listed is kept even when a newer load replaced this one.
+    await saveMoreCache()
     if (loadId !== moreLoadId) throw replaced()
     for (const item of moreItemsOf(accounts, ['archived'])) moreItems.set(moreItemKey(item), item)
     moreArchivedDone = true
     const notes = []
     await saveMoreLoadOrNote(notes)
-    return { loadId, accounts, notes }
+    return { loadId, accounts, notes, cachedAt: cache.cachedAt }
   } catch (e) {
     // Nothing was listed (no Jules tab, say): the same load may try again.
     if (moreArchivedFor === loadId && !moreArchivedDone) moreArchivedFor = null
@@ -3183,6 +3356,36 @@ async function executeMoreBatches(label, items, config, unarchive) {
 // The other per-item RPCs take the id alone.
 function moreActionPayload(operation, item) {
   return operation === 'deleteTask' ? [[item.id]] : [item.id]
+}
+
+// The selected tasks Jules still lists as archived, read live: a load (a
+// cached one, say) may be older than a task's unarchiving in Jules, and
+// Delete permanently must not reach a task that is no longer archived. A
+// repo whose archive can't be read deletes nothing.
+async function stillArchivedInJules(label, items, config) {
+  const byRepo = new Map()
+  for (const item of items) byRepo.set(item.repo, [...(byRepo.get(item.repo) || []), item])
+  const archived = new Set()
+  const unread = new Set()
+  await runInPool([...byRepo], settings.perAccountParallel, async ([repo, group]) => {
+    try {
+      if (!repo) throw new Error('Jules gave no repo for them')
+      const listed = await withRetry(() => listTasks(`source_id=github/${repo} AND is_archived=true`, config))
+      for (const task of listed) archived.add(task.id)
+    } catch (e) {
+      unread.add(repo)
+      addLog(
+        `  [${label}] Could not check the archived tasks of ${repo || '(no repo)'}, so none of its ` +
+          `${group.length} task(s) are deleted: ${e.message}`
+      )
+    }
+  })
+  return items.filter((item) => {
+    if (unread.has(item.repo)) return false
+    if (archived.has(item.id)) return true
+    addLog(`  [${label}] [${item.id}] ${item.title}: Jules no longer lists it as archived; not deleted`)
+    return false
+  })
 }
 
 // The items Jules doesn't list among the non-archived tasks, or null when
@@ -3250,11 +3453,14 @@ async function startMoreOperation(msg) {
             const tab = tabs.find((t) => `u/${extractAccountNum(t.url)}` === account)
             const prepared = tab && (await prepareTab(tab))
             if (!prepared) throw new Error('Open that Jules tab, check you are signed in, then load again.')
+            await dropMoreCache(prepared.config.user, msg.operation, work)
             if (msg.operation === 'archive' || msg.operation === 'unarchive') {
               acted = await executeMoreBatches(account, work, prepared.config, msg.operation === 'unarchive')
             } else {
+              const targets =
+                msg.operation === 'deleteTask' ? await stillArchivedInJules(account, work, prepared.config) : work
               acted = []
-              for (const item of work) {
+              for (const item of targets) {
                 try {
                   await callBatchExecute(
                     rpc(MORE_ACTIONS[msg.operation].method),
@@ -3468,14 +3674,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       })
       // The archived listing is read-only and slow, so it holds nothing back.
       if (msg.action === 'LOAD_ARCHIVED') {
-        ready.then(() => loadMoreArchived(msg.loadId)).then(sendResponse, (e) => sendResponse({ error: e.message }))
+        ready
+          .then(() => loadMoreArchived(msg.loadId, msg.fresh === true))
+          .then(sendResponse, (e) => sendResponse({ error: e.message }))
         return true
       }
       startPending = true
       ready
         .then(async () => {
           if (state.status === 'running') throw new Error('A run is already going. Wait for it to finish.')
-          if (msg.action === 'LOAD_ITEMS') return loadMoreItems(msg.repo, msg.category)
+          if (msg.action === 'LOAD_ITEMS') return loadMoreItems(msg.repo, msg.category, msg.fresh === true)
           startMoreOperation(msg)
           return { ok: true }
         })

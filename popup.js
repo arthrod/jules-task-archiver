@@ -57,6 +57,7 @@ const moreRepoScope = $('#moreRepoScope')
 const moreRepo = $('#moreRepo')
 const moreCategorySelect = $('#moreCategory')
 const moreLoad = $('#moreLoad')
+const moreRefresh = $('#moreRefresh')
 const moreStatus = $('#moreStatus')
 const moreChips = $('#moreChips')
 const moreList = $('#moreList')
@@ -98,6 +99,8 @@ let moreArchived = 'none'
 // How many repos the worker's All-repos archived listing has done: { done, total }.
 let moreArchivedRepos = null
 let moreNotes = []
+// When the oldest cached list of the shown load was read; null when all of it is live.
+let moreCachedAt = null
 // Delete permanently and Delete schedule can't be undone, so their Confirm
 // takes a second click, at least 0.5 s after the first (a double-click is one
 // gesture) and at most 10 s after it. A held key's repeats never press
@@ -487,15 +490,15 @@ const RPC_LABELS = {
   ListTasks: 'List tasks',
   ArchiveTasks: 'Archive',
   ResumeTask: 'Resume',
-  GetTask: 'Get task',
-  Interact: 'Reply',
-  GetTaskUsage: 'Daily quota',
   PauseTask: 'Pause',
   ListScheduledTasks: 'List schedules',
   PauseScheduledTask: 'Pause schedule',
   ResumeScheduledTask: 'Resume schedule',
   DeleteScheduledTask: 'Delete schedule',
   DeleteTasks: 'Delete task',
+  GetTask: 'Get task',
+  Interact: 'Reply',
+  GetTaskUsage: 'Daily quota',
   CreateTask: 'Start session',
   ListSources: 'List repos',
   ListProactiveSuggestions: 'Suggestions',
@@ -1047,6 +1050,8 @@ function moreConfirmText() {
 function updateMoreControls() {
   const locked = backgroundStale || !backgroundOk || isRunning() || moreLoading
   moreLoad.disabled = locked || (moreRepoScope.checked && !/^[\w.-]+\/[\w.-]+$/.test(moreRepo.value.trim()))
+  moreRefresh.disabled = moreLoad.disabled
+  moreRefresh.classList.toggle('hidden', moreCachedAt === null)
   moreConfirm.disabled = locked || fittingMoreItems(moreAction.value).length === 0
   // Force only skips Archive's open-PR check.
   moreForce.disabled = moreAction.value !== 'archive'
@@ -1193,7 +1198,18 @@ function renderMoreStatus() {
     complete: `${count('task')} completed tasks`,
     archive: archived
   }[moreLoadedCategory]
-  moreStatus.textContent = [counts, ...moreNotes].filter(Boolean).join(' · ')
+  moreStatus.textContent = [counts, moreCacheAge(), ...moreNotes].filter(Boolean).join(' · ')
+}
+
+// The worker keeps what a Load listed for 30 minutes (background.js MORE_CACHE).
+function moreCacheAge() {
+  if (moreCachedAt === null) return ''
+  const minutes = Math.floor((Date.now() - moreCachedAt) / 60000)
+  return `from the cache, ${minutes < 1 ? 'under a minute' : `${minutes} min`} old`
+}
+
+function noteMoreCache(cachedAt) {
+  if (Number.isFinite(cachedAt)) moreCachedAt = Math.min(moreCachedAt ?? cachedAt, cachedAt)
 }
 
 function sendMore(msg) {
@@ -1206,14 +1222,15 @@ function sendMore(msg) {
 
 // Jules can take about 90 s on a large archive (and then give up), so the
 // list is usable before the archived tasks arrive.
-async function loadMoreArchived(loadId) {
-  const reply = await sendMore({ action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId })
+async function loadMoreArchived(loadId, fresh) {
+  const reply = await sendMore({ action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId, fresh })
   if (loadId !== moreLoadId) return
   if (!reply?.accounts || reply.error) {
     moreArchived = 'failed'
     moreNotes.push(`Could not list the archived tasks: ${reply?.error || 'no answer'}`)
   } else {
     moreArchived = 'done'
+    noteMoreCache(reply.cachedAt)
     loadedMoreItems.push(...moreItemsFrom(reply.accounts))
     moreNotes.push(...(reply.notes || []), ...reply.accounts.flatMap((account) => account.notes || []))
   }
@@ -1221,7 +1238,8 @@ async function loadMoreArchived(loadId) {
   renderMoreItems()
 }
 
-moreLoad.addEventListener('click', async () => {
+// Load answers from the worker's cache when it can; Refresh (`fresh`) lists live.
+async function loadMore(fresh) {
   updateMoreControls()
   if (moreLoad.disabled) return
   moreLoading = true
@@ -1238,24 +1256,28 @@ moreLoad.addEventListener('click', async () => {
       action: 'LOAD_ITEMS',
       protocol: RUN_PROTOCOL,
       repo: moreRepoScope.checked ? moreRepo.value.trim() : '',
-      category
+      category,
+      fresh
     })
     if (!response?.accounts || response.error) throw new Error(response?.error || 'Could not load items.')
     moreLoadId = response.loadId
     moreLoadedCategory = category
     moreArchived = category === 'archive' ? 'loading' : 'none'
     moreArchivedRepos = null
+    moreCachedAt = null
+    noteMoreCache(response.cachedAt)
     loadedMoreItems = moreItemsFrom(response.accounts)
     moreNotes = [...(response.notes || []), ...response.accounts.flatMap((account) => account.notes || [])]
     selectedMoreItems = new Set()
     moreCategory = 'all'
     renderMoreStatus()
     renderMoreItems()
-    if (category === 'archive') loadMoreArchived(response.loadId)
+    if (category === 'archive') loadMoreArchived(response.loadId, fresh)
   } catch (e) {
     moreLoadId = null
     moreLoadedCategory = null
     moreArchived = 'none'
+    moreCachedAt = null
     loadedMoreItems = []
     selectedMoreItems.clear()
     renderMoreItems()
@@ -1266,7 +1288,10 @@ moreLoad.addEventListener('click', async () => {
     moreLoad.removeAttribute('aria-busy')
     updateMoreControls()
   }
-})
+}
+
+moreLoad.addEventListener('click', () => loadMore(false))
+moreRefresh.addEventListener('click', () => loadMore(true))
 
 // The selected tasks' URLs, one per line, as Jules' Copy session URL gives one.
 async function copyMoreSessionUrls() {
