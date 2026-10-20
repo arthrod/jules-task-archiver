@@ -10,6 +10,8 @@ describe('Security: ghToken Storage Cleanup', () => {
   const popupJs = fs.readFileSync(popupJsPath, 'utf8')
   const itemsJsPath = path.join(__dirname, '../items.js')
   const itemsJs = fs.readFileSync(itemsJsPath, 'utf8')
+  const settingsJsPath = path.join(__dirname, '../settings.js')
+  const settingsJs = fs.readFileSync(settingsJsPath, 'utf8')
 
   function setupPopupSandbox(initialSync = {}, initialLocal = {}) {
     const syncStorage = { ...initialSync }
@@ -92,6 +94,7 @@ describe('Security: ghToken Storage Cleanup', () => {
     const sandbox = { chrome, document, console, setTimeout, clearTimeout, setInterval, clearInterval }
     vm.createContext(sandbox)
     vm.runInContext(itemsJs, sandbox, { filename: itemsJsPath })
+    vm.runInContext(settingsJs, sandbox, { filename: settingsJsPath })
 
     return { sandbox, syncStorage, localStorage, syncRemoved, syncSet, localSet }
   }
@@ -125,6 +128,7 @@ const utilsScriptPath = path.join(__dirname, '..', 'utils.js')
 const bgScriptContent = fs.readFileSync(bgScriptPath, 'utf8')
 const utilsScriptContent = fs.readFileSync(utilsScriptPath, 'utf8')
 const itemsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'items.js'), 'utf8')
+const settingsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8')
 
 function setupEnvironment(initialTabs = {}) {
   const onMessageListeners = []
@@ -187,6 +191,7 @@ function setupEnvironment(initialTabs = {}) {
   const scriptContent =
     utilsScriptContent +
     itemsScriptContent +
+    settingsScriptContent +
     bgScriptContent +
     `
     globalThis.test_ensureContentScript = ensureContentScript;
@@ -194,6 +199,7 @@ function setupEnvironment(initialTabs = {}) {
   `
 
   vm.runInContext(scriptContent, sandbox, { filename: bgScriptPath })
+  sandbox.burstDelayMs = () => 0 // no pacing waits in tests
   return { sandbox, chromeMock, onMessageListeners }
 }
 

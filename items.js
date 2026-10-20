@@ -30,7 +30,19 @@ const NO_STATE_CODE = 3
 const ITEM_ALL = 'all'
 const ITEM_SUGGESTIONS = 'suggestions'
 
-function listItems(states = TASK_STATES) {
+// The table in use: TASK_STATES, or the states "Rediscover from Jules" read
+// from the Jules bundle (settings.js).
+let activeTaskStates = TASK_STATES
+
+function setTaskStates(states) {
+  activeTaskStates = Array.isArray(states) && states.length > 0 ? states : TASK_STATES
+}
+
+function getTaskStates() {
+  return activeTaskStates
+}
+
+function listItems(states = activeTaskStates) {
   return [
     { id: ITEM_ALL, label: 'All', group: 'Tasks', type: 'tasks', codes: null },
     ...states.map((s) => ({
@@ -53,7 +65,7 @@ function normalizeItemText(value) {
 // Accepts an item id ("state:12"), a dropdown label ("Waiting on You (12)") or
 // a state name without its code ("Completed" covers both 3 and 7). Case and
 // spacing don't matter. Returns null when nothing matches.
-function resolveItem(input, states = TASK_STATES) {
+function resolveItem(input, states = activeTaskStates) {
   if (typeof input !== 'string') return null
   const wanted = normalizeItemText(input)
   if (!wanted) return null
@@ -78,7 +90,7 @@ function taskStateCode(task) {
 }
 
 // The state a task is listed under, or null for a code Jules added later.
-function taskStateFor(task, states = TASK_STATES) {
+function taskStateFor(task, states = activeTaskStates) {
   const code = taskStateCode(task)
   return states.find((s) => s.code === code) || null
 }
@@ -94,6 +106,8 @@ if (typeof module !== 'undefined') {
     NO_STATE_CODE,
     ITEM_ALL,
     ITEM_SUGGESTIONS,
+    setTaskStates,
+    getTaskStates,
     listItems,
     resolveItem,
     taskStateCode,

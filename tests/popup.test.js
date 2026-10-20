@@ -9,7 +9,10 @@ const popupJsPath = path.join(__dirname, '../popup.js')
 const popupJs = fs.readFileSync(popupJsPath, 'utf8')
 const itemsJsPath = path.join(__dirname, '../items.js')
 const itemsJs = fs.readFileSync(itemsJsPath, 'utf8')
+const settingsJsPath = path.join(__dirname, '../settings.js')
+const settingsJs = fs.readFileSync(settingsJsPath, 'utf8')
 const popupHtml = fs.readFileSync(path.join(__dirname, '../popup.html'), 'utf8')
+const { RUN_PROTOCOL, START_OPTION_KEYS } = require('../settings.js')
 
 /**
  * Creates a mock DOM element with basic functionality.
@@ -104,7 +107,54 @@ function createMockElement(tag = 'div', attrs = {}) {
 /**
  * Creates a mock Chrome extension API.
  */
-function createMockChrome(syncStorage, localStorage, listeners, sent, tabs) {
+function createMockChrome(syncStorage, localStorage, listeners, sent, tabs, hello) {
+  const runtime = {
+    lastError: undefined,
+    onMessage: {
+      addListener: (cb) => listeners.runtime.push(cb)
+    }
+  }
+  let sendImpl = (msg, cb) => {
+    sent.push(msg)
+    if (!cb) return
+    if (msg.action === 'GET_STATE') cb({ status: 'idle' })
+    else if (msg.action === 'GET_ALL_SOURCES') cb({ repos: [] })
+    else if (msg.action === 'START') cb({ ok: true })
+    else cb()
+  }
+  // HELLO is answered here, so a test that replaces sendMessage still talks to
+  // a background on the popup's protocol. hello.reply = null is a worker too
+  // old to know HELLO: the port closes with no answer.
+  Object.defineProperty(runtime, 'sendMessage', {
+    enumerable: true,
+    get() {
+      const impl = sendImpl
+      return (msg, cb) => {
+        if (msg.action !== 'HELLO') return impl(msg, cb)
+        sent.push(msg)
+        if (!cb) return
+        // 'never' is a worker still starting: the answer comes when a test calls
+        // hello.answer (the latest) or one of hello.pending, or hello.fail(cb).
+        if (hello.reply === 'never') {
+          hello.answer = cb
+          hello.pending = [...(hello.pending || []), cb]
+          hello.fail = (pendingCb) => {
+            runtime.lastError = { message: 'The message port closed before a response was received.' }
+            pendingCb()
+            runtime.lastError = undefined
+          }
+          return
+        }
+        if (hello.reply !== null) return cb(hello.reply)
+        runtime.lastError = { message: 'The message port closed before a response was received.' }
+        cb()
+        runtime.lastError = undefined
+      }
+    },
+    set(fn) {
+      sendImpl = fn
+    }
+  })
   return {
     storage: {
       sync: {
@@ -120,8 +170,8 @@ function createMockChrome(syncStorage, localStorage, listeners, sent, tabs) {
           Object.assign(syncStorage, obj)
           if (cb) cb()
         },
-        remove: (key, cb) => {
-          delete syncStorage[key]
+        remove: (keys, cb) => {
+          for (const k of [].concat(keys)) delete syncStorage[k]
           if (cb) cb()
         }
       },
@@ -137,25 +187,17 @@ function createMockChrome(syncStorage, localStorage, listeners, sent, tabs) {
         set: (obj, cb) => {
           Object.assign(localStorage, obj)
           if (cb) cb()
+        },
+        remove: (key, cb) => {
+          delete localStorage[key]
+          if (cb) cb()
         }
       },
       onChanged: {
         addListener: (cb) => listeners.storage.push(cb)
       }
     },
-    runtime: {
-      sendMessage: (msg, cb) => {
-        sent.push(msg)
-        if (!cb) return
-        if (msg.action === 'GET_STATE') cb({ status: 'idle' })
-        else if (msg.action === 'GET_ALL_SOURCES') cb({ repos: [] })
-        else if (msg.action === 'START') cb({ ok: true })
-        else cb()
-      },
-      onMessage: {
-        addListener: (cb) => listeners.runtime.push(cb)
-      }
-    },
+    runtime,
     tabs: {
       query: (opts) => Promise.resolve(opts?.url ? tabs : [{ id: 123 }]),
       // Repo-picker fallback (GET_CODEBASES) runs when GET_ALL_SOURCES is empty.
@@ -216,10 +258,36 @@ const ELEMENT_IDS = [
   'scheduleToggle',
   'settingsPanel',
   'schedulePanel',
-  'mainView'
+  'mainView',
+  'requestTimeoutSec',
+  'listTimeoutSec',
+  'extraJitter',
+  'extraJitterMaxSec',
+  'perAccountParallel',
+  'totalParallel',
+  'runLimit',
+  'reloadTabOnSignIn',
+  'defaultReply',
+  'defaultRetry',
+  'rpcInputs',
+  'archiveBatch',
+  'archiveSplit',
+  'apiStates',
+  'apiStatus',
+  'rediscoverBtn',
+  'resetApiBtn',
+  'staleBanner',
+  'settingsStatus'
 ]
 
-function setupPopupSandbox({ sync = {}, local = {}, tabs = [], confirm = () => true } = {}) {
+function setupPopupSandbox({
+  sync = {},
+  local = {},
+  tabs = [],
+  confirm = () => true,
+  hello = { protocol: RUN_PROTOCOL }
+} = {}) {
+  const helloState = { reply: hello }
   const syncStorage = { ...sync }
   const localStorage = { ...local }
   const listeners = { storage: [], runtime: [] }
@@ -234,6 +302,7 @@ function setupPopupSandbox({ sync = {}, local = {}, tabs = [], confirm = () => t
   elements['#message'].disabled = true
   elements['#oneSessionRow'].classList.add('hidden')
   elements['#settingsPanel'].classList.add('hidden')
+  elements['#staleBanner'].classList.add('hidden')
   elements['#schedulePanel'].classList.add('hidden')
   elements['#settingsToggle'].setAttribute('aria-expanded', 'false')
   elements['#scheduleToggle'].setAttribute('aria-expanded', 'false')
@@ -259,7 +328,7 @@ function setupPopupSandbox({ sync = {}, local = {}, tabs = [], confirm = () => t
       documentListeners[type].push(cb)
     }
   }
-  const chrome = createMockChrome(syncStorage, localStorage, listeners, sent, tabs)
+  const chrome = createMockChrome(syncStorage, localStorage, listeners, sent, tabs, helloState)
 
   const sandbox = {
     chrome,
@@ -283,6 +352,7 @@ function setupPopupSandbox({ sync = {}, local = {}, tabs = [], confirm = () => t
   }
   vm.createContext(sandbox)
   vm.runInContext(itemsJs, sandbox, { filename: itemsJsPath })
+  vm.runInContext(settingsJs, sandbox, { filename: settingsJsPath })
 
   const load = () => vm.runInContext(popupJs, sandbox, { filename: popupJsPath })
   const starts = () => sent.filter((m) => m.action === 'START').map((m) => JSON.parse(JSON.stringify(m.options)))
@@ -306,7 +376,8 @@ function setupPopupSandbox({ sync = {}, local = {}, tabs = [], confirm = () => t
     starts,
     options,
     option,
-    tick
+    tick,
+    helloState
   }
 }
 
@@ -410,10 +481,14 @@ describe('Items dropdown', () => {
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
   })
 
-  it('ignores a remembered item that no longer exists', () => {
+  it('selects nothing, rather than All, for a remembered item that no longer exists', () => {
     const env = setupPopupSandbox({ sync: { item: 'state:99' } })
     env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+    env.option('All').dispatchEvent('click')
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All')
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, false)
   })
 
   it('shows "One session for all" only for Suggestions', () => {
@@ -674,6 +749,130 @@ describe('Proceed, Archive and Export', () => {
   })
 })
 
+describe('Background version check', () => {
+  const startMessages = (env) => env.sent.filter((m) => m.action === 'START')
+
+  it('blocks every run when the worker is too old to answer HELLO', async () => {
+    const env = setupPopupSandbox({ hello: null })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#staleBanner'].classList.contains('hidden'), false)
+    for (const id of ['#proceedBtn', '#archiveBtn', '#exportBtn']) assert.strictEqual(env.elements[id].disabled, true)
+    for (const id of ['#schedEnabled', '#schedInterval', '#schedSuggestions', '#schedMaxStarts']) {
+      assert.strictEqual(env.elements[id].disabled, true, `${id} is locked: the old worker would act on it`)
+    }
+    env.elements['#dryRun'].checked = false
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    assert.deepStrictEqual(startMessages(env), [])
+  })
+
+  it('blocks every run when the worker speaks another protocol', async () => {
+    const env = setupPopupSandbox({ hello: { protocol: RUN_PROTOCOL - 1 } })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#staleBanner'].classList.contains('hidden'), false)
+    assert.strictEqual(env.elements['#archiveBtn'].disabled, true)
+  })
+
+  it('checks again before each run, in case the worker changed since the popup opened', async () => {
+    const env = setupPopupSandbox()
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#staleBanner'].classList.contains('hidden'), true)
+    env.helloState.reply = null
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    assert.deepStrictEqual(startMessages(env), [])
+    assert.strictEqual(env.elements['#staleBanner'].classList.contains('hidden'), false)
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+    assert.match(env.elements['#currentInfo'].textContent, /reload the extension/)
+  })
+
+  it('keeps the buttons off when a run ends with a stale worker', async () => {
+    const env = setupPopupSandbox({ hello: null })
+    env.load()
+    await env.tick()
+    for (const listener of env.listeners.storage) {
+      listener({
+        archiveState: { newValue: { status: 'done', log: [], progress: { archived: 0, skipped: 0, total: 0 } } }
+      })
+    }
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+  })
+
+  it('keeps the schedule locked until the worker answers HELLO', async () => {
+    const env = setupPopupSandbox({ hello: 'never' })
+    env.load()
+    await env.tick()
+    const ids = ['#schedEnabled', '#schedInterval', '#schedSuggestions', '#schedMaxStarts']
+    for (const id of ids) assert.strictEqual(env.elements[id].disabled, true, `${id} waits for the version check`)
+    env.elements['#schedEnabled'].checked = true
+    env.elements['#schedEnabled'].dispatchEvent('change')
+    env.elements['#schedMaxStarts'].value = '9'
+    env.elements['#schedMaxStarts'].dispatchEvent('change')
+    assert.strictEqual(env.syncStorage.schedEnabled, undefined, 'no schedule write before the worker is known')
+    assert.strictEqual(env.syncStorage.schedMaxStarts, undefined)
+    env.helloState.answer({ protocol: RUN_PROTOCOL })
+    await env.tick()
+    for (const id of ids) assert.strictEqual(env.elements[id].disabled, false)
+    env.elements['#schedEnabled'].dispatchEvent('change')
+    assert.strictEqual(env.syncStorage.schedEnabled, true)
+  })
+
+  it('stays locked when the first HELLO answers late, after a check before a run failed', async () => {
+    const env = setupPopupSandbox({ hello: 'never' })
+    env.load()
+    await env.tick()
+    const firstAnswer = env.helloState.answer
+    env.helloState.reply = null
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    assert.strictEqual(env.elements['#staleBanner'].classList.contains('hidden'), false)
+    firstAnswer({ protocol: RUN_PROTOCOL })
+    await env.tick()
+    assert.strictEqual(env.elements['#schedEnabled'].disabled, true, 'a stale worker stays stale')
+    env.elements['#schedEnabled'].checked = true
+    env.elements['#schedEnabled'].dispatchEvent('change')
+    assert.strictEqual(env.syncStorage.schedEnabled, undefined)
+  })
+
+  it('does not start when the popup went stale while the check before the run was out', async () => {
+    const env = setupPopupSandbox({ hello: 'never' })
+    env.load()
+    await env.tick()
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    const click = env.elements['#proceedBtn'].dispatchEvent('click')
+    await env.tick()
+    const [initial, beforeRun] = env.helloState.pending
+    env.helloState.fail(initial)
+    await env.tick()
+    beforeRun({ protocol: RUN_PROTOCOL })
+    await click
+    assert.deepStrictEqual(startMessages(env), [])
+    assert.strictEqual(env.elements['#staleBanner'].classList.contains('hidden'), false)
+  })
+
+  it('sends its protocol and only options the background knows', async () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.option('Suggestions').dispatchEvent('click')
+    env.elements['#oneSession'].checked = true
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    env.elements['#force'].checked = true
+    env.elements['#addMessage'].checked = true
+    env.elements['#message'].value = 'go'
+    await env.elements['#archiveBtn'].dispatchEvent('click')
+    await env.elements['#exportBtn'].dispatchEvent('click')
+    const starts = startMessages(env)
+    assert.ok(starts.length >= 1)
+    for (const msg of starts) {
+      assert.strictEqual(msg.protocol, RUN_PROTOCOL)
+      for (const key of Object.keys(msg.options)) assert.ok(START_OPTION_KEYS.includes(key), `unknown option ${key}`)
+    }
+  })
+})
+
 describe('Live-run confirmations', () => {
   async function liveClick(env, label, button, { force = false, message = '' } = {}) {
     env.load()
@@ -913,6 +1112,37 @@ describe('Export download', () => {
     assert.strictEqual(env.elements['#downloadBtn'].textContent, '⬇ Download suggestions JSON (3 found)')
   })
 
+  it('names the button Export and says on it when the export is done', () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'popup.html'), 'utf8')
+    const button = html.match(/<button[^>]*id="exportBtn"[^>]*>([\s\S]*?)<\/button>/)
+    assert.ok(button, 'popup.html has #exportBtn')
+    assert.match(button[1], /^\s*↓ Export\s*$/)
+    assert.match(button[0], /title="[^"]*JSON file[^"]*"/, 'a tooltip says what Export makes')
+    const env = setupPopupSandbox()
+    env.load()
+    env.sandbox.renderState(doneWithExport)
+    assert.strictEqual(env.elements['#exportBtn'].textContent, '✓ 3 exported')
+    env.sandbox.renderState({ status: 'idle', log: [], results: [], options: {} })
+    env.elements['#resetBtn'].dispatchEvent('click')
+    assert.strictEqual(env.elements['#exportBtn'].textContent, '↓ Export')
+  })
+
+  it('drops the finished export when a scheduled run starts', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.sandbox.renderState(doneWithExport)
+    env.sandbox.renderState({
+      status: 'running',
+      log: ['=== SCHEDULED (chrome.alarms) ==='],
+      results: [],
+      progress: { archived: 0, skipped: 0, total: 0 },
+      options: { action: 'archive', scheduled: true }
+    })
+    assert.strictEqual(env.elements['#exportBtn'].textContent.includes('exported'), false)
+    assert.strictEqual(env.elements['#downloadBtn'].classList.contains('hidden'), true)
+    assert.strictEqual(vm.runInContext('lastExportData', env.sandbox), null)
+  })
+
   it('hides the download button on reset and returns focus to Proceed', () => {
     const env = setupPopupSandbox()
     env.load()
@@ -934,9 +1164,18 @@ describe('Export download', () => {
 })
 
 describe('Schedule settings', () => {
-  it('loads and clamps the schedule fields', () => {
+  it('turns the schedule on and off with a switch', () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'popup.html'), 'utf8')
+    const input = html.match(/<input[^>]*id="schedEnabled"[^>]*>/)
+    assert.ok(input)
+    assert.match(input[0], /type="checkbox"/, 'still a checkbox for screen readers')
+    assert.match(input[0], /class="switch"/)
+  })
+
+  it('loads and clamps the schedule fields', async () => {
     const env = setupPopupSandbox({ sync: { schedEnabled: true, schedIntervalMin: 30, schedMaxStarts: 7 } })
     env.load()
+    await env.tick() // the schedule unlocks once the worker answers HELLO
     assert.strictEqual(env.elements['#schedEnabled'].checked, true)
     assert.strictEqual(env.elements['#schedInterval'].value, '30')
     env.elements['#schedInterval'].value = '99999'
@@ -945,6 +1184,195 @@ describe('Schedule settings', () => {
     env.elements['#schedMaxStarts'].value = 'abc'
     env.elements['#schedMaxStarts'].dispatchEvent('change')
     assert.strictEqual(env.syncStorage.schedMaxStarts, 20)
+  })
+})
+
+describe('Settings panel', () => {
+  const rpcInput = (env, i) => env.elements['#rpcInputs'].children[i].children[1]
+
+  it('shows the defaults when nothing is saved', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    assert.strictEqual(env.elements['#requestTimeoutSec'].value, '30')
+    assert.strictEqual(env.elements['#listTimeoutSec'].value, '300')
+    assert.strictEqual(env.elements['#perAccountParallel'].value, '6')
+    assert.strictEqual(env.elements['#totalParallel'].value, '12')
+    assert.strictEqual(env.elements['#runLimit'].value, '0')
+    assert.strictEqual(env.elements['#extraJitter'].checked, false)
+    assert.strictEqual(env.elements['#extraJitterMaxSec'].disabled, true, 'the max is greyed out until jitter is on')
+    assert.strictEqual(env.elements['#reloadTabOnSignIn'].checked, true)
+    assert.strictEqual(env.elements['#defaultReply'].value, '')
+  })
+
+  it('loads saved settings and saves a change as one clamped object', () => {
+    const env = setupPopupSandbox({ sync: { settings: { runLimit: 1, extraJitter: true, extraJitterMaxSec: 20 } } })
+    env.load()
+    assert.strictEqual(env.elements['#runLimit'].value, '1')
+    assert.strictEqual(env.elements['#extraJitterMaxSec'].disabled, false)
+
+    env.elements['#requestTimeoutSec'].value = '2'
+    env.elements['#requestTimeoutSec'].dispatchEvent('change')
+    assert.strictEqual(env.elements['#requestTimeoutSec'].value, '5', 'the field shows the clamped value')
+    const saved = JSON.parse(JSON.stringify(env.syncStorage.settings))
+    assert.strictEqual(saved.requestTimeoutSec, 5)
+    assert.strictEqual(saved.runLimit, 1)
+    assert.strictEqual(saved.extraJitterMaxSec, 20)
+  })
+
+  it('saves the default reply and retry texts under their own keys', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.elements['#defaultReply'].value = '  Keep going  '
+    env.elements['#defaultReply'].dispatchEvent('change')
+    assert.strictEqual(env.syncStorage.defaultReply, 'Keep going')
+    assert.strictEqual(env.syncStorage.defaultRetry, '')
+    assert.strictEqual('defaultReply' in env.syncStorage.settings, false, 'not inside the 8 KB settings item')
+  })
+
+  it("moves the old popup's reply boxes into the default reply and retry once", () => {
+    const env = setupPopupSandbox({ sync: { continueMessage: 'Old reply', continueErrorMessage: 'Old retry' } })
+    env.load()
+    assert.strictEqual(env.elements['#defaultReply'].value, 'Old reply')
+    assert.strictEqual(env.syncStorage.defaultRetry, 'Old retry')
+    assert.strictEqual(env.syncStorage.continueMessage, undefined)
+    assert.strictEqual(env.syncStorage.continueErrorMessage, undefined)
+  })
+
+  it('does not overwrite a default reply already set, and still retires the old keys', () => {
+    const env = setupPopupSandbox({ sync: { defaultReply: 'New', continueMessage: 'Old reply' } })
+    env.load()
+    assert.strictEqual(env.elements['#defaultReply'].value, 'New')
+    assert.strictEqual(env.syncStorage.defaultReply, 'New')
+    assert.strictEqual(env.syncStorage.continueMessage, undefined)
+  })
+
+  it('says when sync storage refuses the settings, and keeps the old keys', () => {
+    const env = setupPopupSandbox({ sync: { continueMessage: 'Old reply' } })
+    env.sandbox.chrome.storage.sync.set = (_data, cb) => {
+      env.sandbox.chrome.runtime.lastError = { message: 'QUOTA_BYTES_PER_ITEM quota exceeded' }
+      cb?.()
+      env.sandbox.chrome.runtime.lastError = undefined
+    }
+    env.load()
+    assert.strictEqual(env.elements['#settingsStatus'].classList.contains('hidden'), false)
+    assert.match(env.elements['#settingsStatus'].textContent, /Settings not saved: QUOTA_BYTES_PER_ITEM/)
+    assert.strictEqual(env.syncStorage.continueMessage, 'Old reply')
+  })
+
+  it('shows the RPC ids and saves a valid change to local storage', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    assert.strictEqual(rpcInput(env, 0).value, 'p1Takd')
+    rpcInput(env, 1).value = 'Zz9Yy'
+    rpcInput(env, 1).dispatchEvent('change')
+    assert.strictEqual(env.localStorage.julesApi.rpc.ArchiveTasks, 'Zz9Yy')
+  })
+
+  it('refuses a malformed RPC id and puts the old one back', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    rpcInput(env, 0).value = 'x'
+    rpcInput(env, 0).dispatchEvent('change')
+    assert.strictEqual(rpcInput(env, 0).value, 'p1Takd')
+    assert.strictEqual(env.localStorage.julesApi, undefined)
+    assert.match(env.elements['#apiStatus'].textContent, /5 or 6 letters or digits/)
+  })
+
+  it('rebuilds the Items dropdown from rediscovered states', () => {
+    const states = [
+      { code: 13, name: 'Waiting on You', kind: 'feedback' },
+      { code: 3, name: 'Completed', kind: 'completed' }
+    ]
+    const env = setupPopupSandbox({ local: { julesApi: { states } } })
+    env.load()
+    const labels = env.options().map((o) => o.attributes['aria-label'])
+    assert.ok(labels.includes('Waiting on You (13)'), labels.join(', '))
+    assert.ok(!labels.some((l) => l.includes('(12)')))
+    assert.match(env.elements['#apiStates'].textContent, /from Jules, 2 codes/)
+  })
+
+  it('never turns a saved item into All while its state table is still loading', async () => {
+    const states = [
+      { code: 13, name: 'Waiting on You', kind: 'feedback' },
+      { code: 3, name: 'Completed', kind: 'completed' }
+    ]
+    const env = setupPopupSandbox({ sync: { item: 'state:13' }, local: { julesApi: { states } } })
+    const localGet = env.sandbox.chrome.storage.local.get
+    env.sandbox.chrome.storage.local.get = (keys, cb) => setTimeout(() => localGet(keys, cb), 0)
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+    assert.strictEqual(env.elements['#archiveBtn'].disabled, true)
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    assert.deepStrictEqual(env.starts(), [])
+    await env.tick()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (13)')
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, false)
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    assert.deepStrictEqual(
+      env.starts().map((s) => s.item),
+      ['state:13']
+    )
+  })
+
+  it('selects nothing, not All, when a rediscovery removes the chosen state', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    const states = [{ code: 3, name: 'Completed', kind: 'completed' }]
+    for (const listener of env.listeners.storage) listener({ julesApi: { newValue: { states } } }, 'local')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
+    assert.strictEqual(env.elements['#archiveBtn'].disabled, true)
+    assert.strictEqual(env.elements['#exportBtn'].disabled, false, 'Export needs no item')
+  })
+
+  it('asks the background to rediscover and shows what changed', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    const asked = []
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      asked.push(msg.action)
+      cb({ api: { rpc: { ArchiveTasks: 'Qq7Rr' } }, changes: ['ArchiveTasks: Tjmm5c → Qq7Rr'], problems: [] })
+    }
+    env.elements['#rediscoverBtn'].dispatchEvent('click')
+    assert.deepStrictEqual(asked, ['REDISCOVER_API'])
+    assert.strictEqual(rpcInput(env, 1).value, 'Qq7Rr')
+    assert.match(env.elements['#apiStatus'].textContent, /Changed: ArchiveTasks: Tjmm5c → Qq7Rr/)
+    assert.strictEqual(env.elements['#rediscoverBtn'].disabled, false)
+  })
+
+  it("shows the background's error when rediscovery fails", () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.sandbox.chrome.runtime.sendMessage = (_msg, cb) => cb({ error: 'Open a Jules tab first.' })
+    env.elements['#rediscoverBtn'].dispatchEvent('click')
+    assert.strictEqual(env.elements['#apiStatus'].textContent, 'Open a Jules tab first.')
+  })
+
+  it('keeps a long rediscovery report short, with the whole of it in the tooltip', async () => {
+    const env = setupPopupSandbox()
+    const changes = ['ListTasks: p1Takd → Aa111', 'GetTask: n74qPd → Bb222', 'Interact: SLmX6 → Cc333']
+    const problems = ['Dismiss not found; keeping sc1vFf', 'New state Awaiting Review (14) is not in the list']
+    const base = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) =>
+      msg.action === 'REDISCOVER_API' ? cb({ api: {}, changes, problems }) : base(msg, cb)
+    env.load()
+    await env.elements['#rediscoverBtn'].dispatchEvent('click')
+    const status = env.elements['#apiStatus']
+    assert.strictEqual(
+      status.textContent,
+      'Changed: ListTasks: p1Takd → Aa111; GetTask: n74qPd → Bb222 and 1 more. 2 problems; hover for details.'
+    )
+    for (const line of [...changes, ...problems]) assert.ok(status.title.includes(line), line)
+  })
+
+  it('resets the Jules API values to the built-in ones', () => {
+    const env = setupPopupSandbox({ local: { julesApi: { rpc: { ListTasks: 'Abc12' } } } })
+    env.load()
+    assert.strictEqual(rpcInput(env, 0).value, 'Abc12')
+    env.elements['#resetApiBtn'].dispatchEvent('click')
+    assert.strictEqual(env.localStorage.julesApi, undefined)
+    assert.strictEqual(rpcInput(env, 0).value, 'p1Takd')
   })
 })
 
@@ -968,8 +1396,35 @@ describe('popup.html', () => {
   })
 
   it('links the GitHub inputs to their hints', () => {
-    assert.match(popupHtml, /aria-describedby="ghOwnerHint ghOwnerError"/)
-    assert.match(popupHtml, /aria-describedby="ghTokenHint"/)
+    assert.match(popupHtml, /id="ghOwner"[\s\S]*?aria-describedby="ghOwnerHint ghOwnerError"/)
+    assert.match(popupHtml, /id="ghToken"[\s\S]*?aria-describedby="ghOwnerHint"/)
+  })
+
+  it('loads settings.js after items.js and before popup.js', () => {
+    const at = (src) => popupHtml.indexOf(`src="${src}"`)
+    assert.ok(at('items.js') < at('settings.js') && at('settings.js') < at('popup.js'))
+  })
+
+  it('has every Settings field', () => {
+    for (const id of [
+      'requestTimeoutSec',
+      'listTimeoutSec',
+      'extraJitter',
+      'extraJitterMaxSec',
+      'perAccountParallel',
+      'totalParallel',
+      'runLimit',
+      'reloadTabOnSignIn',
+      'defaultReply',
+      'defaultRetry',
+      'rpcInputs',
+      'archiveBatch',
+      'archiveSplit',
+      'rediscoverBtn',
+      'resetApiBtn'
+    ]) {
+      assert.match(popupHtml, new RegExp(`id="${id}"`), id)
+    }
   })
 
   it('puts the Settings and Schedule toggles side by side, with their panels hidden', () => {

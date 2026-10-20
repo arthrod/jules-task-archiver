@@ -16,8 +16,13 @@
         <button type="button" class="xbtn" id="scheduleToggle" aria-expanded="false" aria-controls="schedulePanel">
           <span class="caret" aria-hidden="true"></span>Schedule
         </button>
-        <button type="button" class="linkbtn" id="exportBtn">
-          <span class="dl" aria-hidden="true"></span>Export suggestions
+        <button
+          type="button"
+          class="linkbtn"
+          id="exportBtn"
+          title="Export the code suggestions of every Jules tab to a JSON file you can download"
+        >
+          ↓ Export
         </button>
       </nav>
       <div class="status mono" id="tabStatus">
@@ -115,6 +120,10 @@
         </div>
         <span class="hint sr-only" id="repoFilterHint">Select from the list or type owner/repo</span>
 
+        <p class="alert hidden" id="staleBanner" role="alert">
+          The extension changed on disk but Chrome is still running the old version, so nothing can run and the
+          schedule is locked. Reload the extension at chrome://extensions, then open this popup again.
+        </p>
         <div class="actions">
           <button type="button" class="act pri" id="proceedBtn">Proceed</button>
           <button type="button" class="act" id="archiveBtn">Archive</button>
@@ -149,52 +158,174 @@
     </div>
 
     <section class="xb set hidden" id="settingsPanel" aria-labelledby="settingsToggle">
-      <div class="srow">
-        <span class="sk mono">GitHub</span>
-        <div class="sv">
-          <div class="line">
-            <label class="l" for="ghOwner">Owner</label>
-            <input
-              type="text"
-              id="ghOwner"
-              class="m"
-              placeholder="org or user"
-              spellcheck="false"
-              autocomplete="username"
-              aria-describedby="ghOwnerHint ghOwnerError"
-              maxlength="39"
-              pattern="[a-zA-Z0-9\-]+"
-            />
-            <label class="l" for="ghToken">Token</label>
-            <input
-              type="password"
-              id="ghToken"
-              class="s"
-              placeholder="ghp_..."
-              spellcheck="false"
-              autocomplete="current-password"
-              aria-describedby="ghTokenHint"
-              maxlength="255"
-            />
+      <div class="scol">
+        <div class="srow">
+          <span class="sk mono">GitHub</span>
+          <div class="sv">
+            <div class="line">
+              <label class="l" for="ghOwner">Owner</label>
+              <input
+                type="text"
+                id="ghOwner"
+                class="m"
+                placeholder="org or user"
+                spellcheck="false"
+                autocomplete="username"
+                aria-describedby="ghOwnerHint ghOwnerError"
+                maxlength="39"
+                pattern="[a-zA-Z0-9\-]+"
+              />
+              <label class="l" for="ghToken">Token</label>
+              <input
+                type="password"
+                id="ghToken"
+                class="s"
+                placeholder="ghp_..."
+                spellcheck="false"
+                autocomplete="current-password"
+                aria-describedby="ghOwnerHint"
+                maxlength="255"
+              />
+            </div>
+            <span class="shint" id="ghOwnerHint">Optional. Archive skips tasks with a matching open PR; the token is for private repos.</span>
+            <div id="ghOwnerError" class="validation-error" aria-live="polite">
+              Only alphanumeric characters and hyphens allowed.
+            </div>
           </div>
-          <span class="shint" id="ghOwnerHint">Optional. Archive skips tasks with a matching open PR.</span>
-          <span class="shint" id="ghTokenHint">Token: optional, for private repos.</span>
-          <div id="ghOwnerError" class="validation-error" aria-live="polite">
-            Only alphanumeric characters and hyphens allowed.
+        </div>
+        <div class="srow">
+          <span class="sk mono">Timeouts</span>
+          <div class="sv">
+            <div class="line">
+              <label class="l" for="requestTimeoutSec">Request</label>
+              <input type="number" id="requestTimeoutSec" class="n" min="5" max="600" step="1" inputmode="numeric" />
+              <span class="u">s</span>
+              <label class="l" for="listTimeoutSec">Task list</label>
+              <input type="number" id="listTimeoutSec" class="n" min="30" max="1800" step="1" inputmode="numeric" />
+              <span class="u">s</span>
+            </div>
+            <span class="shint">Listing every task can take minutes on a big account.</span>
+          </div>
+        </div>
+        <div class="srow">
+          <span class="sk mono">Pacing</span>
+          <div class="sv">
+            <span class="shint" id="pacingHint"
+              >Requests sent together each wait 0.5–2 s first. On HTTP 429 the account pauses as long as Jules asks.</span
+            >
+            <div class="line">
+              <label class="cb"
+                ><input type="checkbox" id="extraJitter" aria-describedby="pacingHint" />Extra jitter, up to</label
+              >
+              <input
+                type="number"
+                id="extraJitterMaxSec"
+                class="n"
+                min="1"
+                max="300"
+                step="1"
+                inputmode="numeric"
+                aria-label="Extra jitter, maximum seconds"
+              />
+              <span class="u">s</span>
+            </div>
+            <div class="line">
+              <span class="l">Parallel requests</span>
+              <input
+                type="number"
+                id="perAccountParallel"
+                class="n"
+                min="1"
+                max="20"
+                step="1"
+                inputmode="numeric"
+                aria-label="Parallel requests per account"
+              />
+              <span class="u">per account</span>
+              <input
+                type="number"
+                id="totalParallel"
+                class="n"
+                min="1"
+                max="50"
+                step="1"
+                inputmode="numeric"
+                aria-label="Parallel requests in total"
+              />
+              <span class="u">total</span>
+            </div>
+          </div>
+        </div>
+        <div class="srow">
+          <span class="sk mono">Runs</span>
+          <div class="sv">
+            <div class="line">
+              <label class="l" for="runLimit">Run up to</label>
+              <input
+                type="number"
+                id="runLimit"
+                class="n"
+                min="0"
+                max="100000"
+                step="1"
+                inputmode="numeric"
+                aria-describedby="runLimitHint"
+              />
+              <span class="u" id="runLimitHint">items per run (0 = no limit)</span>
+            </div>
+            <label class="cb"
+              ><input type="checkbox" id="reloadTabOnSignIn" />Reload the Jules tab when its sign-in stops working</label
+            >
+          </div>
+        </div>
+        <div class="srow last">
+          <span class="sk mono">About</span>
+          <div class="sv">
+            <a href="license.html" target="_blank" rel="noopener noreferrer" class="linkrow">License &amp; Credits</a>
           </div>
         </div>
       </div>
-      <div class="srow">
-        <span class="sk mono">About</span>
-        <div class="sv">
-          <a href="license.html" target="_blank" rel="noopener noreferrer" class="linkrow">License &amp; Credits</a>
+      <div class="scol">
+        <div class="srow">
+          <span class="sk mono">Default messages</span>
+          <div class="sv">
+            <label class="l" for="defaultReply">Reply to sessions waiting on you</label>
+            <textarea id="defaultReply" class="sm" rows="2" maxlength="2000" aria-describedby="defaultsHint"></textarea>
+            <label class="l" for="defaultRetry">Retry for sessions that failed</label>
+            <textarea id="defaultRetry" class="sm" rows="2" maxlength="2000" aria-describedby="defaultsHint"></textarea>
+            <span class="shint" id="defaultsHint">Empty uses the built-in text. Add a message goes after these.</span>
+            <span class="alert hidden" id="settingsStatus" role="alert"></span>
+          </div>
+        </div>
+        <div class="srow last">
+          <span class="sk mono">Jules API values</span>
+          <div class="sv">
+            <div class="rpcs" id="rpcInputs"></div>
+            <div class="line">
+              <label class="l" for="archiveBatch">Archive batch</label>
+              <input type="number" id="archiveBatch" class="n" min="1" max="200" step="1" inputmode="numeric" />
+              <label class="l" for="archiveSplit">split when rejected</label>
+              <input type="number" id="archiveSplit" class="n" min="1" max="200" step="1" inputmode="numeric" />
+            </div>
+            <span class="shint" id="apiStates"></span>
+            <div class="line">
+              <button type="button" class="sb" id="rediscoverBtn">Rediscover from Jules</button>
+              <button type="button" class="sb" id="resetApiBtn">Reset to defaults</button>
+            </div>
+            <span class="shint" id="apiStatus" aria-live="polite"></span>
+          </div>
         </div>
       </div>
     </section>
     <section class="xb hidden" id="schedulePanel" aria-labelledby="scheduleToggle">
       <label class="cb"
-        ><input type="checkbox" id="schedEnabled" aria-describedby="schedEnabledHint" />Archive Completed tasks
-        automatically</label
+        ><input
+          type="checkbox"
+          class="switch"
+          id="schedEnabled"
+          aria-describedby="schedEnabledHint"
+        />Archive
+        Completed tasks automatically</label
       >
       <span class="shint" id="schedEnabledHint"
         >Runs in the background across all Jules tabs and skips tasks with a matching open PR.</span
@@ -238,6 +369,7 @@
     </section>
 
     <script src="items.js"></script>
+    <script src="settings.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

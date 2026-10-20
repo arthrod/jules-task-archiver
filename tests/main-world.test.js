@@ -203,7 +203,7 @@ describe('main-world.js', () => {
       null,
       [null, null, null, null, ['exp1', 'exp2']] // payload[9][4]
     ]
-    const freq = [[['id', JSON.stringify(payload)]]]
+    const freq = [[['Rja83d', JSON.stringify(payload), null, 'generic']]]
     const body = `f.req=${encodeURIComponent(JSON.stringify(freq))}`
 
     // Call intercepted fetch
@@ -219,6 +219,83 @@ describe('main-world.js', () => {
     assert.deepStrictEqual(startMsg.data.config.experimentIds, ['exp1', 'exp2'])
     assert.deepStrictEqual(startMsg.data.config.featureFlags, ['flag1'])
     assert.strictEqual(startMsg.data.config.capturedAt, 1234567890)
+  })
+
+  it('captures the start config from fetch(Request), reading a clone before the page sends it', async () => {
+    const { sandbox, messages, windowMock } = setupSandbox({})
+    const sent = []
+    windowMock.fetch = async (input) => {
+      sent.push(input)
+      input.used = true
+      return { ok: true }
+    }
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+
+    const payload = [null, null, ['model-config'], null, null, null, null, null, null, [null, null, null, null, ['e1']]]
+    const body = `f.req=${encodeURIComponent(JSON.stringify([[['Rja83d', JSON.stringify(payload)]]]))}`
+    const request = {
+      url: 'https://jules.google.com/_/Swebot/data/batchexecute?rpcids=Rja83d',
+      used: false,
+      clone() {
+        assert.strictEqual(this.used, false, 'the clone must be taken before the page fetch reads the body')
+        return { text: async () => body }
+      }
+    }
+    await windowMock.fetch(request)
+
+    assert.strictEqual(sent[0], request, 'the page still sends its own Request')
+    const startMsg = messages.find((m) => m.data.type === 'JULES_START_CONFIG')
+    assert.ok(startMsg, 'JULES_START_CONFIG message should be sent')
+    assert.deepStrictEqual(startMsg.data.config.experimentIds, ['e1'])
+  })
+
+  it('reads the URL of fetch(URL)', async () => {
+    const { sandbox, messages, windowMock } = setupSandbox({})
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    const payload = [null, null, ['m'], null, null, null, null, null, null, null]
+    const body = `f.req=${encodeURIComponent(JSON.stringify([[['Rja83d', JSON.stringify(payload)]]]))}`
+    const url = { toString: () => 'https://jules.google.com/_/Swebot/data/batchexecute?rpcids=Rja83d' }
+    await windowMock.fetch(url, { method: 'POST', body })
+    assert.ok(messages.find((m) => m.data.type === 'JULES_START_CONFIG'))
+    const before = messages.length
+    await windowMock.fetch(new URL('https://jules.google.com/_/Swebot/data/batchexecute?rpcids=Rja83d'), { body })
+    assert.ok(
+      messages.slice(before).some((m) => m.data.type === 'JULES_START_CONFIG'),
+      'a real URL instance'
+    )
+  })
+
+  it('watches the CreateTask id content.js sends, and the built-in one again on null', async () => {
+    const { sandbox, messages, windowMock, listeners } = setupSandbox({})
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    const payload = [null, null, ['m'], null, null, null, null, null, null, null]
+    const base = 'https://jules.google.com/_/Swebot/data/batchexecute?rpcids='
+    const captured = async (rpcIds) => {
+      const entries = rpcIds.split(',').map((id) => [id, JSON.stringify(payload)])
+      const body = `f.req=${encodeURIComponent(JSON.stringify([entries]))}`
+      const before = messages.length
+      await windowMock.fetch(base + rpcIds, { method: 'POST', body })
+      return messages.slice(before).some((m) => m.data.type === 'JULES_START_CONFIG')
+    }
+    const tell = (rpcId) => {
+      for (const listener of listeners.message) {
+        listener({
+          source: windowMock,
+          origin: 'https://jules.google.com',
+          data: { type: 'JULES_CREATE_TASK_RPC', rpcId }
+        })
+      }
+    }
+    assert.strictEqual(await captured('Rja83dX'), false, 'a longer id is another RPC')
+    tell('Qq7Rr')
+    assert.strictEqual(await captured('Qq7Rr'), true)
+    assert.strictEqual(await captured('Rja83d'), false)
+    assert.strictEqual(await captured('abc12,Qq7Rr'), true, 'one of several rpcids')
+    tell('not an id')
+    assert.strictEqual(await captured('Rja83d'), true)
+    tell('Qq7Rr')
+    tell(null)
+    assert.strictEqual(await captured('Rja83d'), true)
   })
 
   it('should gracefully handle malformed fetch payloads', async () => {
@@ -269,5 +346,76 @@ describe('main-world.js', () => {
     // Run script again
     vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
     assert.strictEqual(windowMock.fetch, firstFetch, 'Fetch should not be wrapped again')
+  })
+
+  it('installs over the observer an older version left in the page', async () => {
+    const { sandbox, messages, windowMock, listeners } = setupSandbox({})
+    windowMock.__julesArchiver = true // set by the old main-world.js, whose observer is still in fetch
+    const oldFetch = windowMock.fetch
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    assert.notStrictEqual(windowMock.fetch, oldFetch)
+    for (const listener of listeners.message) {
+      listener({
+        source: windowMock,
+        origin: 'https://jules.google.com',
+        data: { type: 'JULES_CREATE_TASK_RPC', rpcId: 'Qq7Rr' }
+      })
+    }
+    const payload = [null, null, ['m'], null, null, null, null, null, null, null]
+    const body = `f.req=${encodeURIComponent(JSON.stringify([[['Qq7Rr', JSON.stringify(payload)]]]))}`
+    await windowMock.fetch('https://jules.google.com/_/Swebot/data/batchexecute?rpcids=Qq7Rr', { body })
+    assert.ok(messages.some((m) => m.data.type === 'JULES_START_CONFIG'))
+  })
+
+  it('reads the CreateTask entry of a request that carries several RPCs', async () => {
+    const { sandbox, messages, windowMock } = setupSandbox({})
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    const other = [null, null, ['not the model'], null, null, null, null, null, null, [null, null, null, null, ['x']]]
+    const create = [
+      null,
+      null,
+      ['model-config'],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [null, null, null, null, ['exp1']]
+    ]
+    const entries = [
+      ['abc12', JSON.stringify(other), null, '1'],
+      ['Rja83d', JSON.stringify(create), null, '2']
+    ]
+    const body = `f.req=${encodeURIComponent(JSON.stringify([entries]))}`
+    await windowMock.fetch('https://jules.google.com/_/Swebot/data/batchexecute?rpcids=abc12,Rja83d', { body })
+    const start = messages.find((m) => m.data.type === 'JULES_START_CONFIG')
+    assert.ok(start)
+    assert.deepStrictEqual(start.data.config.modelConfig, ['model-config'])
+    assert.deepStrictEqual(start.data.config.experimentIds, ['exp1'])
+  })
+
+  it('installs over the observer of the previous version too', () => {
+    const { sandbox, windowMock } = setupSandbox({})
+    windowMock.__julesArchiverObserver = 2 // read only freq[0][0], whatever RPC it was
+    const oldFetch = windowMock.fetch
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    assert.notStrictEqual(windowMock.fetch, oldFetch)
+  })
+
+  it('lets a copy injected again after a reload retarget the first observer', async () => {
+    const { sandbox, messages, windowMock, listeners } = setupSandbox({})
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    const second = listeners.message.at(-1)
+    second({
+      source: windowMock,
+      origin: 'https://jules.google.com',
+      data: { type: 'JULES_CREATE_TASK_RPC', rpcId: 'Qq7Rr' }
+    })
+    const payload = [null, null, ['m'], null, null, null, null, null, null, null]
+    const body = `f.req=${encodeURIComponent(JSON.stringify([[['Qq7Rr', JSON.stringify(payload)]]]))}`
+    await windowMock.fetch('https://jules.google.com/_/Swebot/data/batchexecute?rpcids=Qq7Rr', { body })
+    assert.ok(messages.some((m) => m.data.type === 'JULES_START_CONFIG'))
   })
 })

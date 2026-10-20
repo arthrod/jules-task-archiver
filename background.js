@@ -1,5 +1,5 @@
 // Modified by tommyzed: Added repository filtering and suggestions
-importScripts('utils.js', 'items.js')
+importScripts('utils.js', 'items.js', 'settings.js')
 /**
  * Jules Task Archiver v2 — Background Service Worker
  *
@@ -17,26 +17,103 @@ const JULES_ORIGIN = 'https://jules.google.com'
 // repos/tasks does not fire hundreds of simultaneous fetches at once.
 const API_CONCURRENCY = 5
 
-// Archive fan-out. Accounts (tabs) are processed in parallel; each account
-// drains its own pool, while a shared global limiter caps the TOTAL in-flight
-// archive requests across all accounts so parallel work cannot overwhelm Jules
-// (which rate-limits with HTTP 429). Retries with backoff absorb the rest.
-const PER_ACCOUNT_CONCURRENCY = 6
-const GLOBAL_CONCURRENCY = 12
-// Tjmm5c (ArchiveTask) accepts an array of task IDs, so archive in batches to cut
-// the request count (was 1 request per task). One batch = one batchexecute call.
-const ARCHIVE_BATCH_SIZE = 50
-// A 50-id batch can be rejected with an RPC error code (seen live: [4],
-// DEADLINE_EXCEEDED, on 2 of 147 batches) while the same ids succeed in
-// smaller chunks, so a rejected batch is retried at this size. Not anchored:
-// callBatchExecute rethrows as "batchexecute Tjmm5c failed: RPC Tjmm5c error code [4]".
-const ARCHIVE_SPLIT_SIZE = 10
+// Fan-out. Accounts (tabs) are processed in parallel; each account drains its
+// own pool of settings.perAccountParallel, while a shared limiter caps the
+// TOTAL in-flight requests at settings.totalParallel so parallel work cannot
+// overwhelm Jules (which rate-limits with HTTP 429).
+// ArchiveTasks takes an array of task IDs, so tasks are archived in batches of
+// julesApi.archiveBatch (50). A 50-id batch can be rejected with an RPC error
+// code (seen live: [4], DEADLINE_EXCEEDED, on 2 of 147 batches) while the same
+// ids succeed in smaller chunks, so a rejected batch is retried in chunks of
+// julesApi.archiveSplit (10). Not anchored: callBatchExecute rethrows as
+// "batchexecute Tjmm5c failed: RPC Tjmm5c error code [4]".
 const RPC_ERROR_CODE_REGEX = /\bRPC \w+ error code \[/
 
 // ⚡ Bolt Optimization: After parsing the URL, use a fast regex test to extract
 // the account ID instead of allocating string arrays via `.split('/')`. This avoids
 // object allocation overhead while preserving the original strict URL validation.
 const ACCOUNT_NUM_REGEX = /\/u\/(\d+)(?:\/|$)/
+
+// =============================================================================
+// Settings and Jules API values (settings.js)
+// =============================================================================
+
+// Kept in memory and refreshed from storage (see the onChanged listener), so
+// every request reads the values in force at that moment.
+let settings = normalizeSettings()
+let julesApi = normalizeJulesApi()
+
+// New values (from a rediscovery or the Settings panel) wait for the run in
+// progress to end, so one run never mixes two sets of RPC ids or states.
+let pendingJulesApi = null
+
+function applyJulesApi(raw) {
+  if (state.status === 'running') {
+    pendingJulesApi = { raw }
+    return
+  }
+  pendingJulesApi = null
+  julesApi = normalizeJulesApi(raw)
+  setTaskStates(julesApi.states)
+}
+
+function applyPendingJulesApi() {
+  if (pendingJulesApi) applyJulesApi(pendingJulesApi.raw)
+}
+
+// The sync values behind `settings`, kept so a change to one key can be
+// merged with the rest.
+const syncSettings = {}
+
+// A change that lands while the start-up read is in flight is newer than
+// what that read returns, so the read doesn't overwrite it.
+const changedSinceStart = { syncKeys: new Set(), julesApi: false }
+
+// Why the start-up read failed, or null. Runs refuse to start meanwhile:
+// running on the defaults would drop "Run up to N" and the saved RPC ids.
+let settingsLoadError = null
+
+const settingsReadyPromise = Promise.allSettled([
+  chrome.storage?.sync?.get?.(SETTINGS_SYNC_KEYS),
+  chrome.storage?.local?.get?.(JULES_API_KEY)
+]).then(([syncRead, localRead]) => {
+  if (syncRead.status === 'fulfilled') {
+    for (const key of SETTINGS_SYNC_KEYS) {
+      if (!changedSinceStart.syncKeys.has(key)) syncSettings[key] = syncRead.value?.[key]
+    }
+    settings = settingsFromSync(syncSettings)
+  }
+  if (localRead.status === 'fulfilled' && !changedSinceStart.julesApi) applyJulesApi(localRead.value?.[JULES_API_KEY])
+  const failed = [syncRead, localRead].find((read) => read.status === 'rejected')
+  if (failed) {
+    settingsLoadError = failed.reason?.message || String(failed.reason)
+    console.error('[JTA] Could not load settings:', failed.reason)
+  }
+})
+
+function settingsProblem() {
+  if (!settingsLoadError) return null
+  return `Could not read the settings (${settingsLoadError}). Reload the extension at chrome://extensions.`
+}
+
+// The popup saves settings to sync and the Jules API values to local storage.
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  const syncKeys = area === 'sync' ? SETTINGS_SYNC_KEYS.filter((key) => key in changes) : []
+  for (const key of syncKeys) {
+    changedSinceStart.syncKeys.add(key)
+    syncSettings[key] = changes[key].newValue
+  }
+  if (syncKeys.length) settings = settingsFromSync(syncSettings)
+  if (area === 'local' && JULES_API_KEY in changes) {
+    changedSinceStart.julesApi = true
+    applyJulesApi(changes[JULES_API_KEY].newValue)
+  }
+})
+
+// The RPC id Jules uses today for a SweBotService method (see settings.js).
+function rpc(method) {
+  return julesApi.rpc[method]
+}
 
 // =============================================================================
 // Scheduling (chrome.alarms)
@@ -118,26 +195,35 @@ async function syncScheduleAlarm() {
 // a deliberate manual choice), then optionally start queued suggestions with a
 // per-tick global cap.
 async function runScheduledTick() {
-  await stateReadyPromise
-  if (state.status === 'running') {
+  await Promise.all([stateReadyPromise, settingsReadyPromise])
+  if (settingsProblem()) {
+    console.error('[JTA] Scheduled tick skipped:', settingsProblem())
+    return
+  }
+  const cfg = await getScheduleConfig()
+  if (!cfg.schedEnabled) return // defensive: config toggled off after alarm fired
+  if (state.status === 'running' || startPending) {
     // A manual operation is in flight; skipping is safer than racing two bulk
     // runs against the same accounts (Jules rate-limits with HTTP 429).
     console.log('[JTA] Scheduled tick skipped: operation already running')
     return
   }
-  const cfg = await getScheduleConfig()
-  if (!cfg.schedEnabled) return // defensive: config toggled off after alarm fired
 
+  // The two steps are one run: they share the Run up to N budget, and an
+  // account the archive step paused or stopped stays so for the suggestions.
+  // Reset here, before either step, so a step that fails early can't skip it.
+  resetRunLimits()
   await startOperation({
     action: 'archive',
     item: 'Completed',
     dryRun: false,
     force: false,
     scope: 'all',
-    scheduled: true
+    scheduled: true,
+    tickStep: true
   })
   // A manual run may have started while the archive step was finishing.
-  if (cfg.schedStartSuggestions && state.status !== 'running') {
+  if (cfg.schedStartSuggestions && state.status !== 'running' && !startPending) {
     await startOperation({
       action: 'proceed',
       item: ITEM_SUGGESTIONS,
@@ -145,7 +231,8 @@ async function runScheduledTick() {
       force: false,
       scope: 'all',
       maxSuggestions: cfg.schedMaxStarts,
-      scheduled: true
+      scheduled: true,
+      tickStep: true
     })
   }
 }
@@ -173,7 +260,7 @@ async function jFetch(url, options = {}) {
     throw new Error('Security Error: Disallowed fetch origin')
   }
 
-  const { token, headers = {}, timeout = 30000, ...rest } = options
+  const { token, headers = {}, timeout = settings.requestTimeoutSec * 1000, buffer = false, ...rest } = options
   const safeHeaders = { ...headers }
 
   if (token) {
@@ -193,14 +280,22 @@ async function jFetch(url, options = {}) {
     // Only restrict redirects when sending credentials, and ensure the restriction cannot be bypassed by `...rest`
     const finalRedirect = token ? 'error' : rest.redirect || 'follow'
     const res = await fetch(url, { headers: safeHeaders, signal: controller.signal, ...rest, redirect: finalRedirect })
+    // With `buffer`, the body is read under the same timeout, so a reply that
+    // stops arriving fails instead of hanging the run. Of the error bodies only
+    // a 400's is needed (it can carry a fresh sign-in token); any other error,
+    // a 429 above all, is thrown on its headers at once, so the account pauses
+    // before more requests go out.
+    const readBody = buffer && (res.ok || res.status === 400)
+    if (buffer && !readBody) res.body?.cancel?.().catch(() => {})
+    const reply = readBody ? await bufferedReply(res) : res
     if (!res.ok) {
       // Callers that need the error body (e.g. the XSRF refresh) read it here.
       const err = new Error(`HTTP ${res.status}`)
       err.status = res.status
-      err.response = res
+      err.response = reply
       throw err
     }
-    return res
+    return reply
   } catch (e) {
     if (e.name === 'AbortError') {
       throw new Error('NetworkError: Request timed out')
@@ -208,6 +303,25 @@ async function jFetch(url, options = {}) {
     throw e
   } finally {
     clearTimeout(timeoutId)
+  }
+}
+
+async function bufferedReply(res) {
+  let text
+  try {
+    text = await res.text()
+  } catch (e) {
+    // An error body that won't read, or stops arriving, only loses its hints:
+    // the status (a 429's Retry-After too) still stands.
+    if (res.ok) throw e
+    text = ''
+  }
+  return {
+    ok: res.ok,
+    status: res.status,
+    headers: res.headers,
+    text: async () => text,
+    json: async () => JSON.parse(text)
   }
 }
 
@@ -244,11 +358,13 @@ async function runInPool(items, limit, worker) {
  * used to cap TOTAL in-flight archive requests while accounts run in parallel.
  */
 function createLimiter(max) {
+  // `max` may be a function, so the limit follows the Settings panel.
+  const limit = typeof max === 'function' ? max : () => max
   let active = 0
   const queue = []
 
   function next() {
-    if (active >= max || queue.length === 0) return
+    if (active >= limit() || queue.length === 0) return
     active++
     const { fn, resolve, reject } = queue.shift()
     Promise.resolve()
@@ -267,7 +383,54 @@ function createLimiter(max) {
     })
 }
 
-const globalLimit = createLimiter(GLOBAL_CONCURRENCY)
+// --- Concurrency and pacing of requests to Jules ---
+// Every POST to Jules (postBatchExecute) takes a slot of its account
+// (Settings: parallel requests per account) and then one of the total. A
+// request that goes out while others of its account are in flight or waiting
+// first waits a random 0.5-2 s, plus up to the extra jitter when Settings
+// turns it on, so a burst never reaches Jules in lockstep. A lone request
+// goes straight out. GitHub calls don't go through here.
+const globalLimit = createLimiter(() => settings.totalParallel)
+const accountLimits = new Map() // accountNum -> limiter
+const accountActive = new Map() // accountNum -> requests in flight or waiting
+
+function accountKey(config) {
+  return String(config?.accountNum ?? '0')
+}
+
+function accountLimit(config) {
+  const key = accountKey(config)
+  if (!accountLimits.has(key))
+    accountLimits.set(
+      key,
+      createLimiter(() => settings.perAccountParallel)
+    )
+  return accountLimits.get(key)
+}
+
+function burstDelayMs() {
+  const span = BURST_JITTER_MAX_MS - BURST_JITTER_MIN_MS
+  const extra = settings.extraJitter ? Math.random() * settings.extraJitterMaxSec * 1000 : 0
+  return Math.round(BURST_JITTER_MIN_MS + Math.random() * span + extra)
+}
+
+// --- Run up to N items (Settings) ---
+// The whole run, across every account, acts on at most N items (dry runs
+// and scheduled runs too); 0 means no limit. Reset when a run starts.
+let runBudget = Number.POSITIVE_INFINITY
+
+function takeRunBudget(label, items, noun) {
+  if (items.length <= runBudget) {
+    runBudget -= items.length
+    return items
+  }
+  const kept = items.slice(0, Math.max(0, runBudget))
+  runBudget = 0
+  addLog(
+    `[${label}] Settings: run up to ${settings.runLimit} item(s), so only ${kept.length} of ${items.length} ${noun}`
+  )
+  return kept
+}
 
 // =============================================================================
 // batchexecute Client
@@ -295,9 +458,12 @@ function buildBatchRequest(rpcId, payload, config) {
   }
 }
 
-function postBatchExecute(rpcId, payload, config, timeout) {
+// The reply is read in full before this resolves, so postBatchExecute holds
+// its parallel slots while a task list (up to 100+ MB) downloads.
+function sendBatchExecute(rpcId, payload, config, timeout) {
   const { url, body } = buildBatchRequest(rpcId, payload, config)
   return jFetch(url, {
+    buffer: true,
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
@@ -307,6 +473,33 @@ function postBatchExecute(rpcId, payload, config, timeout) {
     body,
     ...(timeout ? { timeout } : {})
   })
+}
+
+// A pause or stop that lands while a request waits for its slot or its
+// jitter sends it back to wait, so nothing goes out during a 429 pause.
+const SEND_LATER = Symbol('send later')
+
+async function postBatchExecute(rpcId, payload, config, timeout) {
+  const key = accountKey(config)
+  const burst = (accountActive.get(key) || 0) > 0
+  accountActive.set(key, (accountActive.get(key) || 0) + 1)
+  try {
+    return await accountLimit(config)(async () => {
+      for (;;) {
+        await waitForAccount(config)
+        const pausedUntil = accountPauses.get(key) || 0
+        const res = await globalLimit(async () => {
+          const ms = burst ? burstDelayMs() : 0
+          if (ms > 0) await pause(ms)
+          if (stoppedAccounts.has(key) || (accountPauses.get(key) || 0) !== pausedUntil) return SEND_LATER
+          return sendBatchExecute(rpcId, payload, config, timeout)
+        })
+        if (res !== SEND_LATER) return res
+      }
+    })
+  } finally {
+    accountActive.set(key, accountActive.get(key) - 1)
+  }
 }
 
 // The XSRF token (WIZ_global_data.SNlM0e) is frozen at page load, while the
@@ -327,26 +520,215 @@ async function readXsrfToken(err) {
 
 async function mintXsrfToken(config) {
   try {
-    await postBatchExecute('KQOO7', [], { ...config, at: '' })
+    // Rate-limited like any request: a 429 here pauses the account too.
+    await postRateLimited(rpc('GetTaskUsage'), [], { ...config, at: '' })
     return null
   } catch (e) {
     return e.status === 400 ? readXsrfToken(e) : null
   }
 }
 
+function accountLabel(config) {
+  const num = String(config?.accountNum ?? '0')
+  return num !== '0' ? `u/${num}` : 'default'
+}
+
+// --- HTTP 429: pause the whole account ---
+// Jules answers 429 when an account sends too much. Every request of that
+// account then waits out Retry-After (30 s when Jules doesn't say) before it
+// goes; a wait longer than 5 minutes stops the account for this run.
+const RATE_LIMIT_DEFAULT_MS = 30 * 1000
+const RATE_LIMIT_MAX_WAIT_MS = 5 * 60 * 1000
+const RATE_LIMIT_RETRIES = 3
+const accountPauses = new Map() // accountNum -> when its pause ends (ms)
+const stoppedAccounts = new Map() // accountNum -> why it stopped
+// accountNum -> 429s in a row, across all of the account's requests; a
+// request that gets through resets it.
+const accountRateLimits = new Map()
+
+function pause(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function retryAfterMs(err) {
+  const header = err?.response?.headers?.get?.('retry-after')
+  if (!header) return RATE_LIMIT_DEFAULT_MS
+  const seconds = Number(header)
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000)
+  const date = Date.parse(header)
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : RATE_LIMIT_DEFAULT_MS
+}
+
+// Waits out the account's pause, again if it was extended meanwhile; throws
+// once the account is stopped for the run.
+async function waitForAccount(config) {
+  const key = accountKey(config)
+  let waitedFor = 0
+  for (;;) {
+    const stopped = stoppedAccounts.get(key)
+    if (stopped) throw new Error(stopped)
+    const until = accountPauses.get(key) || 0
+    if (until <= Date.now() || until === waitedFor) return
+    waitedFor = until
+    await pause(until - Date.now())
+  }
+}
+
+function pauseAccount(config, ms) {
+  const until = Date.now() + ms
+  if (until <= (accountPauses.get(accountKey(config)) || 0)) return // already paused at least this long
+  accountPauses.set(accountKey(config), until)
+  addLog(
+    `[${accountLabel(config)}] Jules is rate-limiting this account (HTTP 429): pausing its requests for ${Math.ceil(ms / 1000)} s`
+  )
+}
+
+async function postRateLimited(rpcId, payload, config, timeout) {
+  const key = accountKey(config)
+  for (;;) {
+    try {
+      const res = await postBatchExecute(rpcId, payload, config, timeout)
+      accountRateLimits.delete(key)
+      return res
+    } catch (e) {
+      if (e.status !== 429) throw e
+      const wait = retryAfterMs(e)
+      const inARow = (accountRateLimits.get(key) || 0) + 1
+      accountRateLimits.set(key, inARow)
+      if (inARow > RATE_LIMIT_RETRIES || wait > RATE_LIMIT_MAX_WAIT_MS) {
+        const why = `Jules rate-limited ${accountLabel(config)} (asked to wait ${Math.ceil(wait / 1000)} s); stopped this account for the run`
+        stoppedAccounts.set(accountKey(config), why)
+        throw new Error(why)
+      }
+      pauseAccount(config, wait)
+    }
+  }
+}
+
+// --- Sign-in tokens ---
+// A stale token answers HTTP 400 (401/403 when signed out). The steps run in
+// order, each only when the one before didn't bring new tokens, and the
+// request is sent again after any step that did:
+//   1. the fresh XSRF token Jules puts in the 400 body
+//   2. a token minted by a read-only call sent without one
+//   3. WIZ_global_data read again, past the content script's 5-minute cache
+//   4. the Jules tab reloaded (Settings, on by default), then read again
+// After the last one the account stops with a hint to sign in. The steps are
+// shared by every request of the run's config, so parallel requests don't
+// each reload the tab.
+const SIGN_IN_STATUSES = new Set([400, 401, 403])
+const SIGN_IN_STEPS = [
+  { name: 'the token in the 400 reply', run: async (_config, err) => ({ at: await readXsrfToken(err) }) },
+  {
+    name: 'a newly minted token',
+    run: async (config, err) => (err.status === 400 ? { at: await mintXsrfToken(config) } : null)
+  },
+  { name: "the tab's current tokens", run: (config) => readPageTokens(config) },
+  {
+    name: 'reloading the Jules tab',
+    run: async (config) => {
+      if (!settings.reloadTabOnSignIn || config.tabId === undefined) return null
+      if (!(await tabOnAccount(config))) {
+        addLog(`[${accountLabel(config)}] Not reloading: the tab is no longer on Jules for ${accountLabel(config)}`)
+        return null
+      }
+      await reloadJulesTab(config.tabId)
+      return readPageTokens(config)
+    }
+  }
+]
+
+// Copies new tokens into the run's config, so every later call uses them.
+// Returns whether anything changed.
+function setTokens(config, fresh) {
+  if (!fresh?.at) return false
+  const changed =
+    fresh.at !== config.at || (fresh.bl && fresh.bl !== config.bl) || (fresh.fsid && fresh.fsid !== config.fsid)
+  config.at = fresh.at
+  if (fresh.bl) config.bl = fresh.bl
+  if (fresh.fsid) config.fsid = fresh.fsid
+  return Boolean(changed)
+}
+
+// A tab switched to another account mid-run holds that account's tokens,
+// which must not be sent for this one.
+async function readPageTokens(config) {
+  if (config.tabId === undefined) return null
+  try {
+    const fresh = await getTabConfig(config.tabId, { fresh: true })
+    return fresh.accountNum === String(config.accountNum ?? '0') ? fresh : null
+  } catch {
+    return null
+  }
+}
+
+// The tab may have left Jules, or moved to another account, since the run
+// started; a reload then would throw away whatever the user has open there.
+async function tabOnAccount(config) {
+  try {
+    const { url } = await chrome.tabs.get(config.tabId)
+    return new URL(url).origin === JULES_ORIGIN && extractAccountNum(url) === accountKey(config)
+  } catch {
+    return false
+  }
+}
+
+// Reloads the tab and waits (up to 30 s) for it to finish loading.
+async function reloadJulesTab(tabId) {
+  await new Promise((resolve) => {
+    const timer = setTimeout(done, 30 * 1000)
+    function done() {
+      clearTimeout(timer)
+      chrome.tabs.onUpdated.removeListener(listener)
+      resolve()
+    }
+    function listener(id, info) {
+      if (id === tabId && info.status === 'complete') done()
+    }
+    chrome.tabs.onUpdated.addListener(listener)
+    chrome.tabs.reload(tabId).catch(done)
+  })
+}
+
+async function renewSignIn(config, err) {
+  const label = accountLabel(config)
+  while ((config.signInStep || 0) < SIGN_IN_STEPS.length) {
+    const step = SIGN_IN_STEPS[config.signInStep || 0]
+    config.signInStep = (config.signInStep || 0) + 1
+    addLog(`[${label}] Sign-in tokens rejected (HTTP ${err.status}): trying ${step.name}`)
+    if (setTokens(config, await step.run(config, err))) return true
+  }
+  return false
+}
+
+async function postWithSignIn(rpcId, payload, config, timeout) {
+  for (;;) {
+    const used = config.at
+    try {
+      const res = await postRateLimited(rpcId, payload, config, timeout)
+      config.signInStep = 0 // these tokens work; a later expiry starts over
+      return res
+    } catch (e) {
+      if (!SIGN_IN_STATUSES.has(e.status)) throw e
+      if (config.at !== used) continue // another request already renewed them
+      if (!config.signInPromise) {
+        config.signInPromise = renewSignIn(config, e).finally(() => {
+          config.signInPromise = null
+        })
+      }
+      if (!(await config.signInPromise) && config.at === used) {
+        // The rest of the run's requests for this account would fail the same way.
+        const why = `HTTP ${e.status}: Jules rejected the sign-in for ${accountLabel(config)}. Open that Jules tab, check you're signed in, and run again.`
+        stoppedAccounts.set(accountKey(config), why)
+        throw new Error(why)
+      }
+    }
+  }
+}
+
 async function callBatchExecute(rpcId, payload, config, { timeout } = {}) {
   try {
-    let res
-    try {
-      res = await postBatchExecute(rpcId, payload, config, timeout)
-    } catch (e) {
-      if (e.status !== 400) throw e
-      const fresh = (await readXsrfToken(e)) || (await mintXsrfToken(config))
-      if (!fresh) throw e
-      // Mutate the run's config so every later call reuses the fresh token.
-      config.at = fresh
-      res = await postBatchExecute(rpcId, payload, config, timeout)
-    }
+    const res = await postWithSignIn(rpcId, payload, config, timeout)
     return parseResponse(await res.text(), rpcId)
   } catch (e) {
     throw new Error(`batchexecute ${rpcId} failed: ${e.message}`)
@@ -541,13 +923,12 @@ function groupTasksByRepo(tasks) {
 }
 
 // ListTasks returns every task with its full prompt in one response — 121 MB
-// and ~85 s for a 7,355-task account (measured 2026-10-19). The 30 s default
-// would abort it before the headers even arrive.
-const LIST_TASKS_TIMEOUT_MS = 5 * 60 * 1000
-
+// and ~85 s for a 7,355-task account (measured 2026-10-19). The 30 s request
+// timeout would abort it before the headers even arrive, so it gets its own
+// (settings.listTimeoutSec, 300 s by default).
 async function listTasks(filter, config) {
   const payload = [filter, 4]
-  const result = await callBatchExecute('p1Takd', payload, config, { timeout: LIST_TASKS_TIMEOUT_MS })
+  const result = await callBatchExecute(rpc('ListTasks'), payload, config, { timeout: settings.listTimeoutSec * 1000 })
   if (!result?.[0]) return []
 
   const arr = result[0]
@@ -577,17 +958,17 @@ async function archiveTasks(taskIds, config) {
   const payload = new Array(2).fill(null)
   payload[TJMM5C.TASK_IDS] = taskIds
   payload[TJMM5C.ACTION] = 1
-  await callBatchExecute('Tjmm5c', payload, config)
+  await callBatchExecute(rpc('ArchiveTasks'), payload, config)
 }
 
 const RETRY_ATTEMPTS = 4
 const RETRY_BASE_MS = 400
 
-// Higher concurrency makes Jules more likely to answer 429 (rate limit) or a
-// transient 5xx. Rather than dropping those tasks, back off and retry so a fast
-// run degrades gracefully instead of failing.
+// A transient 5xx or network failure is retried with backoff rather than
+// dropping the task. HTTP 429 is handled by postRateLimited, which pauses the
+// whole account for as long as Jules asks.
 function isRetryable(message) {
-  return /HTTP 429|HTTP 5\d\d|Failed to fetch|NetworkError/i.test(message || '')
+  return /HTTP 5\d\d|Failed to fetch|NetworkError/i.test(message || '')
 }
 
 async function withRetry(fn) {
@@ -617,7 +998,7 @@ async function dismissSuggestion(suggestionId, config) {
   const payload = new Array(2).fill(null)
   payload[SC1VFF.SUGGESTION_ID] = suggestionId
   payload[SC1VFF.ACTION] = SC1VFF_ACTION_DISMISS
-  await callBatchExecute('sc1vFf', payload, config)
+  await callBatchExecute(rpc('UpdateProactiveSuggestionStatus'), payload, config)
 }
 
 function dismissSuggestionWithRetry(suggestionId, config) {
@@ -701,7 +1082,7 @@ function parseSuggestion(raw) {
 }
 
 async function listSuggestions(repo, config) {
-  const result = await callBatchExecute('hQP40d', [repo], config)
+  const result = await callBatchExecute(rpc('ListProactiveSuggestions'), [repo], config)
   if (!result || !Array.isArray(result) || !Array.isArray(result[0])) return []
 
   // ⚡ Bolt Optimization: Use a standard for loop instead of `.reduce()` to
@@ -721,7 +1102,7 @@ async function listSuggestions(repo, config) {
 // Returning every connected source (not just enabled ones) is what caused the
 // extension to start hundreds of unwanted suggestion tasks across all repos.
 async function listSuggestionEnabledSources(config) {
-  const result = await callBatchExecute('YqkSHd', [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
+  const result = await callBatchExecute(rpc('ListSources'), [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
   if (!result?.[0]) return []
 
   // ⚡ Bolt Optimization: Replace `.filter().map()` chain with a single
@@ -741,7 +1122,7 @@ async function listSuggestionEnabledSources(config) {
 // read-only work (export, repo picker) or an explicit user-chosen repo — never
 // for bulk session starts across "all" repos.
 async function listAllSources(config) {
-  const result = await callBatchExecute('YqkSHd', [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
+  const result = await callBatchExecute(rpc('ListSources'), [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
   if (!result?.[0]) return []
   const arr = result[0]
   const sources = []
@@ -778,7 +1159,7 @@ async function safeListSources(label, config, allowAll = false) {
 // 268/100). Returns null if the shape is unrecognised so callers can no-op the
 // guard rather than block the run.
 async function getDailySessionQuota(config) {
-  const result = await callBatchExecute('KQOO7', [], config)
+  const result = await callBatchExecute(rpc('GetTaskUsage'), [], config)
   if (!Array.isArray(result) || typeof result[0] !== 'number' || typeof result[2] !== 'number') return null
   return { used: result[0], limit: result[2], remaining: Math.max(0, result[2] - result[0]) }
 }
@@ -972,7 +1353,7 @@ function buildRja83dPayload(prompt, suggestionId, repo, config, startConfig) {
 
 async function startSuggestion(suggestion, repo, config, startConfig, message) {
   const payload = buildStartPayload(suggestion, repo, config, startConfig, message)
-  return callBatchExecute('Rja83d', payload, config)
+  return callBatchExecute(rpc('CreateTask'), payload, config)
 }
 
 async function getStartConfig() {
@@ -1031,14 +1412,14 @@ async function processSuggestionsForTab(tab, options) {
 
   addLog(`\n[${label}] Fetching suggestions for ${targetRepos.length} repos concurrently...`)
   let totalDiscovered = 0
-  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) => {
+  const allSuggestions = await runInPool(targetRepos, settings.perAccountParallel, (repo) => {
     // ⚡ Bolt Optimization: Short-circuit network discovery if we've already
     // found enough suggestions to satisfy the daily quota limit. This prevents
     // dozens of wasteful `listSuggestions` batchexecute API calls.
     if (quota && totalDiscovered >= quota.remaining) {
       return Promise.resolve({ repo, suggestions: [], skipped: true })
     }
-    return globalLimit(() => listSuggestions(repo, config))
+    return listSuggestions(repo, config)
       .then((suggestions) => {
         totalDiscovered += suggestions.length
         return { repo, suggestions }
@@ -1091,6 +1472,7 @@ async function processSuggestionsForTab(tab, options) {
     addLog(`[${label}] Capping ${toStart.length} suggestions to ${options._remainingStarts} (per-tick cap)`)
     toStart = toStart.slice(0, Math.max(0, options._remainingStarts))
   }
+  toStart = takeRunBudget(label, toStart, 'suggestion(s) to start')
   if (options._remainingStarts !== undefined) {
     options._remainingStarts -= toStart.length
   }
@@ -1102,7 +1484,7 @@ async function processSuggestionsForTab(tab, options) {
 
   let totalStarted = 0
   let lastUpdate = 0
-  await runInPool(toStart, PER_ACCOUNT_CONCURRENCY, async ({ repo, s }) => {
+  await runInPool(toStart, settings.perAccountParallel, async ({ repo, s }) => {
     if (state.status === 'cancelled') return
 
     if (options.dryRun) {
@@ -1116,7 +1498,7 @@ async function processSuggestionsForTab(tab, options) {
       lastUpdate = now
     }
     try {
-      await globalLimit(() => withRetry(() => startSuggestion(s, repo, config, startConfig, options.message)))
+      await startSuggestion(s, repo, config, startConfig, options.message)
       totalStarted++
       state.progress.archived += 1
       if (Date.now() - lastUpdate > 500) {
@@ -1154,8 +1536,8 @@ async function processRemoveSuggestionsForTab(tab, options) {
   if (!targetRepos) return 0
 
   addLog(`\n[${label}] Fetching suggestions for ${targetRepos.length} repos concurrently...`)
-  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
-    globalLimit(() => listSuggestions(repo, config))
+  const allSuggestions = await runInPool(targetRepos, settings.perAccountParallel, (repo) =>
+    listSuggestions(repo, config)
       .then((suggestions) => ({ repo, suggestions }))
       .catch((e) => ({ repo, error: e.message }))
   )
@@ -1181,20 +1563,21 @@ async function processRemoveSuggestionsForTab(tab, options) {
     return 0
   }
 
+  const toRemove = takeRunBudget(label, work, 'suggestion(s) to remove')
   if (options.dryRun) {
-    addLog(`[${label}] DRY RUN - would remove ${work.length} suggestions`)
-    for (const { s } of work) {
+    addLog(`[${label}] DRY RUN - would remove ${toRemove.length} suggestions`)
+    for (const { s } of toRemove) {
       addLog(`  [DRY] Would remove [${label}] ${s.title} (${s.categorySlug})`)
     }
     return 0
   }
 
-  state.progress.total += work.length
+  state.progress.total += toRemove.length
   updateState({})
 
   let totalRemoved = 0
   let lastUpdate = 0
-  await runInPool(work, PER_ACCOUNT_CONCURRENCY, async ({ repo, s }) => {
+  await runInPool(toRemove, settings.perAccountParallel, async ({ repo, s }) => {
     if (state.status === 'cancelled') return
     const now = Date.now()
     if (now - lastUpdate > 500) {
@@ -1202,7 +1585,7 @@ async function processRemoveSuggestionsForTab(tab, options) {
       lastUpdate = now
     }
     try {
-      await globalLimit(() => dismissSuggestionWithRetry(s.id, config))
+      await dismissSuggestionWithRetry(s.id, config)
       totalRemoved++
       state.progress.archived++
       if (Date.now() - lastUpdate > 500) {
@@ -1230,14 +1613,6 @@ const INTERACT_EXPERIMENT_IDS = [
   105754824, 105739042, 105762189, 105800437
 ]
 
-const DEFAULT_CONTINUE_MESSAGE =
-  'Please continue. Use your best judgment on any open questions and keep going without waiting for me.'
-const DEFAULT_ERROR_CONTINUE_MESSAGE =
-  'Your previous run stopped with an error before the task was finished. Please pick it back up: find the step ' +
-  'that failed and retry it. If it keeps failing, work around it (for example, carry on without a broken optional ' +
-  'dependency or git submodule) and note what you skipped. Then finish the original task.'
-const MAX_MESSAGE_LEN = 2000
-
 const PROCEED_VERBS = {
   reply: { dry: 'reply to', done: 'Replied to' },
   approve: { dry: 'approve the plan of', done: 'Approved the plan of' },
@@ -1249,11 +1624,6 @@ const PROCEED_VERBS = {
 // Proceed works through tasks in this order, so whatever daily quota is left
 // goes to the most useful work first.
 const PROCEED_ORDER = { feedback: 0, plan: 1, paused: 2, running: 3, unknown: 3, error: 4, completed: 5 }
-
-function normalizeMessage(value) {
-  const message = typeof value === 'string' ? value.trim() : ''
-  return message.slice(0, MAX_MESSAGE_LEN)
-}
 
 function taskKind(task) {
   return taskStateFor(task)?.kind || 'unknown'
@@ -1310,7 +1680,7 @@ function planProceedWork(tasks, item, options) {
 // GetTask view 3 includes the activity log. The UI threads every reply onto
 // the newest activity, so this does the same.
 async function getLastActivityId(taskId, config) {
-  const result = await callBatchExecute('n74qPd', [taskId, 3], config)
+  const result = await callBatchExecute(rpc('GetTask'), [taskId, 3], config)
   const activities = result?.[0]?.[3]
   if (!Array.isArray(activities) || activities.length === 0) return null
   return activities[activities.length - 1]?.[0] || null
@@ -1334,7 +1704,7 @@ function buildInteractPayload(task, plan, activityId) {
 // still have delivered the reply, and a re-run only finds tasks still waiting.
 async function proceedTask(label, task, plan, config) {
   if (plan.action === 'resume') {
-    await callBatchExecute('wk4vKd', [task.id], config)
+    await callBatchExecute(rpc('ResumeTask'), [task.id], config)
     return true
   }
   const activityId = await withRetry(() => getLastActivityId(task.id, config))
@@ -1342,7 +1712,7 @@ async function proceedTask(label, task, plan, config) {
     addLog(`  SKIP [${label}] [${task.id}] ${task.title} (no activity to reply to)`)
     return false
   }
-  await callBatchExecute('SLmX6', buildInteractPayload(task, plan, activityId), config)
+  await callBatchExecute(rpc('Interact'), buildInteractPayload(task, plan, activityId), config)
   return true
 }
 
@@ -1418,7 +1788,7 @@ async function processProceedForTab(tab, options) {
     addLog(`[${label}] Plan approvals and resumes don't take a message; those tasks go without it.`)
   }
 
-  const toProceed = await capToQuota(label, work, config)
+  const toProceed = takeRunBudget(label, await capToQuota(label, work, config), 'task(s) to proceed')
   if (options.dryRun) {
     for (const { task, plan } of toProceed) {
       addLog(`  [DRY] Would ${PROCEED_VERBS[plan.action].dry} [${label}] [${task.id}] ${task.title}`)
@@ -1434,9 +1804,9 @@ async function processProceedForTab(tab, options) {
   updateState({})
 
   let proceeded = 0
-  await runInPool(toProceed, PER_ACCOUNT_CONCURRENCY, async ({ task, plan }) => {
+  await runInPool(toProceed, settings.perAccountParallel, async ({ task, plan }) => {
     try {
-      const sent = await globalLimit(() => proceedTask(label, task, plan, config))
+      const sent = await proceedTask(label, task, plan, config)
       if (sent) {
         proceeded++
         state.progress.archived++
@@ -1572,6 +1942,7 @@ async function processBatchAgentForTab(tab, options) {
       addLog(`[${label}] ${repo}: 0 suggestions. Skipping agent launch.`)
       continue
     }
+    if (takeRunBudget(label, [repo], 'agent launch(es)').length === 0) break
 
     addLog(`[${label}] ${repo}: Assembling ${suggestions.length} suggestions into 1 Unified Master Agent task...`)
     const batchPrompt = appendMessage(buildBatchAgentPrompt(suggestions, repo), options.message)
@@ -1589,7 +1960,7 @@ async function processBatchAgentForTab(tab, options) {
     updateState({ currentRepo: repo.replace(/^github\//, '') })
     const payload = buildRja83dPayload(batchPrompt, suggestions[0].id, repo, config, startConfig)
     try {
-      await globalLimit(() => withRetry(() => callBatchExecute('Rja83d', payload, config)))
+      await callBatchExecute(rpc('CreateTask'), payload, config)
       totalTasksLaunched++
       state.progress.archived++
       updateState({})
@@ -1621,8 +1992,8 @@ async function processExportSuggestionsForTab(tab, options) {
   if (!targetRepos) return 0
 
   addLog(`[${label}] Querying suggestions for ${targetRepos.length} repo(s)...`)
-  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
-    globalLimit(() => listSuggestions(repo, config))
+  const allSuggestions = await runInPool(targetRepos, settings.perAccountParallel, (repo) =>
+    listSuggestions(repo, config)
       .then((suggestions) => ({ repo, suggestions }))
       .catch((e) => ({ repo, error: e.message }))
   )
@@ -1694,6 +2065,9 @@ function downloadExport(label, exportPayload) {
 // =============================================================================
 
 const prCache = new Map()
+// GitHub requests in flight. One sent while others are out waits the same
+// random burst delay as Jules requests do.
+let githubActive = 0
 
 function getOpenPRs(owner, repo, token) {
   const key = `${owner}/${repo}`
@@ -1713,10 +2087,15 @@ function getOpenPRs(owner, repo, token) {
       url.searchParams.set('state', 'open')
       url.searchParams.set('per_page', '100')
 
-      const res = await jFetch(url.toString(), {
-        headers: { Accept: 'application/vnd.github+json' },
-        token
-      })
+      const burst = githubActive > 0
+      githubActive++
+      let res
+      try {
+        if (burst) await pause(burstDelayMs())
+        res = await fetchOpenPRs(key, url.toString(), token)
+      } finally {
+        githubActive--
+      }
       const prs = await res.json()
       return prs.map((pr) => ({
         title: pr.title || '',
@@ -1724,13 +2103,30 @@ function getOpenPRs(owner, repo, token) {
         branch: pr.head?.ref || ''
       }))
     } catch (e) {
+      // null, not []: "no open PRs" would let every task through.
       addLog(`  WARNING: Could not check PRs for ${key}: ${e.message}`)
-      return []
+      return null
     }
   })()
 
   prCache.set(key, fetchPromise)
   return fetchPromise
+}
+
+// GitHub answers 404 for a repo the token can't see as well as for a wrong
+// name, which a second later is usually still true; one retry, after a random
+// wait and with a second more to answer, rules out a passing hiccup.
+async function fetchOpenPRs(key, url, token) {
+  const request = (timeout) =>
+    jFetch(url, { headers: { Accept: 'application/vnd.github+json' }, token, timeout, buffer: true })
+  try {
+    return await request()
+  } catch (e) {
+    if (e.status !== 404) throw e
+    addLog(`  GitHub answered 404 for ${key}; trying once more`)
+    await pause(burstDelayMs())
+    return request(settings.requestTimeoutSec * 1000 + 1000)
+  }
 }
 
 // ⚡ Bolt Optimization: Replace `.some()` with a standard for loop to avoid
@@ -1949,9 +2345,12 @@ async function ensureContentScript(tabId) {
   return documentId
 }
 
-async function getTabConfig(tabId) {
+// `fresh` reads WIZ_global_data again instead of the content script's cached
+// copy (sign-in renewal). The tab id rides along so a stale token can be
+// renewed from the tab later in the run.
+async function getTabConfig(tabId, { fresh = false } = {}) {
   const documentId = await ensureContentScript(tabId)
-  const response = await chrome.tabs.sendMessage(tabId, { action: 'GET_CONFIG' }, { documentId })
+  const response = await chrome.tabs.sendMessage(tabId, { action: 'GET_CONFIG', fresh }, { documentId })
   if (!response?.config?.at) {
     throw new Error('Could not extract page config (XSRF token missing). Try refreshing the Jules tab.')
   }
@@ -1962,7 +2361,8 @@ async function getTabConfig(tabId) {
   }
   return {
     ...response.config,
-    accountNum
+    accountNum,
+    tabId
   }
 }
 
@@ -1996,6 +2396,15 @@ async function filterArchivableTasks(label, tasks, options) {
   for (let i = 0; i < repoEntries.length; i++) {
     const [repo, repoTasks] = repoEntries[i]
     const openPRs = allPRs[i]
+    if (openPRs === null) {
+      // Unknown is not "none": without Force, these wait for a check that works.
+      prLogs.push(`  ${repo}: ${repoTasks.length} tasks, open PRs unknown`)
+      for (const task of repoTasks) {
+        toSkip.push(task)
+        prLogs.push(`    SKIP [${task.id}] ${task.title} (couldn't check its open PRs)`)
+      }
+      continue
+    }
     prLogs.push(`  ${repo}: ${repoTasks.length} tasks, ${openPRs.length} open PRs`)
 
     for (const task of repoTasks) {
@@ -2037,22 +2446,24 @@ function getTaskIds(tasks) {
 
 // Returns the tasks that were archived. HTTP-level failures (auth, network)
 // are not split: every chunk would fail the same way.
+// The split is read once: Settings may change it while a batch is going.
 async function archiveBatchWithSplit(label, batch, config) {
+  const split = julesApi.archiveSplit
   try {
-    await globalLimit(() => archiveTasksWithRetry(getTaskIds(batch), config))
+    await archiveTasksWithRetry(getTaskIds(batch), config)
     return batch
   } catch (e) {
-    if (batch.length <= ARCHIVE_SPLIT_SIZE || !RPC_ERROR_CODE_REGEX.test(e.message)) {
+    if (batch.length <= split || !RPC_ERROR_CODE_REGEX.test(e.message)) {
       addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
       return []
     }
-    addLog(`  [${label}] Batch of ${batch.length} rejected (${e.message}); retrying in chunks of ${ARCHIVE_SPLIT_SIZE}`)
+    addLog(`  [${label}] Batch of ${batch.length} rejected (${e.message}); retrying in chunks of ${split}`)
   }
   const archived = []
-  for (let i = 0; i < batch.length; i += ARCHIVE_SPLIT_SIZE) {
-    const chunk = batch.slice(i, i + ARCHIVE_SPLIT_SIZE)
+  for (let i = 0; i < batch.length; i += split) {
+    const chunk = batch.slice(i, i + split)
     try {
-      await globalLimit(() => archiveTasksWithRetry(getTaskIds(chunk), config))
+      await archiveTasksWithRetry(getTaskIds(chunk), config)
       archived.push(...chunk)
     } catch (e) {
       addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
@@ -2066,11 +2477,11 @@ async function executeArchive(label, toArchive, config) {
   let lastUpdate = 0
 
   const batches = []
-  for (let i = 0; i < toArchive.length; i += ARCHIVE_BATCH_SIZE) {
-    batches.push(toArchive.slice(i, i + ARCHIVE_BATCH_SIZE))
+  for (let i = 0; i < toArchive.length; i += julesApi.archiveBatch) {
+    batches.push(toArchive.slice(i, i + julesApi.archiveBatch))
   }
 
-  await runInPool(batches, PER_ACCOUNT_CONCURRENCY, async (batch) => {
+  await runInPool(batches, settings.perAccountParallel, async (batch) => {
     const now = Date.now()
     if (now - lastUpdate > 500) {
       updateState({ currentRepo: batch[0].repo || '(no repo)' })
@@ -2108,16 +2519,18 @@ async function processTab(tab, options) {
     return 0
   }
 
-  const { toArchive, toSkip } = await filterArchivableTasks(label, selected, options)
+  const filtered = await filterArchivableTasks(label, selected, options)
+  const { toSkip } = filtered
 
   if (toSkip.length > 0) {
-    addLog(`\n[${label}] ${toSkip.length} tasks skipped (open PRs matching)`)
+    addLog(`\n[${label}] ${toSkip.length} tasks skipped by the open-PR check`)
   }
 
-  if (toArchive.length === 0) {
-    addLog(`[${label}] Nothing to archive (all tasks have matching open PRs).`)
+  if (filtered.toArchive.length === 0) {
+    addLog(`[${label}] Nothing to archive: every task was skipped by the open-PR check.`)
     return 0
   }
+  const toArchive = takeRunBudget(label, filtered.toArchive, 'task(s) to archive')
 
   const totalTasks = toArchive.length
   addLog(`\n[${label}] Archiving ${totalTasks} tasks`)
@@ -2147,8 +2560,24 @@ const OP_MODE_HEADERS = {
 const RUN_ACTIONS = new Set(['proceed', 'archive', 'export'])
 
 // The popup and the CLI send { action, item }; this turns them into the opMode
-// that picks the per-tab orchestrator. Callers that already send an opMode
-// (and no action) pass through unchanged. Throws on an unknown action or item.
+// that picks the per-tab orchestrator. Throws on a missing or unknown action
+// or item.
+// Set while a START waits for the settings, so a second START (or a
+// scheduled tick) can't slip in before the first run marks itself running.
+let startPending = false
+
+// Why a START message from the popup can't run, or null. A popup newer than
+// this worker must not have its options read the old way.
+function startMessageProblem(msg) {
+  const reload = 'Reload the extension at chrome://extensions, then open the popup again.'
+  if (msg.protocol !== RUN_PROTOCOL) return `The popup and the background are different versions. ${reload}`
+  const options = msg.options
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return 'The run has no options.'
+  const unknown = Object.keys(options).filter((key) => !START_OPTION_KEYS.includes(key))
+  if (unknown.length) return `Unknown option ${unknown.join(', ')}. ${reload}`
+  return null
+}
+
 function resolveRunOptions(options) {
   if (!RUN_ACTIONS.has(options.action)) throw new Error(`Unknown action "${options.action}"`)
   const resolved = { ...options, message: normalizeMessage(options.message) }
@@ -2314,6 +2743,15 @@ function finalizeOperation(results, optionsOrIsSuggestions) {
   updateState({ status: 'done', results })
 }
 
+// What a run tracks across its accounts: the Run up to N budget, and the
+// accounts paused, stopped or counting 429s.
+function resetRunLimits() {
+  runBudget = settings.runLimit > 0 ? settings.runLimit : Number.POSITIVE_INFINITY
+  accountPauses.clear()
+  stoppedAccounts.clear()
+  accountRateLimits.clear()
+}
+
 function handleOperationError(e) {
   const msg = e?.message || String(e) || 'Unknown error'
   addLog(`FATAL ERROR: ${msg}`)
@@ -2331,6 +2769,14 @@ async function startOperation(rawOptions) {
   const isSuggestions = initOperationState(options)
 
   try {
+    // After initOperationState, so a second START already sees the run going.
+    await settingsReadyPromise
+    options.defaultReply = settings.defaultReply
+    options.defaultRetry = settings.defaultRetry
+    // runScheduledTick resets once for both of its steps.
+    if (!options.tickStep) resetRunLimits()
+    if (settings.runLimit > 0) addLog(`Settings: run up to ${settings.runLimit} item(s)`)
+
     const tabs = await discoverTabs(options)
     if (!tabs) return
 
@@ -2340,12 +2786,139 @@ async function startOperation(rawOptions) {
     handleOperationError(e)
   } finally {
     stopKeepAlive()
+    applyPendingJulesApi()
   }
 }
 
 // =============================================================================
 // Message Handlers
 // =============================================================================
+
+// =============================================================================
+// Jules API rediscovery
+// =============================================================================
+
+// Reads the RPC ids and the task-state map from the Jules web app's scripts,
+// from Settings > "Rediscover from Jules" and once a day. Changes apply at
+// once and go to a short log (JULES_API_LOG_KEY).
+const API_REDISCOVER_ALARM = 'jta-api-rediscover'
+
+// Runs inside the Jules tab (isolated world), so it must stand alone. Fetches
+// only https scripts on jules.google.com or *.gstatic.com and returns parsed
+// values, never the script text.
+async function readJulesBundle() {
+  const urls = new Set()
+  for (const el of document.scripts) if (el.src) urls.add(el.src)
+  for (const entry of performance.getEntriesByType('resource')) {
+    if (entry.initiatorType === 'script') urls.add(entry.name)
+  }
+  const allowed = [...urls].filter((u) => {
+    try {
+      const { protocol, hostname } = new URL(u)
+      return protocol === 'https:' && (hostname === 'jules.google.com' || hostname.endsWith('.gstatic.com'))
+    } catch {
+      return false
+    }
+  })
+  const rpc = []
+  const stateMaps = []
+  const rpcPattern = /\{S:"([A-Za-z0-9]{5,6})",V:"\/([\w.]+)"/g
+  const mapStart = 'new Map([[0,"Unknown"]'
+  for (const url of allowed.slice(0, 40)) {
+    // A script that stops arriving is skipped, not waited on forever.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 20 * 1000)
+    let text
+    try {
+      text = await (await fetch(url, { signal: controller.signal })).text()
+    } catch {
+      continue
+    } finally {
+      clearTimeout(timer)
+    }
+    for (const m of text.matchAll(rpcPattern)) rpc.push([m[1], m[2]])
+    for (let at = text.indexOf(mapStart); at !== -1; at = text.indexOf(mapStart, at + 1)) {
+      const open = at + 'new Map('.length
+      let depth = 0
+      let end = -1
+      for (let i = open; i < text.length && i < open + 4000; i++) {
+        if (text[i] === '"') i = text.indexOf('"', i + 1)
+        else if (text[i] === '[') depth++
+        else if (text[i] === ']' && --depth === 0) {
+          end = i + 1
+          break
+        }
+        if (i === -1) break
+      }
+      if (end === -1) continue
+      try {
+        stateMaps.push(JSON.parse(text.slice(open, end)))
+      } catch {
+        /* not a plain literal */
+      }
+    }
+  }
+  return { rpc, stateMaps, scripts: allowed.length }
+}
+
+// One check at a time: a second request (the popup's button while the daily
+// alarm runs) gets the same answer.
+let rediscovery = null
+
+// A check stuck in the tab must not hold every later one.
+const REDISCOVER_DEADLINE_MS = 2 * 60 * 1000
+
+// Each check gets a number; only the latest one, within its deadline, may save
+// what it found. A check that ran out of time and ends later is dropped, so it
+// can't roll back a newer check's values.
+let rediscoveryGeneration = 0
+
+function rediscoverJulesApi() {
+  if (rediscovery) return rediscovery
+  const generation = ++rediscoveryGeneration
+  let timer
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      if (rediscoveryGeneration === generation) rediscoveryGeneration++
+      reject(new Error('The Jules check took too long. Reload the Jules tab and try again.'))
+    }, REDISCOVER_DEADLINE_MS)
+  })
+  const current = () => rediscoveryGeneration === generation
+  rediscovery = Promise.race([discoverJulesApi(current), deadline]).finally(() => {
+    clearTimeout(timer)
+    rediscovery = null
+  })
+  return rediscovery
+}
+
+async function discoverJulesApi(current = () => true) {
+  const [tab] = await getJulesTabs()
+  if (!tab) throw new Error('Open a Jules tab first.')
+  const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 })
+  if (!frame?.url || new URL(frame.url).origin !== JULES_ORIGIN) throw new Error('The Jules tab is not on Jules.')
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, documentIds: [frame.documentId] },
+    func: readJulesBundle
+  })
+  const found = injection?.result
+  if (!found?.scripts)
+    throw new Error("Could not read the Jules web app's scripts. Reload the Jules tab and try again.")
+
+  if (!current()) throw new Error('A newer Jules check replaced this one.')
+  const stored = await chrome.storage.local.get([JULES_API_KEY, JULES_API_LOG_KEY])
+  const { api, changes, problems } = applyDiscovery(stored[JULES_API_KEY], found, TASK_STATES)
+  api.checkedAt = Date.now()
+  const pastLog = Array.isArray(stored[JULES_API_LOG_KEY]) ? stored[JULES_API_LOG_KEY] : []
+  const log = [{ at: api.checkedAt, changes, problems }, ...pastLog].slice(0, JULES_API_LOG_MAX)
+  if (!current()) throw new Error('A newer Jules check replaced this one.')
+  await chrome.storage.local.set({ [JULES_API_KEY]: api, [JULES_API_LOG_KEY]: log })
+  // The deadline can pass during the save. A newer check's save lands after
+  // this one, so storage ends on its values; memory must not go back either.
+  if (!current()) throw new Error('A newer Jules check replaced this one.')
+  applyJulesApi(api)
+  if (changes.length) console.info('[JTA] Jules API values changed:', changes.join('; '))
+  return { api, changes, problems }
+}
 
 // Repo picker source for the popup: every connected repo of the first Jules
 // tab's account, as sorted "owner/repo" display names.
@@ -2367,6 +2940,21 @@ async function getAllSourceNames() {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.action) {
+    case 'REDISCOVER_API':
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      // New RPC ids mid-run would mix two sets of values in one run.
+      if (state.status === 'running') {
+        sendResponse({ error: 'A run is going. Rediscover once it finishes.' })
+        break
+      }
+      rediscoverJulesApi()
+        .then((result) => sendResponse(result))
+        .catch((err) => sendResponse({ error: err.message }))
+      return true
+
     case 'GET_ALL_SOURCES':
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })
@@ -2380,26 +2968,49 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         })
       return true
 
-    case 'START':
+    case 'HELLO':
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      sendResponse({ protocol: RUN_PROTOCOL })
+      break
+
+    case 'START': {
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })
         break
       }
       // One run at a time: two runs would read the same daily quota and race
       // each other on the same tasks.
-      if (state.status === 'running') {
+      if (state.status === 'running' || startPending) {
         sendResponse({ error: 'A run is already going. Wait for it to finish.' })
         break
       }
-      try {
-        resolveRunOptions(msg.options || {})
-      } catch (e) {
-        sendResponse({ error: e.message })
+      const problem = startMessageProblem(msg)
+      if (problem) {
+        sendResponse({ error: problem })
         break
       }
-      startOperation(msg.options)
-      sendResponse({ ok: true })
-      break
+      // Wait for the run state a woken worker restores (restoring it after
+      // the run began would mark the run interrupted and let a second START
+      // in) and for the task states saved by the last rediscovery, which the
+      // item is resolved against.
+      startPending = true
+      Promise.all([stateReadyPromise, settingsReadyPromise])
+        .then(() => {
+          if (settingsProblem()) throw new Error(settingsProblem())
+          resolveRunOptions(msg.options)
+          if (state.status === 'running') throw new Error('A run is already going. Wait for it to finish.')
+          startOperation(msg.options)
+          sendResponse({ ok: true })
+        })
+        .catch((e) => sendResponse({ error: e.message }))
+        .finally(() => {
+          startPending = false
+        })
+      return true
+    }
 
     case 'GET_STATE':
       if (_sender.tab) {
@@ -2448,6 +3059,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Optional chaining keeps the script loadable in non-extension contexts where
 // these APIs may be absent (e.g. unit-test sandboxes with partial mocks).
 chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === API_REDISCOVER_ALARM) {
+    if (state.status === 'running' || startPending) return // tomorrow's check will do
+    rediscoverJulesApi().catch((e) => console.warn('[JTA] Daily Jules API check skipped:', e.message))
+    return
+  }
   if (alarm.name !== SCHEDULE_ALARM_NAME) return
   // Fire-and-forget is fine here: a tick that throws still resolves cleanly —
   // startOperation captures failures into state.error for the popup to show.
@@ -2469,3 +3085,8 @@ chrome.storage?.onChanged?.addListener((changes, area) => {
 
 // Reconcile alarm vs config on every SW startup (alarms outlive the worker).
 syncScheduleAlarm().catch((e) => console.error('[JTA] Alarm sync failed:', e))
+
+// The daily Jules API check; created once, kept across worker restarts.
+Promise.resolve(chrome.alarms?.get?.(API_REDISCOVER_ALARM))
+  .then((alarm) => alarm || chrome.alarms?.create?.(API_REDISCOVER_ALARM, { periodInMinutes: 24 * 60 }))
+  .catch((e) => console.error('[JTA] Could not schedule the daily Jules API check:', e))

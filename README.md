@@ -79,6 +79,19 @@ Pick an **Item** -- All, one Jules task state (each listed with its state code, 
 - **Config capture** -- observes the Jules UI to capture model config and experiment IDs for accurate reproduction
 - **Repository filter** -- every action can be narrowed to one repo from the dropdown or a typed `owner/repo`
 
+### Settings
+
+The **Settings** panel (header) holds everything you may want to tune:
+
+- **GitHub** -- owner for the open-PR check, and an optional token for private repos
+- **Timeouts** -- per request (30 s) and for listing every task (300 s; big accounts take minutes)
+- **Pacing** -- requests sent together each wait a random 0.5–2 s first; **Extra jitter** adds up to N more seconds (off, 10 s). **Parallel requests** caps how many go at once (6 per account, 12 in total). When Jules answers HTTP 429, that account pauses for as long as Jules asks
+- **Run up to N items** -- the whole run (dry and scheduled runs too) acts on at most N items; 0 means no limit
+- **Reload the Jules tab when its sign-in stops working** (on) -- when Jules rejects the tokens, the extension tries the fresh token Jules sends back, then mints one, then re-reads the page, then reloads the tab; if none works it stops that account and tells you to sign in. It never reloads a tab you have moved off Jules or to another account
+- **Default messages** -- your own default reply (Waiting on You) and retry prompt (Error); empty uses the built-in text, and **Add a message** goes after it
+- **Jules API values** -- the RPC id of each Jules method, the archive batch size and the task states. **Rediscover from Jules** reads them from the Jules web app in an open tab and applies any change (after the run in progress, if one is going); it also runs once a day. **Reset to defaults** goes back to the built-in values
+- **About** -- License & Credits
+
 ### Scheduled Operations
 
 - **Auto-archive on a schedule** -- `chrome.alarms`-driven periodic archive of finished tasks across all Jules tabs; runs in the background while the popup is closed (service-worker safe, no `setInterval`)
@@ -101,19 +114,21 @@ Pick an **Item** -- All, one Jules task state (each listed with its state code, 
 4. Enable **Developer mode** (top right toggle)
 5. Click **Load unpacked** and select the extracted folder
 
+After you update the files of an unpacked extension, click **Reload** (↻) on its card in `chrome://extensions`. Until then Chrome keeps running the old background, and the popup refuses to run, with a banner that says so.
+
 ## Usage
 
 1. Open one or more `jules.google.com` tabs (supports multiple accounts)
 2. Click the extension icon in the toolbar
 3. Choose:
-   - **Items** -- All, one task state, or Suggestions
+   - **Items** -- All, one task state, or Suggestions. The popup remembers your choice; if that state no longer exists (Jules renumbered it), it shows **Choose an item** instead of falling back to All
    - **Dry-run** -- on: preview only; off: make the changes
-   - **Force** -- Archive skips the open-PR check; Proceed on All also messages Completed tasks
+   - **Force** -- Archive skips the open-PR check; Proceed on All also messages Completed tasks. Without Force, a repo whose open PRs can't be read from GitHub (a 404 is tried once more) keeps its tasks: they are skipped, not archived
    - **Add a message** -- text appended to what Proceed sends
    - **One session for all** -- Suggestions only: one session per repo
    - **Scope** -- all Jules tabs or the current tab only
    - **Repository** -- All Repositories (default), one repo from the list, or a typed `owner/repo`
-   - **Settings** (header) -- GitHub owner (for the open-PR check), an optional token for private repos, and License & Credits
+   - **Settings** (header) -- GitHub, timeouts, pacing, run limit, default messages and the Jules API values (see [Settings](#settings))
 4. Click **Proceed** or **Archive**
 
 5. (Optional) In **Schedule**, enable **Archive Completed tasks automatically**, set the interval in minutes, and optionally enable **Also start suggestions each run** with a max-starts cap. Scheduled runs archive Completed tasks (3, 7 and tasks without a state) with the open-PR check -- they never Force.
