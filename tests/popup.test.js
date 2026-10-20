@@ -308,6 +308,8 @@ function setupPopupSandbox({
   const listeners = { storage: [], runtime: [] }
   const sent = []
   const confirms = []
+  // What Copy session URL wrote; set clipboard.fail to make the write fail.
+  const clipboard = { copied: [], fail: null }
   const radioStates = { scope: 'all' }
 
   const elements = {}
@@ -357,6 +359,14 @@ function setupPopupSandbox({
         return confirm(text)
       }
     },
+    navigator: {
+      clipboard: {
+        writeText: async (text) => {
+          if (clipboard.fail) throw new Error(clipboard.fail)
+          clipboard.copied.push(text)
+        }
+      }
+    },
     console,
     setTimeout,
     clearTimeout,
@@ -387,6 +397,7 @@ function setupPopupSandbox({
     listeners,
     sent,
     confirms,
+    clipboard,
     radioStates,
     documentListeners,
     tips,
@@ -1581,7 +1592,7 @@ describe('More Actions popup', () => {
     assert.strictEqual(checkbox.type, 'checkbox')
     checkbox.checked = true
     await checkbox.dispatchEvent('change')
-    assert.ok(el['#moreAction'].children.some((opt) => opt.textContent === 'Pause task (1)' && !opt.disabled))
+    assert.ok(el['#moreAction'].children.some((opt) => opt.textContent === 'Pause session (1)' && !opt.disabled))
     await el['#moreChips'].children[1].dispatchEvent('click')
     assert.strictEqual(el['#moreList'].children.length, 1)
     await el['#moreChips'].children[0].dispatchEvent('click')
@@ -1903,6 +1914,221 @@ describe('More Actions confirmation choices', () => {
       assert.ok(el['#moreAction'].children.find((opt) => opt.value === action).textContent.endsWith('(0)'))
     })
   }
+})
+
+describe('More Actions options', () => {
+  // One load of the category, with these lists for u/1.
+  async function loaded(category, lists) {
+    const env = setupPopupSandbox()
+    const reply = moreReplies([{ account: 'u/1', tasks: [], schedules: [], archived: [], notes: [], ...lists }])
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      if (cb) cb(msg.action === 'GET_STATE' ? { status: 'idle' } : reply(msg))
+    }
+    env.load()
+    await env.tick()
+    env.elements['#moreCategory'].value = category
+    await env.elements['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    return env
+  }
+  const offered = (env) => env.elements['#moreAction'].children.map((opt) => opt.value).filter(Boolean)
+  async function choose(env, action, select = true) {
+    const el = env.elements
+    if (select) {
+      el['#moreSelectAll'].checked = true
+      await el['#moreSelectAll'].dispatchEvent('change')
+    }
+    el['#moreAction'].value = action
+    await el['#moreAction'].dispatchEvent('change')
+  }
+  // The popup's Date.now, set by hand from here on.
+  function clock(env, start = 1000) {
+    env.sandbox.__now = start
+    vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
+    return (ms) => {
+      env.sandbox.__now += ms
+    }
+  }
+  const deletes = (env) => env.sent.filter((msg) => msg.action === 'APPLY_ACTION')
+  const done = { id: 'done', title: 'Done', state: 3, repo: 'org/repo' }
+  const review = { id: 'review', title: 'Review', state: 3, awaitingReview: true, repo: 'org/repo' }
+  const running = { id: 'run', title: 'Run', state: 2, repo: 'org/repo' }
+  const paused = { id: 'paused', title: 'Paused', state: 8, repo: 'org/repo' }
+  const active = { id: 'active', title: 'Active', state: 2, repo: 'org/repo' }
+  const stopped = { id: 'stopped', title: 'Stopped', state: 3, repo: 'org/repo' }
+
+  it('offers Copy session URL and Archive for completed and ready-for-review tasks', async () => {
+    const env = await loaded('complete', { tasks: [done, review] })
+    assert.deepStrictEqual(offered(env), ['copyUrl', 'archive'])
+  })
+
+  it('offers Copy session URL and Unarchive for archived tasks', async () => {
+    const archived = await loaded('archive', { archived: [{ ...done, id: 'old' }] })
+    assert.deepStrictEqual(offered(archived), ['copyUrl', 'unarchive'])
+  })
+
+  it('offers Pause, Resume and Delete schedule for schedules, never Update', async () => {
+    const env = await loaded('scheduled', { schedules: [active, stopped] })
+    assert.deepStrictEqual(offered(env), ['pauseSchedule', 'resumeSchedule', 'deleteSchedule'])
+    const one = await loaded('scheduled', { schedules: [active] })
+    assert.deepStrictEqual(offered(one), ['pauseSchedule', 'deleteSchedule'])
+  })
+
+  it("offers what fits the shown items, in Jules' order", async () => {
+    const env = await loaded('all', { tasks: [running, paused, done], schedules: [active] })
+    assert.deepStrictEqual(offered(env), [
+      'pauseTask',
+      'resumeTask',
+      'copyUrl',
+      'archive',
+      'pauseSchedule',
+      'deleteSchedule'
+    ])
+    // The Scheduled chip shows only the schedule's actions.
+    await env.elements['#moreChips'].children[1].dispatchEvent('click')
+    assert.deepStrictEqual(offered(env), ['pauseSchedule', 'deleteSchedule'])
+  })
+
+  it('Copy session URL copies the selected URLs, one per line, with no run', async () => {
+    const env = await loaded('complete', { tasks: [done, review] })
+    const el = env.elements
+    el['#moreDryRun'].checked = true
+    await el['#moreDryRun'].dispatchEvent('change')
+    await choose(env, 'copyUrl')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Copy', 'copying has no dry run')
+    await el['#moreConfirm'].dispatchEvent('click')
+    await env.tick()
+    assert.deepStrictEqual(env.clipboard.copied, [
+      'https://jules.google.com/task/done\nhttps://jules.google.com/task/review'
+    ])
+    assert.ok(!env.sent.some((msg) => msg.action === 'APPLY_ACTION'))
+    assert.strictEqual(el['#moreStatus'].textContent, 'Copied 2 session URLs.')
+    assert.strictEqual(el['#moreList'].children[0].children[0].checked, true, 'the selection stays')
+  })
+
+  it('says when the URLs could not be copied', async () => {
+    const env = await loaded('complete', { tasks: [done] })
+    env.clipboard.fail = 'Document is not focused.'
+    await choose(env, 'copyUrl')
+    await env.elements['#moreConfirm'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(env.elements['#moreStatus'].textContent, 'Could not copy the URLs: Document is not focused.')
+  })
+
+  it('Delete schedule needs a second click on Confirm', async () => {
+    const env = await loaded('scheduled', { schedules: [active, stopped] })
+    const wait = clock(env)
+    const el = env.elements
+    await choose(env, 'deleteSchedule')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Confirm')
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.ok(!env.sent.some((msg) => msg.action === 'APPLY_ACTION'))
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 2 schedules? Click again')
+    wait(1000)
+    await el['#moreConfirm'].dispatchEvent('click')
+    const sent = JSON.parse(JSON.stringify(env.sent.find((msg) => msg.action === 'APPLY_ACTION')))
+    assert.strictEqual(sent.operation, 'deleteSchedule')
+    assert.strictEqual(sent.dryRun, false)
+    assert.deepStrictEqual(
+      sent.items.map((item) => item.id),
+      ['active', 'stopped']
+    )
+  })
+
+  it('a second click under 0.5 s after the first is not the second click', async () => {
+    const env = await loaded('scheduled', { schedules: [active] })
+    const wait = clock(env)
+    const el = env.elements
+    await choose(env, 'deleteSchedule')
+    await el['#moreConfirm'].dispatchEvent('click')
+    wait(300)
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.deepStrictEqual(deletes(env), [], 'a double-click is one gesture')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 1 schedule? Click again', 'still armed')
+    wait(300)
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.strictEqual(deletes(env).length, 1)
+  })
+
+  it('the first click lapses after 10 s, even when its timer has not run', async () => {
+    const env = await loaded('scheduled', { schedules: [active] })
+    const wait = clock(env)
+    const el = env.elements
+    await choose(env, 'deleteSchedule')
+    await el['#moreConfirm'].dispatchEvent('click')
+    wait(10001)
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.deepStrictEqual(deletes(env), [], 'a late click arms again')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 1 schedule? Click again')
+    wait(600)
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.strictEqual(deletes(env).length, 1)
+  })
+
+  it("a held key's repeats never press Confirm", async () => {
+    const env = await loaded('scheduled', { schedules: [active] })
+    let prevented = 0
+    const press = (key, repeat) =>
+      env.elements['#moreConfirm'].dispatchEvent('keydown', { key, repeat, preventDefault: () => prevented++ })
+    await press('Enter', false)
+    assert.strictEqual(prevented, 0)
+    await press('Enter', true)
+    await press(' ', true)
+    assert.strictEqual(prevented, 2)
+  })
+
+  it('Dry run on and off takes the first Delete click back', async () => {
+    const env = await loaded('scheduled', { schedules: [active] })
+    const wait = clock(env)
+    const el = env.elements
+    await choose(env, 'deleteSchedule')
+    await el['#moreConfirm'].dispatchEvent('click')
+    el['#moreDryRun'].checked = true
+    await el['#moreDryRun'].dispatchEvent('change')
+    el['#moreDryRun'].checked = false
+    await el['#moreDryRun'].dispatchEvent('change')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Confirm')
+    wait(1000)
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.deepStrictEqual(deletes(env), [])
+  })
+
+  it('a change of action or selection takes back the first Delete click', async () => {
+    const env = await loaded('scheduled', { schedules: [active, stopped] })
+    clock(env)
+    const el = env.elements
+    await choose(env, 'deleteSchedule')
+    await el['#moreConfirm'].dispatchEvent('click')
+    await choose(env, 'pauseSchedule', false)
+    await choose(env, 'deleteSchedule', false)
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Confirm')
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 2 schedules? Click again')
+    // The other schedule stays selected, so Delete stays the chosen action.
+    const checkbox = el['#moreList'].children[1].children[0]
+    checkbox.checked = false
+    await checkbox.dispatchEvent('change')
+    checkbox.checked = true
+    await checkbox.dispatchEvent('change')
+    assert.strictEqual(el['#moreAction'].value, 'deleteSchedule')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Confirm')
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.ok(!env.sent.some((msg) => msg.action === 'APPLY_ACTION'), 'every first click was taken back')
+  })
+
+  it('a Delete dry run needs one click', async () => {
+    const env = await loaded('scheduled', { schedules: [active] })
+    const el = env.elements
+    el['#moreDryRun'].checked = true
+    await el['#moreDryRun'].dispatchEvent('change')
+    await choose(env, 'deleteSchedule')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Confirm (dry run)')
+    await el['#moreConfirm'].dispatchEvent('click')
+    const sent = env.sent.find((msg) => msg.action === 'APPLY_ACTION')
+    assert.strictEqual(sent.operation, 'deleteSchedule')
+    assert.strictEqual(sent.dryRun, true)
+  })
 })
 
 describe('More Actions smoke', () => {

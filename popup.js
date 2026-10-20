@@ -98,6 +98,14 @@ let moreArchived = 'none'
 // How many repos the worker's All-repos archived listing has done: { done, total }.
 let moreArchivedRepos = null
 let moreNotes = []
+// Delete schedule can't be undone, so its Confirm takes a second click, at
+// least 0.5 s after the first (a double-click is one gesture) and at most
+// 10 s after it. A held key's repeats never press Confirm, and a change of
+// action, selection or Dry run takes the first click back.
+const DELETE_CONFIRM_MIN_MS = 500
+const DELETE_CONFIRM_MAX_MS = 10000
+let moreDeleteArmedAt = null
+let moreDeleteTimer = null
 
 // Storage-side bounds match background.js; the background re-validates anyway,
 // these just keep obviously-bad values out of sync storage.
@@ -991,23 +999,55 @@ function fittingMoreItems(action) {
   return loadedMoreItems.filter((item) => selectedMoreItems.has(moreItemKey(item)) && moreActionFits(action, item))
 }
 
+function disarmMoreDelete() {
+  moreDeleteArmedAt = null
+  clearTimeout(moreDeleteTimer)
+  moreDeleteTimer = null
+}
+
+// The timer only redraws the button; a click checks the time itself.
+function armMoreDelete() {
+  disarmMoreDelete()
+  moreDeleteArmedAt = Date.now()
+  moreDeleteTimer = setTimeout(() => {
+    disarmMoreDelete()
+    updateMoreControls()
+  }, DELETE_CONFIRM_MAX_MS)
+}
+
+function moreConfirmText() {
+  const action = moreAction.value
+  if (MORE_ACTIONS[action]?.local) return 'Copy'
+  if (moreDryRun.checked) return 'Confirm (dry run)'
+  if (action === 'deleteSchedule' && moreDeleteArmedAt !== null) {
+    const count = fittingMoreItems(action).length
+    return `Delete ${count} ${count === 1 ? 'schedule' : 'schedules'}? Click again`
+  }
+  return 'Confirm'
+}
+
 function updateMoreControls() {
   const locked = backgroundStale || !backgroundOk || isRunning() || moreLoading
   moreLoad.disabled = locked || (moreRepoScope.checked && !/^[\w.-]+\/[\w.-]+$/.test(moreRepo.value.trim()))
   moreConfirm.disabled = locked || fittingMoreItems(moreAction.value).length === 0
   // Force only skips Archive's open-PR check.
   moreForce.disabled = moreAction.value !== 'archive'
-  if (!isRunning()) moreConfirm.textContent = moreDryRun.checked ? 'Confirm (dry run)' : 'Confirm'
+  if (!isRunning()) moreConfirm.textContent = moreConfirmText()
 }
 
+// Only the actions that fit a shown item are offered, as in Jules' menus;
+// each counts the selected items it fits.
 function renderMoreSelection() {
+  disarmMoreDelete()
   const previous = moreAction.value
   moreAction.textContent = ''
   const choose = document.createElement('option')
   choose.value = ''
   choose.textContent = 'Choose an action'
   moreAction.appendChild(choose)
+  const shownItems = shownMoreItems()
   for (const [action, details] of Object.entries(MORE_ACTIONS)) {
+    if (!shownItems.some((item) => moreActionFits(action, item))) continue
     const count = fittingMoreItems(action).length
     const option = document.createElement('option')
     option.value = action
@@ -1095,8 +1135,12 @@ moreRepo.addEventListener('input', () => {
   if (moreRepo.value.trim()) moreRepoScope.checked = true
   updateMoreControls()
 })
-moreAction.addEventListener('change', updateMoreControls)
-moreDryRun.addEventListener('change', updateMoreControls)
+for (const input of [moreAction, moreDryRun]) {
+  input.addEventListener('change', () => {
+    disarmMoreDelete()
+    updateMoreControls()
+  })
+}
 moreSelectAll.addEventListener('change', () => {
   for (const item of shownMoreItems()) {
     if (moreSelectAll.checked) selectedMoreItems.add(moreItemKey(item))
@@ -1206,12 +1250,41 @@ moreLoad.addEventListener('click', async () => {
   }
 })
 
+// The selected tasks' URLs, one per line, as Jules' Copy session URL gives one.
+async function copyMoreSessionUrls() {
+  const urls = fittingMoreItems('copyUrl').map(moreSessionUrl)
+  try {
+    await navigator.clipboard.writeText(urls.join('\n'))
+    moreStatus.textContent = `Copied ${urls.length} session ${urls.length === 1 ? 'URL' : 'URLs'}.`
+  } catch (e) {
+    moreStatus.textContent = `Could not copy the URLs: ${e.message}`
+  }
+}
+
+moreConfirm.addEventListener('keydown', (event) => {
+  if (event.repeat && (event.key === 'Enter' || event.key === ' ')) event.preventDefault()
+})
+
 moreConfirm.addEventListener('click', async () => {
   updateMoreControls()
   if (moreConfirm.disabled) return
   const operation = moreAction.value
-  const items = fittingMoreItems(operation).map(({ account, kind, id }) => ({ account, kind, id }))
+  if (MORE_ACTIONS[operation].local) {
+    await copyMoreSessionUrls()
+    return
+  }
   const dryRun = moreDryRun.checked
+  if (operation === 'deleteSchedule' && !dryRun) {
+    const since = moreDeleteArmedAt === null ? null : Date.now() - moreDeleteArmedAt
+    if (since === null || since > DELETE_CONFIRM_MAX_MS) {
+      armMoreDelete()
+      updateMoreControls()
+      return
+    }
+    if (since < DELETE_CONFIRM_MIN_MS) return
+  }
+  disarmMoreDelete()
+  const items = fittingMoreItems(operation).map(({ account, kind, id }) => ({ account, kind, id }))
   const force = operation === 'archive' && moreForce.checked
   setRunning('more', dryRun)
   togglePanel(null)

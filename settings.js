@@ -138,6 +138,7 @@ const JULES_RPC_DEFAULTS = {
   ListScheduledTasks: 'hvmRxc',
   PauseScheduledTask: 'gBUOb',
   ResumeScheduledTask: 'XuzQWe',
+  DeleteScheduledTask: 'sL8twb',
   GetTask: 'n74qPd',
   Interact: 'SLmX6',
   GetTaskUsage: 'KQOO7',
