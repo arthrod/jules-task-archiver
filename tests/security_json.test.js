@@ -37,6 +37,10 @@ function setup() {
   vm.createContext(sandbox)
   sandbox.globalThis = sandbox
   vm.runInContext(utilsScriptContent, sandbox, { filename: utilsScriptPath })
+  for (const name of ['items.js', 'settings.js']) {
+    const file = path.join(__dirname, '..', name)
+    vm.runInContext(fs.readFileSync(file, 'utf8'), sandbox, { filename: file })
+  }
   vm.runInContext(bgScriptContent, sandbox, { filename: bgScriptPath })
   // Expose parseResponse if not already global
   vm.runInContext('globalThis.parseResponse = parseResponse', sandbox)

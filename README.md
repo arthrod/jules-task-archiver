@@ -39,6 +39,7 @@
 
 ## Table of contents
 
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -50,27 +51,57 @@
 - [License](#license)
 
 
+## Screenshots
+
+All the data in these pictures is made up.
+
+![Proceed and Archive across every signed-in account](docs/images/hero.png)
+
+| | |
+|---|---|
+| ![More Actions: pick tasks and act on them all](docs/images/more-actions.png) | ![Delete permanently, checked with Jules first](docs/images/delete.png) |
+| ![Settings: pacing, parallel requests and API values](docs/images/settings.png) | ![Schedule: archive in the background](docs/images/schedule.png) |
 
 ## Features
 
-### Archive Tasks
+### Items, Proceed and Archive
 
-- **Bulk archive** -- archive all completed tasks for repos with zero open PRs in one click
-- **GitHub PR check** -- skips repos with open PRs to avoid archiving active work
-- **Force mode** -- skip PR check and archive everything
+Pick an **Item** -- All, one Jules task state (each listed with its state code, e.g. *Waiting on You (12)*, *Error (4)*, *Completed (3)*), or Suggestions -- then press **Proceed** or **Archive**.
 
-### Start Suggestions
+- **Proceed** moves each task forward according to its state:
+  - *Waiting on You* -- sends the default reply, with your message appended
+  - *Awaiting Plan Approval* -- approves the plan
+  - *Paused* -- resumes the session
+  - *Error* -- retries with the default retry prompt, with your message appended
+  - *In Progress, Planning, Queued* -- sends your message (nothing without one)
+  - *Completed* -- sends your message as a follow-up (nothing without one). Under **All**, Completed tasks are skipped unless **Force** is on
+  - Tasks are handled in that order. Retries and follow-ups start a new run, so they are capped to the daily sessions you have left
+- **Archive** archives the chosen item's tasks, skipping tasks with a matching open GitHub PR. **Force** skips that check
+- **Dry-run** (on by default) lists what would happen without changing anything
+- **Add a message** appends your text (up to 2000 characters) to whatever the extension sends: the default reply, the retry prompt, each suggestion prompt. Running and Completed tasks get it on its own. Plan approvals and resumes take no message. The **?** next to Force and Add a message explains what they do for the chosen item
+- The popup asks before risky live runs: Archive on All, any Force archive, and a Force Proceed that messages Completed tasks
 
-- **Bulk start** -- start all recommended code suggestions (security, performance, testing, cleanup) across repos
-- **Category-aware prompts** -- generates tailored prompts per suggestion category (security fix, performance optimization, test coverage, code cleanup)
-- **Config capture** -- observes Jules UI to capture model config and experiment IDs for accurate reproduction
+### Suggestions
 
-### Batch Agent, Remove and Export
+- **Proceed** starts every queued code suggestion (security, performance, testing, cleanup) on Suggestions-enabled repos, with a prompt tailored to its category, capped to the daily sessions you have left
+- **One session for all** starts one Jules session per repo whose prompt carries every queued suggestion
+- **Archive** dismisses the queued suggestions
+- **Export suggestions** saves every suggestion across all connected repos to `jules-suggestions-YYYY-MM-DD.json` (one file per account); the popup's re-download combines all accounts under `accounts`
+- **Config capture** -- observes the Jules UI to capture model config and experiment IDs for accurate reproduction
+- **Repository filter** -- every action can be narrowed to one repo from the dropdown or a typed `owner/repo`
 
-- **Batch to 1 Agent** -- one Jules session per repo whose prompt carries every queued suggestion, instead of one session per suggestion (counts against the daily session quota like Start Suggestions)
-- **Remove Suggestions** -- bulk-dismiss queued suggestions on Suggestions-enabled repos (Dry Run previews the list)
-- **Export Suggestions JSON** -- save every suggestion across all connected repos to `jules-suggestions-YYYY-MM-DD.json` (one file per account); the popup's re-download combines all accounts under `accounts`
-- **Repository filter** -- every mode can be narrowed to one repo from the dropdown or a typed `owner/repo`
+### Settings
+
+The **Settings** panel (header) holds everything you may want to tune:
+
+- **GitHub** -- owner for the open-PR check, and an optional token for private repos
+- **Timeouts** -- per request (30 s) and for listing every task (300 s; big accounts take minutes)
+- **Pacing** -- requests sent together each wait a random 0.5–2 s first; **Extra jitter** adds up to N more seconds (off, 10 s). **Parallel requests** caps how many go at once (6 per account, 12 in total). When Jules answers HTTP 429, that account pauses for as long as Jules asks
+- **Run up to N items** -- the whole run (dry and scheduled runs too) acts on at most N items; 0 means no limit
+- **Reload the Jules tab when its sign-in stops working** (on) -- when Jules rejects the tokens, the extension tries the fresh token Jules sends back, then mints one, then re-reads the page, then reloads the tab; if none works it stops that account and tells you to sign in. It never reloads a tab you have moved off Jules or to another account
+- **Default messages** -- your own default reply (Waiting on You) and retry prompt (Error); empty uses the built-in text, and **Add a message** goes after it
+- **Jules API values** -- the RPC id of each Jules method, the archive batch size and the task states. **Rediscover from Jules** reads them from the Jules web app in an open tab and applies any change (after the run in progress, if one is going); it also runs once a day. Nothing changes when the result would give two methods the same id, and both methods stay off until a rediscovery agrees or you reset the values; the panel refuses an id another method already uses. **Reset to defaults** goes back to the built-in values
+- **About** -- License & Credits
 
 ### Scheduled Operations
 
@@ -94,23 +125,28 @@
 4. Enable **Developer mode** (top right toggle)
 5. Click **Load unpacked** and select the extracted folder
 
+After you update the files of an unpacked extension, click **Reload** (↻) on its card in `chrome://extensions`. Until then Chrome keeps running the old background, and the popup refuses to run, with a banner that says so.
+
 ## Usage
 
 1. Open one or more `jules.google.com` tabs (supports multiple accounts)
 2. Click the extension icon in the toolbar
-3. Configure:
-   - **Operation** -- Archive Tasks, Start (Separate), Batch to 1 Agent, Remove, or Export JSON
-   - **GitHub Owner** -- your GitHub username (for PR checks in archive mode)
-   - **GitHub Token** -- optional, for private repos
-   - **Mode** -- Dry Run (preview) or Run (execute)
-   - **Force** -- archive every task regardless of state or open PRs (archive mode only)
-   - **Scope** -- current tab only or all Jules tabs
+3. Choose:
+   - **Items** -- All, one task state, or Suggestions. The popup remembers your choice; if that state no longer exists (Jules renumbered it), it shows **Choose an item** instead of falling back to All
+   - **Dry-run** -- on: preview only; off: make the changes
+   - **Force** -- Archive skips the open-PR check; Proceed on All also messages Completed tasks. Without Force, a repo whose open PRs can't be read from GitHub (a 404 is tried once more) keeps its tasks: they are skipped, not archived
+   - **Add a message** -- text appended to what Proceed sends
+   - **One session for all** -- Suggestions only: one session per repo
+   - **Scope** -- all Jules tabs or the current tab only
    - **Repository** -- All Repositories (default), one repo from the list, or a typed `owner/repo`
-4. Click **Start**
+   - **Settings** (header) -- GitHub, timeouts, pacing, run limit, default messages and the Jules API values (see [Settings](#settings))
+4. Click **Proceed** or **Archive**
 
-5. (Optional) In **Schedule**, enable **Auto-archive on a schedule**, set the interval in minutes, and optionally enable **Also start suggestions each tick** with a max-starts cap. Scheduled runs use normal archive safety (finished-state filter + open-PR check) — they never Force.
+5. (Optional) In **Schedule**, enable **Archive Completed tasks automatically**, set the interval in minutes, and optionally enable **Also start suggestions each run** with a max-starts cap. Scheduled runs archive Completed tasks (3, 7 and tasks without a state) with the open-PR check -- they never Force.
 
-### Start Suggestions tips
+**More Actions** (before Export) loads one category for all repos or one `org/repo`: **All** (tasks and schedules, without the archived tasks, like Jules' All tab), **Scheduled**, **Completed** or **Archived**. Typing a repo picks **Repo**. Select items, choose an action and click **Confirm**. The action list offers what Jules' own item menus offer for the shown items: **Pause session** / **Resume session** (running / paused tasks), **Copy session URL** and **Archive** (tasks; archived tasks get **Unarchive** and **Delete permanently**), **Pause schedule** / **Resume schedule** and **Delete schedule** (schedules). Only eligible items receive the action. **Copy session URL** puts the selected tasks' URLs on the clipboard, one per line. **Delete permanently** and **Delete schedule** can't be undone, so Confirm asks for a second click, from 0.5 to 10 s after the first; a double-click doesn't count. Confirm acts for real unless the panel's own **Dry run** box is checked. **Archive** skips a task with a matching open PR, as the main Archive does; **Force** skips that check. The Settings item limit applies. Unarchive checks the result and retries missing items once. Archived for one repo takes seconds. Archived for all repos lists every repo in turn, a few at a time (the Parallel per account setting), disconnected repos included, and shows "N of M repos" meanwhile. On a large account that takes minutes: about 16 for 2,084 repos at 6 in parallel. Keep the popup open until it finishes. Listing errors appear beside the counts. A task without a title shows its prompt's first line, and a completed task Jules marks for review shows as "Ready for review". Only archived tasks can be deleted, and **Delete permanently** first checks with Jules that each selected task is still archived. A Load within 30 minutes of an earlier one answers at once from what that one listed (kept per Google account, at most 20,000 items); the status says how old it is, and **Refresh** lists live again. An action, or a real run from the main panel, makes the next Load list the changed items live.
+
+### Suggestions tips
 
 - For best results, manually click "Start" on any suggestion in the Jules UI first -- the extension captures the model config and experiment IDs from that request
 - Without this capture, the extension uses sensible defaults that may differ from Jules' current configuration
@@ -185,7 +221,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## Credits
 
-Repository filtering, Remove Suggestions, Export Suggestions JSON and Batch Agent were contributed by [tommyzed](https://github.com/tommyzed/jules-task-manager) and [PaddyO84](https://github.com/PaddyO84/jules-task-manager). See `license.html` (popup footer → License & Credits).
+Repository filtering, Remove Suggestions, Export Suggestions JSON and Batch Agent were contributed by [tommyzed](https://github.com/tommyzed/jules-task-manager) and [PaddyO84](https://github.com/PaddyO84/jules-task-manager). See `license.html` (popup → License & Credits).
 
 ## License
 

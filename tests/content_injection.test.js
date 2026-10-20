@@ -178,3 +178,68 @@ describe('content.js script injection', () => {
     assert.strictEqual(scriptCreatedCount, initialCount + 1, 'Should have injected again manually')
   })
 })
+
+describe('content.js and the CreateTask RPC id', () => {
+  function load(stored) {
+    const posted = []
+    const storageListeners = []
+    let script = null
+    const chrome = {
+      runtime: { getURL: (p) => `chrome-extension://id/${p}`, onMessage: { addListener: () => {} } },
+      storage: {
+        local: { get: (_key, cb) => cb({ julesApi: stored }) },
+        onChanged: { addListener: (cb) => storageListeners.push(cb) }
+      }
+    }
+    const document = {
+      createElement: () => {
+        script = { src: '', onload: null, remove: () => {} }
+        return script
+      },
+      head: { appendChild: () => {} }
+    }
+    const window = {
+      addEventListener: () => {},
+      postMessage: (data, origin) => posted.push({ data, origin }),
+      location: { origin: 'https://jules.google.com' }
+    }
+    const sandbox = { chrome, document, window, console, setTimeout, clearTimeout, Date, Promise, URL }
+    vm.createContext(sandbox)
+    vm.runInContext(contentJsCode, sandbox, { filename: contentJsPath })
+    const ids = () => posted.filter((p) => p.data.type === 'JULES_CREATE_TASK_RPC').map((p) => [p.data.rpcId, p.origin])
+    return { script, storageListeners, ids }
+  }
+
+  it('sends the saved id once main-world.js has loaded', () => {
+    const env = load({ rpc: { CreateTask: 'Qq7Rr' } })
+    assert.deepStrictEqual(env.ids(), [], 'main-world.js is not listening yet')
+    env.script.onload()
+    assert.deepStrictEqual(env.ids(), [['Qq7Rr', 'https://jules.google.com']])
+  })
+
+  it('sends an empty id while a rediscovery has CreateTask in doubt, so none is watched', () => {
+    const env = load({ rpc: { CreateTask: 'Qq7Rr' }, inDoubt: ['Interact', 'CreateTask'] })
+    env.script.onload()
+    for (const listener of env.storageListeners) {
+      listener({ julesApi: { newValue: { rpc: { CreateTask: 'Qq7Rr' }, inDoubt: ['GetTask', 'Interact'] } } }, 'local')
+      listener({ julesApi: { newValue: { rpc: { CreateTask: 'Qq7Rr' }, inDoubt: ['CreateTask'] } } }, 'local')
+    }
+    assert.deepStrictEqual(
+      env.ids().map(([id]) => id),
+      ['', 'Qq7Rr', '']
+    )
+  })
+
+  it('sends null when nothing is saved, and every later change', () => {
+    const env = load(undefined)
+    env.script.onload()
+    for (const listener of env.storageListeners) {
+      listener({ julesApi: { newValue: { rpc: { CreateTask: 'Zz9Yy' } } } }, 'local')
+      listener({ settings: { newValue: {} } }, 'sync')
+    }
+    assert.deepStrictEqual(
+      env.ids().map(([id]) => id),
+      [null, 'Zz9Yy']
+    )
+  })
+})

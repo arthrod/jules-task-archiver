@@ -8,6 +8,10 @@ const vm = require('node:vm')
 describe('Security: ghToken Storage Cleanup', () => {
   const popupJsPath = path.join(__dirname, '../popup.js')
   const popupJs = fs.readFileSync(popupJsPath, 'utf8')
+  const itemsJsPath = path.join(__dirname, '../items.js')
+  const itemsJs = fs.readFileSync(itemsJsPath, 'utf8')
+  const settingsJsPath = path.join(__dirname, '../settings.js')
+  const settingsJs = fs.readFileSync(settingsJsPath, 'utf8')
 
   function setupPopupSandbox(initialSync = {}, initialLocal = {}) {
     const syncStorage = { ...initialSync }
@@ -60,32 +64,37 @@ describe('Security: ghToken Storage Cleanup', () => {
         }
       },
       tabs: {
-        query: () => {}
+        query: () => Promise.resolve([])
       }
     }
 
+    // Every element the popup touches on load gets the same inert stand-in.
+    const mockElement = () => ({
+      addEventListener: () => {},
+      querySelectorAll: () => [],
+      appendChild: () => {},
+      contains: () => false,
+      dataset: {},
+      classList: { toggle: () => {}, add: () => {}, remove: () => {}, contains: () => false },
+      setAttribute: () => {},
+      getAttribute: () => null,
+      removeAttribute: () => {},
+      style: {},
+      options: [],
+      parentElement: { setAttribute: () => {} }
+    })
     const document = {
-      querySelector: () => ({
-        addEventListener: () => {},
-        querySelectorAll: () => [],
-        appendChild: () => {},
-        dataset: {},
-        classList: { toggle: () => {} },
-        setAttribute: () => {},
-        removeAttribute: () => {},
-        style: {},
-        parentElement: {}
-      }),
-      querySelectorAll: () => ({
-        forEach: () => {}
-      }),
-      createElement: () => ({
-        appendChild: () => {}
-      })
+      querySelector: mockElement,
+      querySelectorAll: () => [],
+      createElement: mockElement,
+      createDocumentFragment: mockElement,
+      addEventListener: () => {}
     }
 
-    const sandbox = { chrome, document, console, setTimeout, setInterval, clearInterval }
+    const sandbox = { chrome, document, console, setTimeout, clearTimeout, setInterval, clearInterval }
     vm.createContext(sandbox)
+    vm.runInContext(itemsJs, sandbox, { filename: itemsJsPath })
+    vm.runInContext(settingsJs, sandbox, { filename: settingsJsPath })
 
     return { sandbox, syncStorage, localStorage, syncRemoved, syncSet, localSet }
   }
@@ -103,7 +112,7 @@ describe('Security: ghToken Storage Cleanup', () => {
     assert.ok(syncRemoved.includes('ghToken'), "sync.remove('ghToken') should have been called")
   })
 
-  it('should ensure startBtn click handler removes ghToken from sync', async () => {
+  it('should ensure the run handler removes ghToken from sync', async () => {
     // This is harder to test without a full DOM mock, but we can verify the code intent
     assert.ok(
       popupJs.includes("chrome.storage.sync.remove('ghToken')"),
@@ -118,6 +127,8 @@ const bgScriptPath = path.join(__dirname, '..', 'background.js')
 const utilsScriptPath = path.join(__dirname, '..', 'utils.js')
 const bgScriptContent = fs.readFileSync(bgScriptPath, 'utf8')
 const utilsScriptContent = fs.readFileSync(utilsScriptPath, 'utf8')
+const itemsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'items.js'), 'utf8')
+const settingsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8')
 
 function setupEnvironment(initialTabs = {}) {
   const onMessageListeners = []
@@ -177,15 +188,21 @@ function setupEnvironment(initialTabs = {}) {
 
   vm.createContext(sandbox)
 
-  const scriptContent =
-    utilsScriptContent +
-    bgScriptContent +
-    `
+  for (const [source, filename] of [
+    [utilsScriptContent, utilsScriptPath],
+    [itemsScriptContent, path.join(__dirname, '..', 'items.js')],
+    [settingsScriptContent, path.join(__dirname, '..', 'settings.js')],
+    [bgScriptContent, bgScriptPath]
+  ])
+    vm.runInContext(source, sandbox, { filename })
+
+  const scriptContent = `
     globalThis.test_ensureContentScript = ensureContentScript;
     globalThis.test_JULES_ORIGIN = JULES_ORIGIN;
   `
 
-  vm.runInContext(scriptContent, sandbox, { filename: bgScriptPath })
+  vm.runInContext(scriptContent, sandbox, { filename: path.join(__dirname, 'security-hooks.js') })
+  sandbox.burstDelayMs = () => 0 // no pacing waits in tests
   return { sandbox, chromeMock, onMessageListeners }
 }
 
