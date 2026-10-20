@@ -123,7 +123,8 @@ describe('normalizeJulesApi', () => {
       archiveBatch: 50,
       archiveSplit: 10,
       states: null,
-      checkedAt: null
+      checkedAt: null,
+      inDoubt: []
     })
   })
 
@@ -132,6 +133,26 @@ describe('normalizeJulesApi', () => {
     assert.strictEqual(api.rpc.ListTasks, 'p1Takd')
     assert.strictEqual(api.rpc.ArchiveTasks, 'Zz9Yy')
     assert.strictEqual(api.rpc.GetTask, 'n74qPd')
+  })
+
+  it('has a different built-in id for every method', () => {
+    const ids = Object.values(JULES_RPC_DEFAULTS)
+    assert.strictEqual(new Set(ids).size, ids.length)
+  })
+
+  it('goes back to the built-in ids when two methods share one', () => {
+    // Delete permanently would send Archive's request, or Archive would delete.
+    const api = normalizeJulesApi({ rpc: { ...JULES_RPC_DEFAULTS, GetTask: 'Ab12C', DeleteTasks: 'Tjmm5c' } })
+    assert.deepStrictEqual(plain(api.rpc), JULES_RPC_DEFAULTS)
+    // A malformed id falls back to its built-in one, which another method may hold.
+    const fallback = normalizeJulesApi({ rpc: { ListTasks: 'Tjmm5c', ArchiveTasks: 'x', GetTask: 'Ab12C' } })
+    assert.deepStrictEqual(plain(fallback.rpc), JULES_RPC_DEFAULTS)
+  })
+
+  it('keeps only known methods in doubt, once each', () => {
+    const api = normalizeJulesApi({ inDoubt: ['DeleteTasks', 'Nope', 'DeleteTasks', 3, 'toString'] })
+    assert.deepStrictEqual(plain(api.inDoubt), ['DeleteTasks'])
+    assert.deepStrictEqual(plain(normalizeJulesApi({ inDoubt: 'DeleteTasks' }).inDoubt), [])
   })
 
   it('never lets the fallback chunk exceed the batch', () => {
@@ -197,15 +218,52 @@ describe('applyDiscovery', () => {
   })
 
   it('changes nothing when most RPCs are missing (the bundle changed shape)', () => {
-    const current = { rpc: { ListTasks: 'Keep1' } }
+    const current = { rpc: { ListTasks: 'Keep1' }, inDoubt: ['DeleteTasks'] }
     const { api, changes, problems } = applyDiscovery(
       current,
       live({ rpc: [['Zz9Yy', 'SweBotService.ListTasks']] }),
       TASK_STATES
     )
     assert.strictEqual(api.rpc.ListTasks, 'Keep1')
+    assert.deepStrictEqual(plain(api.inDoubt), ['DeleteTasks'], 'a bundle it could not read settles no doubt')
     assert.deepStrictEqual(changes, [])
-    assert.match(problems[0], /didn't look as expected \(found 1 of 15 RPCs\); nothing changed/)
+    assert.match(problems[0], /didn't look as expected \(found 1 of 16 RPCs\); nothing changed/)
+  })
+
+  // A method the bundle no longer names would keep its id while another takes it.
+  const sharing = (missing, taker, id) =>
+    LIVE_RPC.filter(([, m]) => m !== `SweBotService.${missing}`).map(([old, m]) =>
+      m === `SweBotService.${taker}` ? [id, m] : [old, m]
+    )
+  const custom = {
+    rpc: { ...JULES_RPC_DEFAULTS, ListScheduledTasks: 'Cc33D' },
+    archiveBatch: 20,
+    archiveSplit: 5,
+    states: [{ code: 13, name: 'Waiting on You', kind: 'feedback' }],
+    checkedAt: 1,
+    inDoubt: []
+  }
+
+  it('changes nothing and puts both methods in doubt when it would give them one id', () => {
+    const rpc = sharing('ArchiveTasks', 'DeleteTasks', 'Tjmm5c')
+    const { api, changes, problems } = applyDiscovery(custom, live({ rpc }), TASK_STATES)
+    assert.deepStrictEqual(plain(api), { ...custom, inDoubt: ['ArchiveTasks', 'DeleteTasks'] })
+    assert.deepStrictEqual(changes, [])
+    assert.deepStrictEqual(problems, [
+      'ArchiveTasks and DeleteTasks would share Tjmm5c; nothing changed, and both stay off until a rediscovery agrees or you reset the values.'
+    ])
+  })
+
+  it('catches any two methods sharing an id, not only Archive and Delete', () => {
+    const rpc = sharing('Interact', 'GetTask', 'SLmX6')
+    const { api, problems } = applyDiscovery(custom, live({ rpc }), TASK_STATES)
+    assert.deepStrictEqual(plain(api), { ...custom, inDoubt: ['GetTask', 'Interact'] })
+    assert.match(problems[0], /^GetTask and Interact would share SLmX6; nothing changed/)
+  })
+
+  it('a rediscovery that agrees takes the doubt back', () => {
+    const { api } = applyDiscovery({ inDoubt: ['ArchiveTasks', 'DeleteTasks'] }, live(), TASK_STATES)
+    assert.deepStrictEqual(plain(api.inDoubt), [])
   })
 
   it('follows renumbered states and reports a state Jules added', () => {
@@ -245,6 +303,7 @@ describe('More Actions protocol', () => {
       PauseScheduledTask: 'gBUOb',
       ResumeScheduledTask: 'XuzQWe',
       DeleteScheduledTask: 'sL8twb',
+      DeleteTasks: 'rist8',
       PauseTask: 'tqq5v'
     })) {
       assert.strictEqual(JULES_RPC_DEFAULTS[method], id)

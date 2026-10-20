@@ -110,8 +110,13 @@ chrome.storage?.onChanged?.addListener((changes, area) => {
   }
 })
 
-// The RPC id Jules uses today for a SweBotService method (see settings.js).
+// The RPC id Jules uses today for a SweBotService method (see settings.js). A
+// method a rediscovery put in doubt may hold another method's id, so it is
+// never sent.
 function rpc(method) {
+  if (julesApi.inDoubt.includes(method)) {
+    throw new Error(`Jules' ${method} id is in doubt: Rediscover from Jules or Reset to defaults in Settings first.`)
+  }
   return julesApi.rpc[method]
 }
 
@@ -3174,6 +3179,12 @@ async function executeMoreBatches(label, items, config, unarchive) {
   return acted.filter((item) => !failed.has(item))
 }
 
+// DeleteTasks takes a list of ids; Jules' own Delete permanently sends one.
+// The other per-item RPCs take the id alone.
+function moreActionPayload(operation, item) {
+  return operation === 'deleteTask' ? [[item.id]] : [item.id]
+}
+
 // The items Jules doesn't list among the non-archived tasks, or null when
 // the list can't be read.
 async function stillArchived(label, items, config) {
@@ -3245,7 +3256,11 @@ async function startMoreOperation(msg) {
               acted = []
               for (const item of work) {
                 try {
-                  await callBatchExecute(rpc(MORE_ACTIONS[msg.operation].method), [item.id], prepared.config)
+                  await callBatchExecute(
+                    rpc(MORE_ACTIONS[msg.operation].method),
+                    moreActionPayload(msg.operation, item),
+                    prepared.config
+                  )
                   acted.push(item)
                 } catch (e) {
                   addLog(`ERROR [${account}] [${item.id}]: ${e.message}`)

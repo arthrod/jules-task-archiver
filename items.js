@@ -106,16 +106,18 @@ function itemIncludesTask(item, task) {
 
 // Shared eligibility keeps the action counts and the worker's checks in step.
 // The order and the words are those of Jules' item menus (2026-10-19); its
-// Update schedule is not here yet. A local action runs in the popup only.
+// Update schedule is not here yet. A local action runs in the popup only; a
+// destructive one can't be undone, so the popup asks twice.
 const MORE_ACTIONS = {
   pauseTask: { label: 'Pause session', method: 'PauseTask' },
   resumeTask: { label: 'Resume session', method: 'ResumeTask' },
   copyUrl: { label: 'Copy session URL', local: true },
   archive: { label: 'Archive', method: 'ArchiveTasks' },
   unarchive: { label: 'Unarchive', method: 'ArchiveTasks' },
+  deleteTask: { label: 'Delete permanently', method: 'DeleteTasks', destructive: true },
   pauseSchedule: { label: 'Pause schedule', method: 'PauseScheduledTask' },
   resumeSchedule: { label: 'Resume schedule', method: 'ResumeScheduledTask' },
-  deleteSchedule: { label: 'Delete schedule', method: 'DeleteScheduledTask' }
+  deleteSchedule: { label: 'Delete schedule', method: 'DeleteScheduledTask', destructive: true }
 }
 
 // The URL Jules' own Copy session URL gives (bundle, 2026-10-19): /task/<id>,
@@ -136,6 +138,7 @@ function moreActionFits(action, item) {
     case 'archive':
       return item.kind === 'task'
     case 'unarchive':
+    case 'deleteTask':
       return item.kind === 'archived'
     case 'pauseTask':
       return item.kind === 'task' && taskStateFor(item)?.kind === 'running'

@@ -5245,7 +5245,8 @@ describe('More Actions background', () => {
     ['resumeTask', 'task', 'paused', 'wk4vKd', ['paused']],
     ['pauseSchedule', 'schedule', 'active', 'gBUOb', ['active']],
     ['resumeSchedule', 'schedule', 'inactive', 'XuzQWe', ['inactive']],
-    ['deleteSchedule', 'schedule', 'active', 'sL8twb', ['active']]
+    ['deleteSchedule', 'schedule', 'active', 'sL8twb', ['active']],
+    ['deleteTask', 'archived', 'archived', 'rist8', [['archived']]]
   ]) {
     it(`APPLY_ACTION ${action} sends the exact RPC payload to the selected account`, async () => {
       const env = setupMoreEnvironment()
@@ -5256,9 +5257,10 @@ describe('More Actions background', () => {
       const mutations = env.calls.filter((call) => call.rpc !== 'p1Takd')
       assert.ok(mutations.length >= 1)
       for (const call of mutations) assert.deepStrictEqual(call, { rpc, payload, account: '2' })
-      assert.ok(
-        env.calls.every((call) => call.rpc !== 'rist8'),
-        'tasks are never deleted'
+      assert.strictEqual(
+        env.calls.some((call) => call.rpc === 'rist8'),
+        action === 'deleteTask',
+        'only Delete permanently deletes a task'
       )
       assert.strictEqual(
         env.calls.some((call) => call.rpc === 'sL8twb'),
@@ -5865,6 +5867,70 @@ describe('More Actions Delete schedule and Copy session URL', () => {
     env.calls.length = 0
     await env.apply('pauseSchedule', [{ account: 'u/1', kind: 'schedule', id: 'active' }])
     assert.deepStrictEqual(env.calls, [])
+  })
+
+  it('Delete permanently sends one archived task per request and drops each from the load', async () => {
+    const env = setupMoreEnvironment()
+    const original = env.sandbox.callBatchExecute
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && archivedFilter(payload[0]) && payload[0].includes('Org/Repo')) {
+        return [
+          [
+            ['a1', 'One', null, null, 'github/Org/Repo', 3],
+            ['a2', 'Two', null, null, 'github/Org/Repo', 3]
+          ]
+        ]
+      }
+      return original(rpc, payload, config)
+    }
+    await env.loadArchived((await env.load('', 'archive')).loadId)
+    env.calls.length = 0
+    const pick = ['a1', 'a2'].map((id) => ({ account: 'u/1', kind: 'archived', id }))
+    await env.apply('deleteTask', pick)
+    assert.deepStrictEqual(
+      Array.from(env.calls, (call) => JSON.stringify([call.rpc, call.payload, call.account])),
+      ['["rist8",[["a1"]],"1"]', '["rist8",[["a2"]],"1"]']
+    )
+    env.calls.length = 0
+    await env.apply('unarchive', pick)
+    assert.deepStrictEqual(env.calls, [], 'a deleted task is no longer in the load')
+  })
+
+  it('Delete permanently fits only archived tasks', async () => {
+    const env = setupMoreEnvironment()
+    await env.load('', 'all')
+    env.calls.length = 0
+    await env.apply('deleteTask', [{ account: 'u/1', kind: 'task', id: 'completed' }])
+    assert.deepStrictEqual(env.calls, [])
+  })
+
+  it('sends nothing for the methods a rediscovery put in doubt', async () => {
+    const env = setupMoreEnvironment()
+    await env.loadAll()
+    // The bundle gave Tjmm5c to DeleteTasks while ArchiveTasks kept it (settings.js applyDiscovery).
+    for (const listener of env.storageChangeListeners) {
+      listener({ julesApi: { newValue: { inDoubt: ['ArchiveTasks', 'DeleteTasks'] } } }, 'local')
+    }
+    for (const [action, kind, id] of [
+      ['deleteTask', 'archived', 'archived'],
+      ['unarchive', 'archived', 'archived'],
+      ['archive', 'task', 'completed']
+    ]) {
+      env.calls.length = 0
+      await env.apply(action, [{ account: 'u/2', kind, id }], false, true)
+      assert.deepStrictEqual(
+        env.calls.filter((call) => call.rpc !== 'p1Takd'),
+        [],
+        `${action} sends nothing`
+      )
+      assert.match(env.sandbox.test_state().log.join('\n'), /(ArchiveTasks|DeleteTasks) id is in doubt/)
+    }
+    env.calls.length = 0
+    await env.apply('pauseSchedule', [{ account: 'u/2', kind: 'schedule', id: 'active' }])
+    assert.ok(
+      env.calls.some((call) => call.rpc === 'gBUOb'),
+      'the other methods still work'
+    )
   })
 
   it('refuses Copy session URL: it runs in the popup', async () => {
