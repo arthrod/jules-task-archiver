@@ -5244,7 +5244,8 @@ describe('More Actions background', () => {
     ['pauseTask', 'task', 'running', 'tqq5v', ['running']],
     ['resumeTask', 'task', 'paused', 'wk4vKd', ['paused']],
     ['pauseSchedule', 'schedule', 'active', 'gBUOb', ['active']],
-    ['resumeSchedule', 'schedule', 'inactive', 'XuzQWe', ['inactive']]
+    ['resumeSchedule', 'schedule', 'inactive', 'XuzQWe', ['inactive']],
+    ['deleteSchedule', 'schedule', 'active', 'sL8twb', ['active']]
   ]) {
     it(`APPLY_ACTION ${action} sends the exact RPC payload to the selected account`, async () => {
       const env = setupMoreEnvironment()
@@ -5255,7 +5256,15 @@ describe('More Actions background', () => {
       const mutations = env.calls.filter((call) => call.rpc !== 'p1Takd')
       assert.ok(mutations.length >= 1)
       for (const call of mutations) assert.deepStrictEqual(call, { rpc, payload, account: '2' })
-      assert.ok(env.calls.every((call) => !['rist8', 'sL8twb'].includes(call.rpc)))
+      assert.ok(
+        env.calls.every((call) => call.rpc !== 'rist8'),
+        'tasks are never deleted'
+      )
+      assert.strictEqual(
+        env.calls.some((call) => call.rpc === 'sL8twb'),
+        action === 'deleteSchedule',
+        'only Delete schedule deletes a schedule'
+      )
       assert.strictEqual(env.sandbox.test_state().status, 'done')
       assert.match(env.sandbox.test_state().log.join('\n'), new RegExp(id))
       assert.match(env.sandbox.test_state().log.join('\n'), /SUMMARY/)
@@ -5831,6 +5840,40 @@ describe('More Actions load choices', () => {
       repo: 'org/repo',
       awaitingReview: true
     })
+  })
+})
+
+describe('More Actions Delete schedule and Copy session URL', () => {
+  it('a Delete schedule dry run sends nothing, and the schedule can still be acted on', async () => {
+    const env = setupMoreEnvironment()
+    await env.load('', 'scheduled')
+    env.calls.length = 0
+    await env.apply('deleteSchedule', [{ account: 'u/1', kind: 'schedule', id: 'active' }], true)
+    assert.deepStrictEqual(env.calls, [])
+    assert.match(env.sandbox.test_state().log.join('\n'), /DRY RUN - would Delete schedule \[u\/1\] \[active\]/)
+    await env.apply('pauseSchedule', [{ account: 'u/1', kind: 'schedule', id: 'active' }])
+    assert.deepStrictEqual(
+      Array.from(env.calls, (call) => call.rpc),
+      ['gBUOb']
+    )
+  })
+
+  it('a deleted schedule leaves the load: no second action reaches it', async () => {
+    const env = setupMoreEnvironment()
+    await env.load('', 'scheduled')
+    await env.apply('deleteSchedule', [{ account: 'u/1', kind: 'schedule', id: 'active' }])
+    env.calls.length = 0
+    await env.apply('pauseSchedule', [{ account: 'u/1', kind: 'schedule', id: 'active' }])
+    assert.deepStrictEqual(env.calls, [])
+  })
+
+  it('refuses Copy session URL: it runs in the popup', async () => {
+    const env = setupMoreEnvironment()
+    await env.load('', 'complete')
+    env.calls.length = 0
+    const reply = await env.apply('copyUrl', [{ account: 'u/1', kind: 'task', id: 'completed' }])
+    assert.match(reply.error, /Copy session URL runs in the popup/)
+    assert.deepStrictEqual(env.calls, [])
   })
 })
 

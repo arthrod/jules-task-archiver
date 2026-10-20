@@ -2891,6 +2891,7 @@ function moreMessageProblem(msg) {
     if (typeof msg.loadId !== 'string') return 'Invalid load id.'
   } else {
     if (!Object.hasOwn(MORE_ACTIONS, msg.operation)) return `Unknown action "${msg.operation}"`
+    if (MORE_ACTIONS[msg.operation].local) return `${MORE_ACTIONS[msg.operation].label} runs in the popup.`
     if (typeof msg.dryRun !== 'boolean' || typeof msg.force !== 'boolean' || !Array.isArray(msg.items)) {
       return 'Invalid action options.'
     }

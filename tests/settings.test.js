@@ -205,7 +205,7 @@ describe('applyDiscovery', () => {
     )
     assert.strictEqual(api.rpc.ListTasks, 'Keep1')
     assert.deepStrictEqual(changes, [])
-    assert.match(problems[0], /didn't look as expected \(found 1 of 14 RPCs\); nothing changed/)
+    assert.match(problems[0], /didn't look as expected \(found 1 of 15 RPCs\); nothing changed/)
   })
 
   it('follows renumbered states and reports a state Jules added', () => {
@@ -244,6 +244,7 @@ describe('More Actions protocol', () => {
       ListScheduledTasks: 'hvmRxc',
       PauseScheduledTask: 'gBUOb',
       ResumeScheduledTask: 'XuzQWe',
+      DeleteScheduledTask: 'sL8twb',
       PauseTask: 'tqq5v'
     })) {
       assert.strictEqual(JULES_RPC_DEFAULTS[method], id)

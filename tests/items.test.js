@@ -171,19 +171,47 @@ describe('setTaskStates', () => {
 })
 
 describe('More Actions eligibility', () => {
-  const { MORE_ACTIONS, moreActionFits, moreItemKey } = require('../items.js')
+  const { MORE_ACTIONS, moreActionFits, moreItemKey, moreSessionUrl } = require('../items.js')
+
+  it("lists the actions in Jules' order, with Jules' words", () => {
+    assert.deepStrictEqual(
+      Object.values(MORE_ACTIONS).map((action) => action.label),
+      [
+        'Pause session',
+        'Resume session',
+        'Copy session URL',
+        'Archive',
+        'Unarchive',
+        'Pause schedule',
+        'Resume schedule',
+        'Delete schedule'
+      ]
+    )
+    assert.deepStrictEqual(
+      Object.keys(MORE_ACTIONS).filter((action) => MORE_ACTIONS[action].local),
+      ['copyUrl'],
+      'only Copy session URL runs in the popup'
+    )
+    assert.strictEqual(MORE_ACTIONS.deleteSchedule.method, 'DeleteScheduledTask')
+  })
+
+  it("builds a task's URL as Jules' Copy session URL does", () => {
+    assert.strictEqual(moreSessionUrl({ account: 'u/1', id: '123456789' }), 'https://jules.google.com/task/123456789')
+  })
 
   it('fits every action only to the supported kind and state', () => {
     for (const kind of ['task', 'archived', 'schedule', 'unknown']) {
       for (const state of [null, 0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 99]) {
         const item = { kind, state }
         const expected = {
-          archive: kind === 'task',
-          unarchive: kind === 'archived',
           pauseTask: kind === 'task' && [1, 2, 9, 11].includes(state),
           resumeTask: kind === 'task' && state === 8,
+          copyUrl: kind === 'task' || kind === 'archived',
+          archive: kind === 'task',
+          unarchive: kind === 'archived',
           pauseSchedule: kind === 'schedule' && state === 2,
-          resumeSchedule: kind === 'schedule' && state === 3
+          resumeSchedule: kind === 'schedule' && state === 3,
+          deleteSchedule: kind === 'schedule'
         }
         for (const action of Object.keys(MORE_ACTIONS)) {
           assert.strictEqual(moreActionFits(action, item), expected[action], `${action}, ${kind}, ${state}`)

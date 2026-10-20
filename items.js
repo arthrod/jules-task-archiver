@@ -105,13 +105,23 @@ function itemIncludesTask(item, task) {
 }
 
 // Shared eligibility keeps the action counts and the worker's checks in step.
+// The order and the words are those of Jules' item menus (2026-10-19); its
+// Update schedule is not here yet. A local action runs in the popup only.
 const MORE_ACTIONS = {
+  pauseTask: { label: 'Pause session', method: 'PauseTask' },
+  resumeTask: { label: 'Resume session', method: 'ResumeTask' },
+  copyUrl: { label: 'Copy session URL', local: true },
   archive: { label: 'Archive', method: 'ArchiveTasks' },
   unarchive: { label: 'Unarchive', method: 'ArchiveTasks' },
-  pauseTask: { label: 'Pause task', method: 'PauseTask' },
-  resumeTask: { label: 'Resume task', method: 'ResumeTask' },
   pauseSchedule: { label: 'Pause schedule', method: 'PauseScheduledTask' },
-  resumeSchedule: { label: 'Resume schedule', method: 'ResumeScheduledTask' }
+  resumeSchedule: { label: 'Resume schedule', method: 'ResumeScheduledTask' },
+  deleteSchedule: { label: 'Delete schedule', method: 'DeleteScheduledTask' }
+}
+
+// The URL Jules' own Copy session URL gives (bundle, 2026-10-19): /task/<id>,
+// with no account in it.
+function moreSessionUrl(item) {
+  return `https://jules.google.com/task/${item.id}`
 }
 
 function moreItemKey(item) {
@@ -121,6 +131,8 @@ function moreItemKey(item) {
 function moreActionFits(action, item) {
   if (!item) return false
   switch (action) {
+    case 'copyUrl':
+      return item.kind === 'task' || item.kind === 'archived'
     case 'archive':
       return item.kind === 'task'
     case 'unarchive':
@@ -133,6 +145,8 @@ function moreActionFits(action, item) {
       return item.kind === 'schedule' && item.state === 2
     case 'resumeSchedule':
       return item.kind === 'schedule' && item.state === 3
+    case 'deleteSchedule':
+      return item.kind === 'schedule'
     default:
       return false
   }
@@ -143,6 +157,7 @@ if (typeof module !== 'undefined') {
     MORE_ACTIONS,
     moreItemKey,
     moreActionFits,
+    moreSessionUrl,
     TASK_STATES,
     NO_STATE_CODE,
     ITEM_ALL,
