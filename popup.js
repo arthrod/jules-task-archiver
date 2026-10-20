@@ -95,6 +95,8 @@ let moreLoadedCategory = null
 // 'done' or 'failed'.
 let moreLoadId = null
 let moreArchived = 'none'
+// How many repos the worker's All-repos archived listing has done: { done, total }.
+let moreArchivedRepos = null
 let moreNotes = []
 
 // Storage-side bounds match background.js; the background re-validates anyway,
@@ -1116,7 +1118,9 @@ function moreItemsFrom(accounts) {
 function renderMoreStatus() {
   const count = (kind) => loadedMoreItems.filter((item) => item.kind === kind).length
   const archived = {
-    loading: 'Listing the archived tasks…',
+    loading: moreArchivedRepos
+      ? `Listing the archived tasks… ${moreArchivedRepos.done} of ${moreArchivedRepos.total} repos`
+      : 'Listing the archived tasks…',
     done: `${count('archived')} archived tasks`,
     failed: '',
     none: ''
@@ -1149,7 +1153,7 @@ async function loadMoreArchived(loadId) {
   } else {
     moreArchived = 'done'
     loadedMoreItems.push(...moreItemsFrom(reply.accounts))
-    moreNotes.push(...reply.accounts.flatMap((account) => account.notes || []))
+    moreNotes.push(...(reply.notes || []), ...reply.accounts.flatMap((account) => account.notes || []))
   }
   renderMoreStatus()
   renderMoreItems()
@@ -1178,8 +1182,9 @@ moreLoad.addEventListener('click', async () => {
     moreLoadId = response.loadId
     moreLoadedCategory = category
     moreArchived = category === 'archive' ? 'loading' : 'none'
+    moreArchivedRepos = null
     loadedMoreItems = moreItemsFrom(response.accounts)
-    moreNotes = response.accounts.flatMap((account) => account.notes || [])
+    moreNotes = [...(response.notes || []), ...response.accounts.flatMap((account) => account.notes || [])]
     selectedMoreItems = new Set()
     moreCategory = 'all'
     renderMoreStatus()
@@ -1262,6 +1267,14 @@ resetBtn.addEventListener('click', () => {
   // Move focus back to the primary action so keyboard users are not stranded
   // on the now-hidden Reset button.
   proceedBtn.focus()
+})
+
+// The worker saves its count while it lists every repo's archived tasks.
+chrome.storage.onChanged.addListener((changes, area) => {
+  const progress = changes.moreArchivedProgress?.newValue
+  if (area !== 'session' || !progress || progress.loadId !== moreLoadId || moreArchived !== 'loading') return
+  moreArchivedRepos = { done: progress.done, total: progress.total }
+  renderMoreStatus()
 })
 
 // --- Listen for state changes ---
