@@ -133,6 +133,8 @@ After you update the files of an unpacked extension, click **Reload** (↻) on i
 
 5. (Optional) In **Schedule**, enable **Archive Completed tasks automatically**, set the interval in minutes, and optionally enable **Also start suggestions each run** with a max-starts cap. Scheduled runs archive Completed tasks (3, 7 and tasks without a state) with the open-PR check -- they never Force.
 
+**More Actions** (before Export) loads one category for all repos or one `org/repo`: **All** (tasks and schedules, without the archived tasks, like Jules' All tab), **Scheduled**, **Completed** or **Archived**. Typing a repo picks **Repo**. Select items, choose an action and click **Confirm**. Only eligible items receive the action. Confirm acts for real unless the panel's own **Dry run** box is checked. **Archive** skips a task with a matching open PR, as the main Archive does; **Force** skips that check. The Settings item limit applies. Unarchive checks the result and retries missing items once. Archived for one repo takes seconds; Archived for all repos can take about 90 s on a large archive, and Jules may then give up. Listing errors appear beside the counts. A task without a title shows its prompt's first line, and a completed task Jules marks for review shows as "Ready for review". There is no delete action.
+
 ### Suggestions tips
 
 - For best results, manually click "Start" on any suggestion in the Jules UI first -- the extension captures the model config and experiment IDs from that request

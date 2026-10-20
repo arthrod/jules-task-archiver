@@ -978,3 +978,66 @@ button.sb:hover {
   border-color: var(--faint);
   color: var(--muted);
 }
+
+/* More Actions keeps the item list inside the popup. */
+.more-scope {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+#moreRepo {
+  width: 125px;
+}
+.more-chips {
+  border: 0;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.more-chip {
+  font: inherit;
+  font-size: 11px;
+  border: 1px solid var(--faint);
+  border-radius: 4px;
+  padding: 4px 7px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.more-chip[aria-pressed="true"] {
+  background: var(--mark);
+  color: var(--mark-text);
+}
+#moreList {
+  max-height: 240px;
+  overflow-y: auto;
+}
+.more-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+.more-text {
+  min-width: 0;
+  flex: 1;
+}
+.more-title,
+.more-meta {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.more-meta {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+#moreAction {
+  flex: 1;
+  min-width: 0;
+}

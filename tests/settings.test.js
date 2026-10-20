@@ -1,6 +1,7 @@
 const { describe, it } = require('node:test')
 const assert = require('node:assert')
 const {
+  RUN_PROTOCOL,
   DEFAULT_SETTINGS,
   JULES_RPC_DEFAULTS,
   normalizeSettings,
@@ -204,7 +205,7 @@ describe('applyDiscovery', () => {
     )
     assert.strictEqual(api.rpc.ListTasks, 'Keep1')
     assert.deepStrictEqual(changes, [])
-    assert.match(problems[0], /didn't look as expected \(found 1 of 10 RPCs\); nothing changed/)
+    assert.match(problems[0], /didn't look as expected \(found 1 of 14 RPCs\); nothing changed/)
   })
 
   it('follows renumbered states and reports a state Jules added', () => {
@@ -233,5 +234,31 @@ describe('applyDiscovery', () => {
     const { api, problems } = applyDiscovery(null, live({ stateMaps: [ROW25_MAP] }), TASK_STATES)
     assert.strictEqual(api.states, null)
     assert.ok(problems.includes('Task state map not found; keeping the current states.'))
+  })
+})
+
+describe('More Actions protocol', () => {
+  it('requires protocol 5 and exposes rediscoverable action methods', () => {
+    assert.strictEqual(RUN_PROTOCOL, 5)
+    for (const [method, id] of Object.entries({
+      ListScheduledTasks: 'hvmRxc',
+      PauseScheduledTask: 'gBUOb',
+      ResumeScheduledTask: 'XuzQWe',
+      PauseTask: 'tqq5v'
+    })) {
+      assert.strictEqual(JULES_RPC_DEFAULTS[method], id)
+      const { api, changes } = applyDiscovery(
+        null,
+        live({
+          rpc: [
+            ...LIVE_RPC.filter(([, name]) => name !== `SweBotService.${method}`),
+            ['Ab12C', `SweBotService.${method}`]
+          ]
+        }),
+        TASK_STATES
+      )
+      assert.strictEqual(api.rpc[method], 'Ab12C')
+      assert.ok(changes.some((change) => change.startsWith(`${method}:`)))
+    }
   })
 })

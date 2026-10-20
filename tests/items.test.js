@@ -169,3 +169,40 @@ describe('setTaskStates', () => {
     }
   })
 })
+
+describe('More Actions eligibility', () => {
+  const { MORE_ACTIONS, moreActionFits, moreItemKey } = require('../items.js')
+
+  it('fits every action only to the supported kind and state', () => {
+    for (const kind of ['task', 'archived', 'schedule', 'unknown']) {
+      for (const state of [null, 0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 99]) {
+        const item = { kind, state }
+        const expected = {
+          archive: kind === 'task',
+          unarchive: kind === 'archived',
+          pauseTask: kind === 'task' && [1, 2, 9, 11].includes(state),
+          resumeTask: kind === 'task' && state === 8,
+          pauseSchedule: kind === 'schedule' && state === 2,
+          resumeSchedule: kind === 'schedule' && state === 3
+        }
+        for (const action of Object.keys(MORE_ACTIONS)) {
+          assert.strictEqual(moreActionFits(action, item), expected[action], `${action}, ${kind}, ${state}`)
+        }
+      }
+    }
+    assert.strictEqual(moreActionFits('delete', { kind: 'task', state: 2 }), false)
+    assert.strictEqual(moreActionFits('archive', null), false)
+  })
+
+  it('uses rediscovered task states and keeps item identities distinct', () => {
+    try {
+      setTaskStates([{ code: 42, name: 'Working', kind: 'running' }])
+      assert.strictEqual(moreActionFits('pauseTask', { kind: 'task', state: 42 }), true)
+    } finally {
+      setTaskStates(null)
+    }
+    const item = { account: 'u/1', kind: 'task', id: 'same' }
+    assert.notStrictEqual(moreItemKey(item), moreItemKey({ ...item, account: 'u/2' }))
+    assert.notStrictEqual(moreItemKey(item), moreItemKey({ ...item, kind: 'schedule' }))
+  })
+})
