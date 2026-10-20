@@ -223,6 +223,9 @@ describe('main-world.js', () => {
     assert.deepStrictEqual(startMsg.data.config.experimentIds, ['exp1', 'exp2'])
     assert.deepStrictEqual(startMsg.data.config.featureFlags, ['flag1'])
     assert.strictEqual(startMsg.data.config.capturedAt, 1234567890)
+    // The tag tells content.js the message is from this observer, not from an
+    // older one still installed on a page opened before an update.
+    assert.strictEqual(startMsg.data.observer, 3)
   })
 
   it('captures the start config from fetch(Request), reading a clone before the page sends it', async () => {

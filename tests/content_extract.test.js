@@ -234,7 +234,7 @@ describe('content.js Message Listeners', () => {
     const sandbox = setupEnvironment()
     const startConfig = { modelConfig: { foo: 'bar' }, experimentIds: [1, 2] }
 
-    sandbox.fireMessage({ type: 'JULES_START_CONFIG', config: startConfig })
+    sandbox.fireMessage({ type: 'JULES_START_CONFIG', observer: 3, config: startConfig })
 
     const sent = sandbox.getSentMessages()
     assert.strictEqual(sent.length, 1)
@@ -244,9 +244,18 @@ describe('content.js Message Listeners', () => {
     })
   })
 
+  it('ignores a JULES_START_CONFIG from an older observer still on the page', () => {
+    // Observers 1 and 2 posted no tag; version 2 posted the first RPC of any
+    // request, so its config may not be a CreateTask payload at all.
+    const sandbox = setupEnvironment()
+    sandbox.fireMessage({ type: 'JULES_START_CONFIG', config: { modelConfig: ['other rpc'] } })
+    sandbox.fireMessage({ type: 'JULES_START_CONFIG', observer: 2, config: { modelConfig: ['other rpc'] } })
+    assert.strictEqual(sandbox.getSentMessages().length, 0)
+  })
+
   it('should ignore untrusted JULES_START_CONFIG messages', () => {
     const sandbox = setupEnvironment()
-    sandbox.fireMessage({ type: 'JULES_START_CONFIG', config: { bad: 1 } }, 'https://evil.com')
+    sandbox.fireMessage({ type: 'JULES_START_CONFIG', observer: 3, config: { bad: 1 } }, 'https://evil.com')
     assert.strictEqual(sandbox.getSentMessages().length, 0)
   })
 

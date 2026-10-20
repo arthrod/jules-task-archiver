@@ -168,6 +168,26 @@ describe('setTaskStates', () => {
       setTaskStates(null)
     }
   })
+
+  it('lists a task without a state under the Completed code a rediscovery found', () => {
+    // Jules renumbered Completed to 13 and gave 3 to another state.
+    const states = [
+      { code: 12, name: 'Waiting on You', kind: 'feedback' },
+      { code: 3, name: 'Planning', kind: 'running' },
+      { code: 13, name: 'Completed', kind: 'completed' }
+    ]
+    try {
+      setTaskStates(states)
+      assert.strictEqual(taskStateCode({ state: null }), 13)
+      assert.strictEqual(taskStateFor({}).name, 'Completed')
+      assert.ok(itemIncludesTask(resolveItem('Completed'), {}))
+      assert.ok(!itemIncludesTask(resolveItem('Planning'), {}))
+      assert.strictEqual(taskStateCode({ state: 3 }), 3, 'a task with a state keeps it')
+    } finally {
+      setTaskStates(null)
+    }
+    assert.strictEqual(taskStateCode({}), 3, 'the built-in table still says 3')
+  })
 })
 
 describe('More Actions eligibility', () => {

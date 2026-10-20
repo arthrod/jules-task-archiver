@@ -6576,6 +6576,50 @@ describe('More Actions cache', () => {
     assert.deepStrictEqual(env.local.moreCache.entries.map((entry) => entry.user).sort(), ['g1', 'g2', 'gA', 'gB'])
   })
 
+  it('acts on no item of a u/N that is another Google account than when it was loaded', async () => {
+    const env = setupCacheEnvironment()
+    const { load } = await env.loadAll()
+    assert.ok(
+      load.accounts.every((account) => !('user' in account)),
+      'the popup gets no Google account id'
+    )
+    const prepare = env.sandbox.prepareTab
+    env.sandbox.prepareTab = async (tab) => {
+      const prepared = await prepare(tab)
+      return { ...prepared, config: { ...prepared.config, user: tab.id === 1 ? 'g9' : prepared.config.user } }
+    }
+    env.calls.length = 0
+    await env.apply('archive', [
+      { account: 'u/1', kind: 'task', id: 'completed' },
+      { account: 'u/2', kind: 'task', id: 'completed' }
+    ])
+    assert.deepStrictEqual(
+      env.calls.filter((call) => call.rpc === 'Tjmm5c').map((call) => call.account),
+      ['2']
+    )
+    assert.match(env.sandbox.test_state().log.join('\n'), /u\/1 is another Google account now than when it was loaded/)
+  })
+
+  it('acts on no item loaded for a Google account when u/N no longer names one', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    const prepare = env.sandbox.prepareTab
+    env.sandbox.prepareTab = async (tab) => {
+      const prepared = await prepare(tab)
+      return { ...prepared, config: { ...prepared.config, user: tab.id === 1 ? null : prepared.config.user } }
+    }
+    env.calls.length = 0
+    await env.apply('archive', [
+      { account: 'u/1', kind: 'task', id: 'completed' },
+      { account: 'u/2', kind: 'task', id: 'completed' }
+    ])
+    assert.deepStrictEqual(
+      env.calls.filter((call) => call.rpc === 'Tjmm5c').map((call) => call.account),
+      ['2']
+    )
+    assert.match(env.sandbox.test_state().log.join('\n'), /u\/1 no longer says which Google account it is/)
+  })
+
   it('Delete permanently deletes only the tasks Jules still lists as archived', async () => {
     const env = setupCacheEnvironment()
     const original = env.sandbox.callBatchExecute
