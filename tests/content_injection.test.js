@@ -217,6 +217,19 @@ describe('content.js and the CreateTask RPC id', () => {
     assert.deepStrictEqual(env.ids(), [['Qq7Rr', 'https://jules.google.com']])
   })
 
+  it('sends an empty id while a rediscovery has CreateTask in doubt, so none is watched', () => {
+    const env = load({ rpc: { CreateTask: 'Qq7Rr' }, inDoubt: ['Interact', 'CreateTask'] })
+    env.script.onload()
+    for (const listener of env.storageListeners) {
+      listener({ julesApi: { newValue: { rpc: { CreateTask: 'Qq7Rr' }, inDoubt: ['GetTask', 'Interact'] } } }, 'local')
+      listener({ julesApi: { newValue: { rpc: { CreateTask: 'Qq7Rr' }, inDoubt: ['CreateTask'] } } }, 'local')
+    }
+    assert.deepStrictEqual(
+      env.ids().map(([id]) => id),
+      ['', 'Qq7Rr', '']
+    )
+  })
+
   it('sends null when nothing is saved, and every later change', () => {
     const env = load(undefined)
     env.script.onload()

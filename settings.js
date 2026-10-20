@@ -164,6 +164,18 @@ function rpcCollision(rpc) {
   return null
 }
 
+// Every id more than one method has, as [id, [methods]] in JULES_RPC_DEFAULTS order.
+function rpcSharedIds(rpc) {
+  const byId = new Map()
+  for (const name of Object.keys(JULES_RPC_DEFAULTS)) byId.set(rpc[name], [...(byId.get(rpc[name]) || []), name])
+  return [...byId].filter(([, methods]) => methods.length > 1)
+}
+
+// 'A and B', 'A, B and C'.
+function joinNames(names) {
+  return names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
+}
+
 // ArchiveTasks takes this many ids per call; a rejected batch is retried in
 // chunks of archiveSplit (see background.js executeArchive).
 const ARCHIVE_LIMITS = {
@@ -342,16 +354,19 @@ function applyDiscovery(current, found, builtInStates) {
     }
   }
   // A method the bundle no longer names keeps its old id, which may now be another
-  // method's. Which one Jules means is unknown, so neither is sent.
-  const collision = rpcCollision(rpc)
-  if (collision) {
-    const [first, second, id] = collision
+  // method's. Which one Jules means is unknown, so none of them is sent. Every
+  // shared id counts, and earlier doubts stay: nothing here settles them.
+  const shared = rpcSharedIds(rpc)
+  if (shared.length) {
+    const doubted = new Set([...api.inDoubt, ...shared.flatMap(([, methods]) => methods)])
     return {
-      api: { ...api, inDoubt: [first, second] },
+      api: { ...api, inDoubt: names.filter((name) => doubted.has(name)) },
       changes: [],
-      problems: [
-        `${first} and ${second} would share ${id}; nothing changed, and both stay off until a rediscovery agrees or you reset the values.`
-      ]
+      problems: shared.map(
+        ([id, methods]) =>
+          `${joinNames(methods)} would share ${id}; nothing changed, and ${methods.length === 2 ? 'both' : 'all'} ` +
+          'stay off until a rediscovery agrees or you reset the values.'
+      )
     }
   }
 
