@@ -60,7 +60,10 @@ window.addEventListener('message', (event) => {
   if (event.data?.type === 'JULES_ARCHIVER_CONFIG') {
     cachedConfig = event.data.config
   }
-  if (event.data?.type === 'JULES_START_CONFIG') {
+  // Only the current observer (main-world.js version 3) tags its messages. An
+  // older one stays installed on a page opened before an update, and version 2
+  // posted the first RPC of any request, so its config is not trusted.
+  if (event.data?.type === 'JULES_START_CONFIG' && event.data.observer === 3) {
     chrome.runtime.sendMessage({
       action: 'CACHE_START_CONFIG',
       config: event.data.config

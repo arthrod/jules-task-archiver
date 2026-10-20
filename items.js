@@ -24,7 +24,8 @@ const TASK_STATES = [
 ]
 
 // Jules shows a task without a state code as Completed, so it is listed under
-// Completed (3).
+// Completed (3), or under the Completed code a rediscovery found when 3 is no
+// longer Completed.
 const NO_STATE_CODE = 3
 
 const ITEM_ALL = 'all'
@@ -85,13 +86,15 @@ function resolveItem(input, states = activeTaskStates) {
   }
 }
 
-function taskStateCode(task) {
-  return task?.state ?? NO_STATE_CODE
+function taskStateCode(task, states = activeTaskStates) {
+  if (task?.state != null) return task.state
+  if (states.some((s) => s.code === NO_STATE_CODE && s.kind === 'completed')) return NO_STATE_CODE
+  return states.find((s) => s.kind === 'completed')?.code ?? NO_STATE_CODE
 }
 
 // The state a task is listed under, or null for a code Jules added later.
 function taskStateFor(task, states = activeTaskStates) {
-  const code = taskStateCode(task)
+  const code = taskStateCode(task, states)
   return states.find((s) => s.code === code) || null
 }
 

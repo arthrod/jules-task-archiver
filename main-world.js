@@ -75,7 +75,8 @@ function requestBody(input, opts) {
 // Install fetch observer for StartSuggestion config capture, once per
 // version: a page kept open across an update still runs the old observer
 // (Part 1's watched only a hardcoded Rja83d; version 2 read the first RPC of
-// a request, whichever it was), so a newer one installs on top.
+// a request, whichever it was), so a newer one installs on top. Its messages
+// carry the version, and content.js relays only this one: bump all three together.
 if (window.__julesArchiverObserver !== 3) {
   window.__julesArchiverObserver = 3
   window.__julesArchiver = true
@@ -96,6 +97,7 @@ if (window.__julesArchiverObserver !== 3) {
         window.postMessage(
           {
             type: 'JULES_START_CONFIG',
+            observer: 3,
             config: {
               modelConfig: payload[2],
               experimentIds: payload[9]?.[4] || [],

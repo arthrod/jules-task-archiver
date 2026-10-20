@@ -3268,6 +3268,8 @@ async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGR
         result.notes.push(`Could not prepare ${account}. Open that Jules tab, check you are signed in.`)
         return result
       }
+      // The Google account the items belong to; the worker keeps it, the popup doesn't get it.
+      result.user = prepared.config.user ?? null
       const context = { account, notes: result.notes, progress, cache }
       // Schedules are filtered here; only the task lists need the source id.
       const source =
@@ -3292,10 +3294,19 @@ async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGR
   )
 }
 
+function popupMoreAccount({ user: _user, ...account }) {
+  return account
+}
+
 function moreItemsOf(accounts, lists) {
   return accounts.flatMap((account) =>
     lists.flatMap((list) =>
-      account[list].map((item) => ({ ...item, account: account.account, kind: MORE_LISTS[list].kind }))
+      account[list].map((item) => ({
+        ...item,
+        account: account.account,
+        user: account.user ?? null,
+        kind: MORE_LISTS[list].kind
+      }))
     )
   )
 }
@@ -3322,7 +3333,7 @@ async function loadMoreItems(repo, category, fresh = false) {
     moreItemsError = null
     const notes = []
     await saveMoreLoadOrNote(notes)
-    return { loadId: id, accounts, notes, cachedAt: cache.cachedAt }
+    return { loadId: id, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
   } finally {
     stopKeepAlive()
   }
@@ -3347,7 +3358,7 @@ async function loadMoreArchived(loadId, fresh = false) {
     moreArchivedDone = true
     const notes = []
     await saveMoreLoadOrNote(notes)
-    return { loadId, accounts, notes, cachedAt: cache.cachedAt }
+    return { loadId, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
   } catch (e) {
     // Nothing was listed (no Jules tab, say): the same load may try again.
     if (moreArchivedFor === loadId && !moreArchivedDone) moreArchivedFor = null
@@ -3487,7 +3498,17 @@ async function startMoreOperation(msg) {
             const tab = tabs.find((t) => `u/${extractAccountNum(t.url)}` === account)
             const prepared = tab && (await prepareTab(tab))
             if (!prepared) throw new Error('Open that Jules tab, check you are signed in, then load again.')
-            await dropMoreCache(prepared.config.user, msg.operation, work)
+            // After a sign-in change u/N is another account, whose credentials must not act on the load;
+            // one that no longer names its account can't be checked, so it doesn't act either.
+            const user = prepared.config.user ?? null
+            if (work.some((item) => item.user && item.user !== user)) {
+              throw new Error(
+                user
+                  ? `${account} is another Google account now than when it was loaded. Load again.`
+                  : `${account} no longer says which Google account it is, so the load can't be checked. Load again.`
+              )
+            }
+            await dropMoreCache(user, msg.operation, work)
             try {
               if (msg.operation === 'archive' || msg.operation === 'unarchive') {
                 acted = await executeMoreBatches(account, work, prepared.config, msg.operation === 'unarchive')
@@ -3510,7 +3531,7 @@ async function startMoreOperation(msg) {
               }
             } finally {
               // An older Load still listing may have read these lists while the action ran.
-              await dropMoreCache(prepared.config.user, msg.operation, work)
+              await dropMoreCache(user, msg.operation, work)
             }
           }
           for (const item of acted) {
