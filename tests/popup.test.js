@@ -779,6 +779,28 @@ describe('Proceed, Archive and Export', () => {
     assert.strictEqual(env.elements['#proceedBtn'].disabled, false)
     assert.strictEqual(env.elements['#currentInfo'].textContent, 'Error: Unknown item "x"')
   })
+
+  it('re-enables the buttons when START gets no answer, so the popup is not stuck on Starting', async () => {
+    for (const [reply, shown] of [
+      ['closed', 'Error: The message port closed before a response was received.'],
+      [undefined, 'Error: The run could not start.'],
+      [{}, 'Error: The run could not start.']
+    ]) {
+      const env = setupPopupSandbox()
+      env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+        if (msg.action !== 'START') return cb?.(msg.action === 'GET_STATE' ? { status: 'idle' } : { repos: ['a/b'] })
+        if (reply !== 'closed') return cb(reply)
+        env.sandbox.chrome.runtime.lastError = { message: 'The message port closed before a response was received.' }
+        cb()
+        env.sandbox.chrome.runtime.lastError = undefined
+      }
+      env.load()
+      await env.elements['#proceedBtn'].dispatchEvent('click')
+      assert.strictEqual(env.elements['#proceedBtn'].disabled, false, String(reply))
+      assert.strictEqual(env.elements['#currentInfo'].textContent, shown)
+      assert.strictEqual(env.elements['#logStatus'].textContent, 'Error')
+    }
+  })
 })
 
 describe('Background version check', () => {

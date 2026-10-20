@@ -302,6 +302,34 @@ describe('main-world.js', () => {
     assert.strictEqual(await captured('Rja83d'), true)
   })
 
+  it('watches no id while content.js sends an empty one (CreateTask in doubt)', async () => {
+    const { sandbox, messages, windowMock, listeners } = setupSandbox({})
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    const payload = [null, null, ['m'], null, null, null, null, null, null, null]
+    const base = 'https://jules.google.com/_/Swebot/data/batchexecute?rpcids='
+    const captured = async (rpcId) => {
+      const body = `f.req=${encodeURIComponent(JSON.stringify([[[rpcId, JSON.stringify(payload)]]]))}`
+      const before = messages.length
+      await windowMock.fetch(base + rpcId, { method: 'POST', body })
+      return messages.slice(before).some((m) => m.data.type === 'JULES_START_CONFIG')
+    }
+    const tell = (rpcId) => {
+      for (const listener of listeners.message) {
+        listener({
+          source: windowMock,
+          origin: 'https://jules.google.com',
+          data: { type: 'JULES_CREATE_TASK_RPC', rpcId }
+        })
+      }
+    }
+    tell('Qq7Rr')
+    tell('')
+    assert.strictEqual(await captured('Qq7Rr'), false, 'the doubted id is not read as CreateTask')
+    assert.strictEqual(await captured('Rja83d'), false, 'nor is the built-in one')
+    tell('Qq7Rr')
+    assert.strictEqual(await captured('Qq7Rr'), true, 'a later id is watched again')
+  })
+
   it('should gracefully handle malformed fetch payloads', async () => {
     const { sandbox, messages, windowMock } = setupSandbox({})
 

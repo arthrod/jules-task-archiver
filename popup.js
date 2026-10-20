@@ -988,10 +988,13 @@ async function startRun(action) {
     return
   }
 
+  // A worker that stops before it answers leaves no reply; the buttons must
+  // not stay locked on "Starting" then.
   chrome.runtime.sendMessage({ action: 'START', protocol: RUN_PROTOCOL, options }, (response) => {
-    if (response?.error) {
+    const error = chrome.runtime.lastError?.message || response?.error || (!response?.ok && 'The run could not start.')
+    if (error) {
       setIdle()
-      currentInfo.textContent = `Error: ${response.error}`
+      currentInfo.textContent = `Error: ${error}`
       logStatus.textContent = 'Error'
     }
   })

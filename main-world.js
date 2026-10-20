@@ -36,9 +36,11 @@ function broadcastConfig() {
 // or the last rediscovery), so a renamed id keeps working. It lives on window,
 // not in a top-level let: an extension reload injects this file into the same
 // page again, where a second let would throw, and the observer the first copy
-// installed must see the id the second copy receives.
+// installed must see the id the second copy receives. '' (CreateTask in doubt)
+// watches none: null.
 function createTaskRpc() {
   const rpcId = window.__julesArchiverCreateTaskRpc
+  if (rpcId === '') return null
   return typeof rpcId === 'string' && /^[A-Za-z0-9]{5,6}$/.test(rpcId) ? rpcId : 'Rja83d'
 }
 
@@ -82,7 +84,7 @@ if (window.__julesArchiverObserver !== 3) {
   window.fetch = async function (...args) {
     const [input, opts] = args
     const rpcId = createTaskRpc()
-    const body = callsRpc(requestUrl(input), rpcId) ? requestBody(input, opts) : null
+    const body = rpcId && callsRpc(requestUrl(input), rpcId) ? requestBody(input, opts) : null
     const resp = await _origFetch.apply(this, args)
     if (body) {
       try {

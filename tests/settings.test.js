@@ -261,6 +261,28 @@ describe('applyDiscovery', () => {
     assert.match(problems[0], /^GetTask and Interact would share SLmX6; nothing changed/)
   })
 
+  it('puts the methods of every shared id in doubt, not only the first pair', () => {
+    const rpc = sharing('ArchiveTasks', 'DeleteTasks', 'Tjmm5c').map(([id, m]) =>
+      m === 'SweBotService.GetTask' ? ['SLmX6', m] : [id, m]
+    )
+    const { api, problems } = applyDiscovery(
+      custom,
+      live({ rpc: rpc.filter(([, m]) => m !== 'SweBotService.Interact') }),
+      TASK_STATES
+    )
+    assert.deepStrictEqual(plain(api), { ...custom, inDoubt: ['ArchiveTasks', 'DeleteTasks', 'GetTask', 'Interact'] })
+    assert.deepStrictEqual(problems.slice(-2), [
+      'ArchiveTasks and DeleteTasks would share Tjmm5c; nothing changed, and both stay off until a rediscovery agrees or you reset the values.',
+      'GetTask and Interact would share SLmX6; nothing changed, and both stay off until a rediscovery agrees or you reset the values.'
+    ])
+  })
+
+  it('keeps the doubts of an earlier rediscovery when it finds another shared id', () => {
+    const rpc = sharing('Interact', 'GetTask', 'SLmX6')
+    const { api } = applyDiscovery({ ...custom, inDoubt: ['DeleteTasks', 'ArchiveTasks'] }, live({ rpc }), TASK_STATES)
+    assert.deepStrictEqual(plain(api.inDoubt), ['ArchiveTasks', 'DeleteTasks', 'GetTask', 'Interact'])
+  })
+
   it('a rediscovery that agrees takes the doubt back', () => {
     const { api } = applyDiscovery({ inDoubt: ['ArchiveTasks', 'DeleteTasks'] }, live(), TASK_STATES)
     assert.deepStrictEqual(plain(api.inDoubt), [])

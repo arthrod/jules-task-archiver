@@ -11,11 +11,14 @@
 let cachedConfig = null
 
 // Tell main-world.js which CreateTask RPC id to watch: the one saved in the
-// Jules API values (settings.js), or null for the built-in one.
+// Jules API values (settings.js), null for the built-in one, or '' for none
+// while a rediscovery has CreateTask in doubt: background.js doesn't send it
+// then, and the id may now be another method's.
 function postCreateTaskRpc(julesApi) {
   const rpcId = julesApi?.rpc?.CreateTask
+  const inDoubt = Array.isArray(julesApi?.inDoubt) && julesApi.inDoubt.includes('CreateTask')
   window.postMessage(
-    { type: 'JULES_CREATE_TASK_RPC', rpcId: typeof rpcId === 'string' ? rpcId : null },
+    { type: 'JULES_CREATE_TASK_RPC', rpcId: inDoubt ? '' : typeof rpcId === 'string' ? rpcId : null },
     window.location.origin
   )
 }
