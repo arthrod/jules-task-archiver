@@ -2966,10 +2966,18 @@ function moreItemOfEntry(entry) {
 // Loads read it; the checks behind actions (Delete permanently's, the
 // Unarchive check, open PRs) list live.
 const MORE_CACHE_KEY = 'moreCache'
+const MORE_CACHE_VERSION = 1
+// maxBytes counts UTF-8 bytes, as Chrome's storage quota does.
 const MORE_CACHE = { ttlMs: 30 * 60 * 1000, maxItems: 20000, maxBytes: 4 * 1024 * 1024 }
 
-// The entries, oldest first: a read that is kept goes to the end.
+// The entries, oldest first: a read that is kept goes to the end. null when
+// chrome.storage.local could not be read; the next call tries again.
 let moreCachePromise = null
+
+// The reads still waiting for Jules, as { user, list, source, dropped }. An
+// action that changes their list marks them dropped: what they bring back
+// may be from before it, so it is not kept.
+const moreCacheReads = new Set()
 
 function moreCacheKey(user, list, source) {
   return JSON.stringify([user, list, source])
@@ -2989,11 +2997,17 @@ function validMoreCacheEntry(entry) {
 function moreCacheEntries() {
   moreCachePromise ??= chrome.storage.local.get(MORE_CACHE_KEY).then(
     (data) => {
-      const saved = data?.[MORE_CACHE_KEY]?.entries
+      const cache = data?.[MORE_CACHE_KEY]
+      const saved = cache?.version === MORE_CACHE_VERSION ? cache.entries : null
       const entries = (Array.isArray(saved) ? saved : []).filter(validMoreCacheEntry).sort((a, b) => a.at - b.at)
       return new Map(entries.map((entry) => [moreCacheKey(entry.user, entry.list, entry.source), entry]))
     },
-    () => new Map()
+    () => {
+      // Unread, the cache can't be used, and a save would write over every
+      // other account's entries.
+      moreCachePromise = null
+      return null
+    }
   )
   return moreCachePromise
 }
@@ -3010,6 +3024,7 @@ function freshMoreCacheEntry(entry) {
 async function cachedMoreRead(cache, user, list, source, read) {
   if (typeof user !== 'string' || user === '') return read()
   const entries = await moreCacheEntries()
+  if (!entries) return read()
   const key = moreCacheKey(user, list, source)
   const hit = entries.get(key)
   if (!cache.fresh && hit && freshMoreCacheEntry(hit)) {
@@ -3017,7 +3032,15 @@ async function cachedMoreRead(cache, user, list, source, read) {
     return hit.items
   }
   const at = Date.now()
-  const items = await read()
+  const pending = { user, list, source, dropped: false }
+  moreCacheReads.add(pending)
+  let items
+  try {
+    items = await read()
+  } finally {
+    moreCacheReads.delete(pending)
+  }
+  if (pending.dropped) return items
   // A run that cleared the cache meanwhile left these entries behind.
   entries.delete(key)
   entries.set(key, { user, list, source, at, items })
@@ -3027,6 +3050,8 @@ async function cachedMoreRead(cache, user, list, source, read) {
 // Saves the newest entries within MORE_CACHE's limits; expired ones go.
 async function saveMoreCache() {
   const entries = await moreCacheEntries()
+  if (!entries) return
+  const utf8 = new TextEncoder()
   const sizes = new Map()
   let items = 0
   let bytes = 0
@@ -3035,7 +3060,7 @@ async function saveMoreCache() {
       entries.delete(key)
       continue
     }
-    sizes.set(key, JSON.stringify(entry).length)
+    sizes.set(key, utf8.encode(JSON.stringify(entry)).length)
     items += entry.items.length
     bytes += sizes.get(key)
   }
@@ -3046,7 +3071,9 @@ async function saveMoreCache() {
     bytes -= sizes.get(key)
   }
   try {
-    await chrome.storage.local.set({ [MORE_CACHE_KEY]: { version: 1, entries: [...entries.values()] } })
+    await chrome.storage.local.set({
+      [MORE_CACHE_KEY]: { version: MORE_CACHE_VERSION, entries: [...entries.values()] }
+    })
   } catch {
     // Chrome could not keep it (its quota, say): the next Load lists live.
     entries.clear()
@@ -3066,17 +3093,23 @@ const MORE_ACTION_LISTS = {
   deleteSchedule: ['schedules']
 }
 
-// Before an action: its account's entries of the lists it changes go, for
-// its items' repos and for every repo, so the next Load lists them live.
+// Before an action and after it: its account's entries of the lists it
+// changes go, for its items' repos and for every repo, and so do the reads
+// of them still waiting, so the next Load lists them live.
 async function dropMoreCache(user, operation, items) {
   if (typeof user !== 'string' || user === '') return
-  const entries = await moreCacheEntries()
   const lists = MORE_ACTION_LISTS[operation] || []
   const sources = new Set(items.map((item) => `github/${item.repo}`.toLowerCase()))
+  const changes = (entry) =>
+    entry.user === user &&
+    lists.includes(entry.list) &&
+    (entry.source === '' || sources.has(entry.source.toLowerCase()))
+  for (const pending of moreCacheReads) if (changes(pending)) pending.dropped = true
+  const entries = await moreCacheEntries()
+  if (!entries) return clearMoreCache()
   let dropped = false
   for (const [key, entry] of entries) {
-    if (entry.user !== user || !lists.includes(entry.list)) continue
-    if (entry.source !== '' && !sources.has(entry.source.toLowerCase())) continue
+    if (!changes(entry)) continue
     entries.delete(key)
     dropped = true
   }
@@ -3085,6 +3118,7 @@ async function dropMoreCache(user, operation, items) {
 
 // A run can change any list of any account.
 function clearMoreCache() {
+  for (const pending of moreCacheReads) pending.dropped = true
   moreCachePromise = Promise.resolve(new Map())
   return chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
 }
@@ -3454,24 +3488,29 @@ async function startMoreOperation(msg) {
             const prepared = tab && (await prepareTab(tab))
             if (!prepared) throw new Error('Open that Jules tab, check you are signed in, then load again.')
             await dropMoreCache(prepared.config.user, msg.operation, work)
-            if (msg.operation === 'archive' || msg.operation === 'unarchive') {
-              acted = await executeMoreBatches(account, work, prepared.config, msg.operation === 'unarchive')
-            } else {
-              const targets =
-                msg.operation === 'deleteTask' ? await stillArchivedInJules(account, work, prepared.config) : work
-              acted = []
-              for (const item of targets) {
-                try {
-                  await callBatchExecute(
-                    rpc(MORE_ACTIONS[msg.operation].method),
-                    moreActionPayload(msg.operation, item),
-                    prepared.config
-                  )
-                  acted.push(item)
-                } catch (e) {
-                  addLog(`ERROR [${account}] [${item.id}]: ${e.message}`)
+            try {
+              if (msg.operation === 'archive' || msg.operation === 'unarchive') {
+                acted = await executeMoreBatches(account, work, prepared.config, msg.operation === 'unarchive')
+              } else {
+                const targets =
+                  msg.operation === 'deleteTask' ? await stillArchivedInJules(account, work, prepared.config) : work
+                acted = []
+                for (const item of targets) {
+                  try {
+                    await callBatchExecute(
+                      rpc(MORE_ACTIONS[msg.operation].method),
+                      moreActionPayload(msg.operation, item),
+                      prepared.config
+                    )
+                    acted.push(item)
+                  } catch (e) {
+                    addLog(`ERROR [${account}] [${item.id}]: ${e.message}`)
+                  }
                 }
               }
+            } finally {
+              // An older Load still listing may have read these lists while the action ran.
+              await dropMoreCache(prepared.config.user, msg.operation, work)
             }
           }
           for (const item of acted) {

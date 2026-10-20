@@ -1211,8 +1211,18 @@ function moreCacheAge() {
   return `from the cache, ${minutes < 1 ? 'under a minute' : `${minutes} min`} old`
 }
 
+// The age of a cached load goes on counting while the popup stays open; the
+// timer stops once a load is not from the cache.
+let moreAgeTimer = null
+
 function noteMoreCache(cachedAt) {
-  if (Number.isFinite(cachedAt)) moreCachedAt = Math.min(moreCachedAt ?? cachedAt, cachedAt)
+  if (!Number.isFinite(cachedAt)) return
+  moreCachedAt = Math.min(moreCachedAt ?? cachedAt, cachedAt)
+  moreAgeTimer ??= setInterval(() => {
+    if (moreCachedAt !== null) return renderMoreStatus()
+    clearInterval(moreAgeTimer)
+    moreAgeTimer = null
+  }, 30000)
 }
 
 function sendMore(msg) {

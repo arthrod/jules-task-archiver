@@ -132,6 +132,7 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}, { sessio
     Error,
     URLSearchParams,
     URL,
+    TextEncoder,
     Promise,
     console,
     parseInt,
@@ -6411,6 +6412,168 @@ describe('More Actions cache', () => {
     env.calls.length = 0
     await env.loadAll()
     assert.ok(env.listed().length >= 4)
+  })
+
+  it('keeps nothing a read brought back after an action dropped its list, and keeps the others', async () => {
+    const env = setupCacheEnvironment()
+    const reads = {}
+    const read = (source) =>
+      env.sandbox.cachedMoreRead(
+        { fresh: false, cachedAt: null },
+        'g1',
+        'archived',
+        source,
+        () => new Promise((resolve) => (reads[source] = resolve))
+      )
+    const repo = read('github/Org/Repo')
+    const other = read('github/Org/Other')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await env.sandbox.dropMoreCache('g1', 'archive', [{ repo: 'org/repo' }])
+    reads['github/Org/Repo']([{ id: 'before' }])
+    reads['github/Org/Other']([{ id: 'other' }])
+    assert.deepStrictEqual(plain(await repo), [{ id: 'before' }], 'the Load still gets what it read')
+    await other
+    await env.sandbox.saveMoreCache()
+    assert.deepStrictEqual(
+      env.local.moreCache.entries.map((entry) => entry.source),
+      ['github/Org/Other']
+    )
+  })
+
+  it('an action also drops what a Load still listing read while it ran', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    const original = env.sandbox.callBatchExecute
+    env.sandbox.callBatchExecute = async (rpc, payload, config) => {
+      if (rpc === 'Tjmm5c') {
+        // An older Load, still listing, reads the repo's archive before the archive lands.
+        await env.sandbox.cachedMoreRead({ fresh: true, cachedAt: null }, 'g1', 'archived', 'github/Org/Repo', () => [
+          { id: 'before' }
+        ])
+      }
+      return original(rpc, payload, config)
+    }
+    await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }])
+    env.calls.length = 0
+    await env.loadAll()
+    assert.ok(env.listed().some(([account, filter]) => account === '1' && filter.endsWith('is_archived=true')))
+  })
+
+  it('counts the byte limit in UTF-8 bytes, as Chrome does', async () => {
+    const now = Date.now()
+    const wide = (user, at) => ({ ...task('x', at, user), items: [{ id: 'x', title: '漢'.repeat(1000), source: '' }] })
+    const env = setupCacheEnvironment({
+      moreCache: { version: 1, entries: [wide('gA', now - 120000), wide('gB', now - 60000)] }
+    })
+    vm.runInContext('MORE_CACHE.maxBytes = 5000', env.sandbox)
+    await env.load('', 'scheduled')
+    const kept = env.local.moreCache.entries.map((entry) => entry.user)
+    assert.deepStrictEqual(kept.sort(), ['g1', 'g2', 'gB'])
+    const bytes = env.local.moreCache.entries.reduce(
+      (sum, entry) => sum + new TextEncoder().encode(JSON.stringify(entry)).length,
+      0
+    )
+    assert.ok(bytes <= 5000, `${bytes} bytes`)
+  })
+
+  it('a cache it could not read is neither used nor written over, and is read again later', async () => {
+    const env = setupCacheEnvironment({ moreCache: { version: 1, entries: [task('kept', Date.now() - 60000, 'gZ')] } })
+    const get = env.sandbox.chrome.storage.local.get
+    let fail = true
+    env.sandbox.chrome.storage.local.get = async (key) => {
+      if (fail && key === 'moreCache') throw new Error('IO error')
+      return get(key)
+    }
+    await env.loadAll()
+    assert.deepStrictEqual(
+      env.local.moreCache.entries.map((entry) => entry.user),
+      ['gZ'],
+      "another account's entries stay"
+    )
+    fail = false
+    await env.loadAll()
+    env.calls.length = 0
+    await env.loadAll()
+    assert.deepStrictEqual(env.reads(), [], 'once it can be read, the cache works again')
+    assert.ok(env.local.moreCache.entries.some((entry) => entry.user === 'gZ'))
+  })
+
+  it('an action that cannot read the cache clears it', async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    vm.runInContext('moreCachePromise = null', env.sandbox)
+    const get = env.sandbox.chrome.storage.local.get
+    env.sandbox.chrome.storage.local.get = async (key) => {
+      if (key === 'moreCache') throw new Error('IO error')
+      return get(key)
+    }
+    await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }])
+    assert.strictEqual(env.local.moreCache, undefined)
+  })
+
+  it('ignores a saved cache of another version, and entries of the wrong shape', async () => {
+    const at = Date.now() - 60000
+    for (const moreCache of [
+      { version: 2, entries: [task('v2', at)] },
+      { entries: [task('v0', at)] },
+      { version: 1, entries: [null, { ...task('a', at), user: '' }, { ...task('b', at), items: 'x' }, 'x'] }
+    ]) {
+      const env = setupCacheEnvironment({ moreCache })
+      const { load } = await env.loadAll()
+      assert.ok(
+        env.listed().some(([account, filter]) => account === '1' && filter === ''),
+        JSON.stringify(moreCache)
+      )
+      assert.strictEqual(load.cachedAt, null)
+    }
+  })
+
+  it('keeps nothing of a read that failed', async () => {
+    const env = setupCacheEnvironment()
+    await assert.rejects(
+      env.sandbox.cachedMoreRead({ fresh: false, cachedAt: null }, 'g1', 'tasks', '', async () => {
+        throw new Error('RPC error [4]')
+      }),
+      /RPC error \[4\]/
+    )
+    await env.sandbox.saveMoreCache()
+    assert.deepStrictEqual(plain(env.local.moreCache.entries), [])
+  })
+
+  it('lists live again when Chrome cannot save the cache', async () => {
+    const env = setupCacheEnvironment()
+    env.sandbox.chrome.storage.local.set = async () => {
+      throw new Error('QUOTA_BYTES quota exceeded')
+    }
+    await env.loadAll()
+    assert.strictEqual(env.local.moreCache, undefined)
+    env.calls.length = 0
+    const again = await env.loadAll()
+    assert.ok(env.reads().length > 0)
+    assert.strictEqual(again.load.cachedAt, null)
+  })
+
+  it("Delete permanently drops the repo's cached archived tasks, and only them", async () => {
+    const env = setupCacheEnvironment()
+    await env.loadAll()
+    await env.apply('deleteTask', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
+    env.calls.length = 0
+    await env.loadAll()
+    assert.deepStrictEqual(env.listed(), [['1', 'source_id=github/Org/Repo AND is_archived=true']])
+  })
+
+  it('keeps exactly 20,000 items', async () => {
+    const now = Date.now()
+    const many = (user, at, n) => ({
+      ...task('x', at, user),
+      items: Array.from({ length: n }, (_, i) => ({ id: `t${i}`, title: 't', state: 3, repo: 'o/r', source: '' }))
+    })
+    const env = setupCacheEnvironment({
+      moreCache: { version: 1, entries: [many('gA', now - 120000, 15000), many('gB', now - 60000, 4996)] }
+    })
+    // Two schedules for each of two accounts: 20,000 items in all.
+    await env.load('', 'scheduled')
+    assert.deepStrictEqual(env.local.moreCache.entries.map((entry) => entry.user).sort(), ['g1', 'g2', 'gA', 'gB'])
   })
 
   it('Delete permanently deletes only the tasks Jules still lists as archived', async () => {
