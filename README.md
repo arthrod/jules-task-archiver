@@ -39,6 +39,7 @@
 
 ## Table of contents
 
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -50,6 +51,16 @@
 - [License](#license)
 
 
+## Screenshots
+
+All the data in these pictures is made up.
+
+![Proceed and Archive across every signed-in account](docs/images/hero.png)
+
+| | |
+|---|---|
+| ![More Actions: pick tasks and act on them all](docs/images/more-actions.png) | ![Delete permanently, checked with Jules first](docs/images/delete.png) |
+| ![Settings: pacing, parallel requests and API values](docs/images/settings.png) | ![Schedule: archive in the background](docs/images/schedule.png) |
 
 ## Features
 
