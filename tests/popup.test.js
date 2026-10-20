@@ -1307,6 +1307,32 @@ describe('Settings panel', () => {
     assert.match(env.elements['#apiStatus'].textContent, /5 or 6 letters or digits/)
   })
 
+  it('refuses an RPC id another method already uses and puts the old one back', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    const deleteTasks = rpcInput(env, 8)
+    assert.strictEqual(deleteTasks.value, 'rist8')
+    deleteTasks.value = 'Tjmm5c'
+    deleteTasks.dispatchEvent('change')
+    assert.strictEqual(deleteTasks.value, 'rist8')
+    assert.strictEqual(env.localStorage.julesApi, undefined)
+    assert.strictEqual(env.elements['#apiStatus'].textContent, 'ArchiveTasks already uses Tjmm5c.')
+    // The owner can come after the method typed in, too.
+    rpcInput(env, 1).value = 'rist8'
+    rpcInput(env, 1).dispatchEvent('change')
+    assert.strictEqual(rpcInput(env, 1).value, 'Tjmm5c')
+    assert.strictEqual(env.elements['#apiStatus'].textContent, 'DeleteTasks already uses rist8.')
+  })
+
+  it('a change in the panel keeps the methods a rediscovery put in doubt', () => {
+    const env = setupPopupSandbox({ local: { julesApi: { inDoubt: ['ArchiveTasks', 'DeleteTasks'] } } })
+    env.load()
+    env.elements['#archiveBatch'].value = '20'
+    env.elements['#archiveBatch'].dispatchEvent('change')
+    assert.strictEqual(env.localStorage.julesApi.archiveBatch, 20)
+    assert.deepStrictEqual([...env.localStorage.julesApi.inDoubt], ['ArchiveTasks', 'DeleteTasks'])
+  })
+
   it('rebuilds the Items dropdown from rediscovered states', () => {
     const states = [
       { code: 13, name: 'Waiting on You', kind: 'feedback' },
@@ -1963,9 +1989,32 @@ describe('More Actions options', () => {
     assert.deepStrictEqual(offered(env), ['copyUrl', 'archive'])
   })
 
-  it('offers Copy session URL and Unarchive for archived tasks', async () => {
+  it('offers Copy session URL, Unarchive and Delete permanently for archived tasks', async () => {
     const archived = await loaded('archive', { archived: [{ ...done, id: 'old' }] })
-    assert.deepStrictEqual(offered(archived), ['copyUrl', 'unarchive'])
+    assert.deepStrictEqual(offered(archived), ['copyUrl', 'unarchive', 'deleteTask'])
+  })
+
+  it('Delete permanently needs a second click too', async () => {
+    const env = await loaded('archive', {
+      archived: [
+        { ...done, id: 'old' },
+        { ...done, id: 'older' }
+      ]
+    })
+    const wait = clock(env)
+    const el = env.elements
+    await choose(env, 'deleteTask')
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.deepStrictEqual(deletes(env), [])
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 2 tasks permanently? Click again')
+    wait(1000)
+    await el['#moreConfirm'].dispatchEvent('click')
+    const sent = JSON.parse(JSON.stringify(deletes(env)[0]))
+    assert.strictEqual(sent.operation, 'deleteTask')
+    assert.deepStrictEqual(
+      sent.items.map((item) => item.id),
+      ['old', 'older']
+    )
   })
 
   it('offers Pause, Resume and Delete schedule for schedules, never Update', async () => {
@@ -2036,35 +2085,78 @@ describe('More Actions options', () => {
     )
   })
 
-  it('a second click under 0.5 s after the first is not the second click', async () => {
-    const env = await loaded('scheduled', { schedules: [active] })
-    const wait = clock(env)
-    const el = env.elements
-    await choose(env, 'deleteSchedule')
-    await el['#moreConfirm'].dispatchEvent('click')
-    wait(300)
-    await el['#moreConfirm'].dispatchEvent('click')
-    assert.deepStrictEqual(deletes(env), [], 'a double-click is one gesture')
-    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 1 schedule? Click again', 'still armed')
-    wait(300)
-    await el['#moreConfirm'].dispatchEvent('click')
-    assert.strictEqual(deletes(env).length, 1)
-  })
+  // Both permanent actions take their second click the same way.
+  const permanent = [
+    ['Delete schedule', 'deleteSchedule', () => loaded('scheduled', { schedules: [active] }), 'schedule?'],
+    [
+      'Delete permanently',
+      'deleteTask',
+      () => loaded('archive', { archived: [{ ...done, id: 'old' }] }),
+      'task permanently?'
+    ]
+  ]
+  for (const [label, action, load, noun] of permanent) {
+    const armed = `Delete 1 ${noun} Click again`
 
-  it('the first click lapses after 10 s, even when its timer has not run', async () => {
-    const env = await loaded('scheduled', { schedules: [active] })
-    const wait = clock(env)
-    const el = env.elements
-    await choose(env, 'deleteSchedule')
-    await el['#moreConfirm'].dispatchEvent('click')
-    wait(10001)
-    await el['#moreConfirm'].dispatchEvent('click')
-    assert.deepStrictEqual(deletes(env), [], 'a late click arms again')
-    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 1 schedule? Click again')
-    wait(600)
-    await el['#moreConfirm'].dispatchEvent('click')
-    assert.strictEqual(deletes(env).length, 1)
-  })
+    it(`${label}: a second click under 0.5 s after the first is not the second click`, async () => {
+      const env = await load()
+      const wait = clock(env)
+      const el = env.elements
+      await choose(env, action)
+      await el['#moreConfirm'].dispatchEvent('click')
+      wait(300)
+      await el['#moreConfirm'].dispatchEvent('click')
+      assert.deepStrictEqual(deletes(env), [], 'a double-click is one gesture')
+      assert.strictEqual(el['#moreConfirm'].textContent, armed, 'still armed')
+      wait(300)
+      await el['#moreConfirm'].dispatchEvent('click')
+      assert.strictEqual(deletes(env).length, 1)
+    })
+
+    it(`${label}: a slow double-click is one gesture too`, async () => {
+      const env = await load()
+      const wait = clock(env)
+      const el = env.elements
+      await choose(env, action)
+      await el['#moreConfirm'].dispatchEvent('click', { detail: 1 })
+      wait(600)
+      // The system still counts this click as the double-click's second.
+      await el['#moreConfirm'].dispatchEvent('click', { detail: 2 })
+      assert.deepStrictEqual(deletes(env), [])
+      assert.strictEqual(el['#moreConfirm'].textContent, armed, 'still armed')
+      wait(600)
+      await el['#moreConfirm'].dispatchEvent('click', { detail: 1 })
+      assert.strictEqual(deletes(env).length, 1)
+    })
+
+    it(`${label}: a slow triple-click is one gesture too`, async () => {
+      const env = await load()
+      const wait = clock(env)
+      const el = env.elements
+      await choose(env, action)
+      for (const detail of [1, 2, 3]) {
+        await el['#moreConfirm'].dispatchEvent('click', { detail })
+        wait(600)
+      }
+      assert.deepStrictEqual(deletes(env), [])
+      assert.strictEqual(el['#moreConfirm'].textContent, armed, 'still armed')
+    })
+
+    it(`${label}: the first click lapses after 10 s, even when its timer has not run`, async () => {
+      const env = await load()
+      const wait = clock(env)
+      const el = env.elements
+      await choose(env, action)
+      await el['#moreConfirm'].dispatchEvent('click')
+      wait(10001)
+      await el['#moreConfirm'].dispatchEvent('click')
+      assert.deepStrictEqual(deletes(env), [], 'a late click arms again')
+      assert.strictEqual(el['#moreConfirm'].textContent, armed)
+      wait(600)
+      await el['#moreConfirm'].dispatchEvent('click')
+      assert.strictEqual(deletes(env).length, 1)
+    })
+  }
 
   it("a held key's repeats never press Confirm", async () => {
     const env = await loaded('scheduled', { schedules: [active] })

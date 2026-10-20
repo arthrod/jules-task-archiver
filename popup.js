@@ -98,10 +98,11 @@ let moreArchived = 'none'
 // How many repos the worker's All-repos archived listing has done: { done, total }.
 let moreArchivedRepos = null
 let moreNotes = []
-// Delete schedule can't be undone, so its Confirm takes a second click, at
-// least 0.5 s after the first (a double-click is one gesture) and at most
-// 10 s after it. A held key's repeats never press Confirm, and a change of
-// action, selection or Dry run takes the first click back.
+// Delete permanently and Delete schedule can't be undone, so their Confirm
+// takes a second click, at least 0.5 s after the first (a double-click is one
+// gesture) and at most 10 s after it. A held key's repeats never press
+// Confirm, and a change of action, selection or Dry run takes the first
+// click back.
 const DELETE_CONFIRM_MIN_MS = 500
 const DELETE_CONFIRM_MAX_MS = 10000
 let moreDeleteArmedAt = null
@@ -570,6 +571,15 @@ function saveJulesApi() {
     }
     rpc[method] = id
   }
+  const collision = rpcCollision(rpc)
+  if (collision) {
+    const [first, second, id] = collision
+    // The method typed in last is the one whose old id goes back.
+    const owner = julesApiValues.rpc[first] === id ? first : second
+    fillJulesApi(julesApiValues)
+    setApiStatus(`${owner} already uses ${id}.`)
+    return
+  }
   const api = normalizeJulesApi({
     ...julesApiValues,
     rpc,
@@ -1019,9 +1029,11 @@ function moreConfirmText() {
   const action = moreAction.value
   if (MORE_ACTIONS[action]?.local) return 'Copy'
   if (moreDryRun.checked) return 'Confirm (dry run)'
-  if (action === 'deleteSchedule' && moreDeleteArmedAt !== null) {
+  if (MORE_ACTIONS[action]?.destructive && moreDeleteArmedAt !== null) {
     const count = fittingMoreItems(action).length
-    return `Delete ${count} ${count === 1 ? 'schedule' : 'schedules'}? Click again`
+    return action === 'deleteTask'
+      ? `Delete ${count} ${count === 1 ? 'task' : 'tasks'} permanently? Click again`
+      : `Delete ${count} ${count === 1 ? 'schedule' : 'schedules'}? Click again`
   }
   return 'Confirm'
 }
@@ -1265,7 +1277,7 @@ moreConfirm.addEventListener('keydown', (event) => {
   if (event.repeat && (event.key === 'Enter' || event.key === ' ')) event.preventDefault()
 })
 
-moreConfirm.addEventListener('click', async () => {
+moreConfirm.addEventListener('click', async (event) => {
   updateMoreControls()
   if (moreConfirm.disabled) return
   const operation = moreAction.value
@@ -1274,14 +1286,15 @@ moreConfirm.addEventListener('click', async () => {
     return
   }
   const dryRun = moreDryRun.checked
-  if (operation === 'deleteSchedule' && !dryRun) {
+  if (MORE_ACTIONS[operation].destructive && !dryRun) {
     const since = moreDeleteArmedAt === null ? null : Date.now() - moreDeleteArmedAt
     if (since === null || since > DELETE_CONFIRM_MAX_MS) {
       armMoreDelete()
       updateMoreControls()
       return
     }
-    if (since < DELETE_CONFIRM_MIN_MS) return
+    // A double-click's second click (detail 2) can come after 0.5 s on a slow setting.
+    if (since < DELETE_CONFIRM_MIN_MS || event.detail > 1) return
   }
   disarmMoreDelete()
   const items = fittingMoreItems(operation).map(({ account, kind, id }) => ({ account, kind, id }))

@@ -182,6 +182,7 @@ describe('More Actions eligibility', () => {
         'Copy session URL',
         'Archive',
         'Unarchive',
+        'Delete permanently',
         'Pause schedule',
         'Resume schedule',
         'Delete schedule'
@@ -193,6 +194,12 @@ describe('More Actions eligibility', () => {
       'only Copy session URL runs in the popup'
     )
     assert.strictEqual(MORE_ACTIONS.deleteSchedule.method, 'DeleteScheduledTask')
+    assert.strictEqual(MORE_ACTIONS.deleteTask.method, 'DeleteTasks')
+    assert.deepStrictEqual(
+      Object.keys(MORE_ACTIONS).filter((action) => MORE_ACTIONS[action].destructive),
+      ['deleteTask', 'deleteSchedule'],
+      'the two actions that cannot be undone'
+    )
   })
 
   it("builds a task's URL as Jules' Copy session URL does", () => {
@@ -209,6 +216,7 @@ describe('More Actions eligibility', () => {
           copyUrl: kind === 'task' || kind === 'archived',
           archive: kind === 'task',
           unarchive: kind === 'archived',
+          deleteTask: kind === 'archived',
           pauseSchedule: kind === 'schedule' && state === 2,
           resumeSchedule: kind === 'schedule' && state === 3,
           deleteSchedule: kind === 'schedule'

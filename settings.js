@@ -139,6 +139,7 @@ const JULES_RPC_DEFAULTS = {
   PauseScheduledTask: 'gBUOb',
   ResumeScheduledTask: 'XuzQWe',
   DeleteScheduledTask: 'sL8twb',
+  DeleteTasks: 'rist8',
   GetTask: 'n74qPd',
   Interact: 'SLmX6',
   GetTaskUsage: 'KQOO7',
@@ -150,6 +151,19 @@ const JULES_RPC_DEFAULTS = {
 
 const RPC_ID_REGEX = /^[A-Za-z0-9]{5,6}$/
 
+// The first two methods sharing an id, as [earlier, later, id], or null. A shared
+// id sends one method's request for the other: Delete permanently would archive,
+// or Archive would delete.
+function rpcCollision(rpc) {
+  const owner = new Map()
+  for (const name of Object.keys(JULES_RPC_DEFAULTS)) {
+    const id = rpc[name]
+    if (owner.has(id)) return [owner.get(id), name, id]
+    owner.set(id, name)
+  }
+  return null
+}
+
 // ArchiveTasks takes this many ids per call; a rejected batch is retried in
 // chunks of archiveSplit (see background.js executeArchive).
 const ARCHIVE_LIMITS = {
@@ -159,13 +173,15 @@ const ARCHIVE_LIMITS = {
 
 const STATE_KINDS = new Set(['feedback', 'plan', 'error', 'paused', 'running', 'completed', 'unknown'])
 
-// `states: null` means the built-in TASK_STATES (items.js).
+// `states: null` means the built-in TASK_STATES (items.js). `inDoubt` names the
+// methods a rediscovery found sharing an id; background.js sends none of them.
 const JULES_API_DEFAULTS = {
   rpc: JULES_RPC_DEFAULTS,
   archiveBatch: 50,
   archiveSplit: 10,
   states: null,
-  checkedAt: null
+  checkedAt: null,
+  inDoubt: []
 }
 
 function validStates(states) {
@@ -189,11 +205,14 @@ function normalizeJulesApi(raw) {
   const archiveBatch = clampSetting(src.archiveBatch, ARCHIVE_LIMITS.archiveBatch)
   const archiveSplit = Math.min(archiveBatch, clampSetting(src.archiveSplit, ARCHIVE_LIMITS.archiveSplit))
   return {
-    rpc,
+    rpc: rpcCollision(rpc) ? { ...JULES_RPC_DEFAULTS } : rpc,
     archiveBatch,
     archiveSplit,
     states: validStates(src.states) ? src.states.map((s) => ({ code: s.code, name: s.name, kind: s.kind })) : null,
-    checkedAt: Number.isFinite(src.checkedAt) ? src.checkedAt : null
+    checkedAt: Number.isFinite(src.checkedAt) ? src.checkedAt : null,
+    inDoubt: Array.isArray(src.inDoubt)
+      ? [...new Set(src.inDoubt.filter((m) => typeof m === 'string' && Object.hasOwn(JULES_RPC_DEFAULTS, m)))]
+      : []
   }
 }
 
@@ -322,6 +341,19 @@ function applyDiscovery(current, found, builtInStates) {
       ]
     }
   }
+  // A method the bundle no longer names keeps its old id, which may now be another
+  // method's. Which one Jules means is unknown, so neither is sent.
+  const collision = rpcCollision(rpc)
+  if (collision) {
+    const [first, second, id] = collision
+    return {
+      api: { ...api, inDoubt: [first, second] },
+      changes: [],
+      problems: [
+        `${first} and ${second} would share ${id}; nothing changed, and both stay off until a rediscovery agrees or you reset the values.`
+      ]
+    }
+  }
 
   let states = api.states
   const entries = pickStateMap(found?.stateMaps)
@@ -344,7 +376,7 @@ function applyDiscovery(current, found, builtInStates) {
     }
   }
 
-  return { api: { ...api, rpc, states }, changes, problems }
+  return { api: { ...api, rpc, states, inDoubt: [] }, changes, problems }
 }
 
 if (typeof module !== 'undefined') {
@@ -373,6 +405,7 @@ if (typeof module !== 'undefined') {
     settingsFromSync,
     settingsToSync,
     normalizeJulesApi,
+    rpcCollision,
     validStates,
     statesFromBundle,
     pickStateMap,
