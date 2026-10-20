@@ -1736,6 +1736,50 @@ describe('More Actions popup edge cases', () => {
     )
   })
 
+  it('shows how many repos the archived listing has done, for this load only', async () => {
+    const env = heldArchived(archivedOnly)
+    await loadArchived(env)
+    const el = env.elements
+    const progress = (loadId, done, total, area = 'session') => {
+      for (const listener of env.listeners.storage) {
+        listener({ moreArchivedProgress: { newValue: { loadId, done, total } } }, area)
+      }
+    }
+    progress('L1', 120, 390)
+    assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks… 120 of 390 repos')
+    progress('L0', 5, 9)
+    progress('L1', 7, 9, 'local')
+    assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks… 120 of 390 repos')
+    // A newer Load starts from no count.
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks…')
+    progress('L1', 200, 390)
+    assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks…')
+    env.held[1].cb(moreReplies(archivedOnly, 'L2')(env.held[1].msg))
+    await env.tick()
+    progress('L2', 390, 390)
+    assert.strictEqual(el['#moreStatus'].textContent, '1 archived tasks · Archived listing note')
+  })
+
+  it("shows the worker's notes about the whole load, for both answers", async () => {
+    const env = heldArchived(archivedOnly)
+    const loadItems = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) =>
+      msg.action === 'LOAD_ITEMS'
+        ? loadItems(msg, (reply) => cb({ ...reply, notes: ['Not kept'] }))
+        : loadItems(msg, cb)
+    await loadArchived(env)
+    assert.strictEqual(env.elements['#moreStatus'].textContent, 'Listing the archived tasks… · Not kept')
+    const [{ msg, cb }] = env.held
+    cb({ ...moreReplies(archivedOnly, 'L1')(msg), notes: ['Still not kept'] })
+    await env.tick()
+    assert.strictEqual(
+      env.elements['#moreStatus'].textContent,
+      '1 archived tasks · Not kept · Still not kept · Archived listing note'
+    )
+  })
+
   it('drops the archived tasks of a load that a newer Load replaced', async () => {
     const env = heldArchived(archivedOnly)
     await loadArchived(env)

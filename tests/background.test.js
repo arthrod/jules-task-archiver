@@ -4928,6 +4928,8 @@ function setupMoreEnvironment(sync = {}, storage = {}) {
   env.sandbox.callBatchExecute = async (rpc, payload, config) => {
     env.calls.push({ rpc, payload: JSON.parse(JSON.stringify(payload)), account: config.accountNum })
     if (rpc === 'p1Takd') {
+      // The one archived task is Org/Repo's; repo-docs has none archived.
+      if (archivedFilter(payload[0]) && payload[0].includes('repo-docs')) return [[]]
       const ids = archivedFilter(payload[0]) ? ['archived'] : ['running', 'paused', 'completed', 'other']
       return [
         ids.map((id) => [
@@ -5057,7 +5059,10 @@ describe('More Actions background', () => {
     assert.strictEqual(load.accounts[0].tasks.length, 4)
     assert.ok(reply.accounts, reply.error)
     assert.strictEqual(reply.accounts[0].archived.length, 0)
-    assert.match(reply.accounts[0].notes.join(' '), /Jules could not list the archived tasks of u\/1: RPC error \[4\]/)
+    assert.match(
+      reply.accounts[0].notes.join(' '),
+      /Jules could not list the archived tasks of 2 of 2 repos of u\/1: Org\/Repo \(RPC error \[4\]\)/
+    )
     assert.strictEqual(reply.accounts[1].archived.length, 1)
   })
 
@@ -5072,7 +5077,11 @@ describe('More Actions background', () => {
     assert.strictEqual(env.calls.length, 0, 'not in the load yet')
     const archived = await env.loadArchived(load.loadId)
     assert.strictEqual(archived.loadId, load.loadId)
-    assert.ok(env.calls.some((call) => call.rpc === 'p1Takd' && call.payload[0] === 'is_archived=true'))
+    assert.ok(
+      env.calls.some(
+        (call) => call.rpc === 'p1Takd' && call.payload[0] === 'source_id=github/Org/Repo AND is_archived=true'
+      )
+    )
     env.calls.length = 0
     await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
     assert.deepStrictEqual(env.calls[0], { rpc: 'Tjmm5c', payload: [['archived']], account: '1' })
@@ -5431,16 +5440,321 @@ describe('More Actions load choices', () => {
     assert.deepStrictEqual(env.calls, [])
     assert.ok(load.accounts.every((account) => Object.keys(account).sort().join() === 'account,notes'))
     const archived = await env.loadArchived(load.loadId)
-    assert.deepStrictEqual([...new Set(listed(env))], ['p1Takd:is_archived=true'])
+    assert.deepStrictEqual(
+      [...new Set(listed(env))],
+      [
+        'YqkSHd:',
+        'p1Takd:source_id=github/Org/Repo AND is_archived=true',
+        'p1Takd:source_id=github/org/repo-docs AND is_archived=true'
+      ]
+    )
     assert.strictEqual(archived.accounts[0].archived.length, 1)
   })
 
-  it('an All-repos load asks for every task and, for Archived, every archived task', async () => {
+  it('an All-repos load asks for every task with no repo lookup', async () => {
     const env = setupMoreEnvironment()
-    const load = await env.load('', 'all')
-    await env.loadArchived(load.loadId)
-    assert.deepStrictEqual([...new Set(listed(env))].sort(), ['hvmRxc:', 'p1Takd:', 'p1Takd:is_archived=true'])
+    await env.load('', 'all')
+    assert.deepStrictEqual([...new Set(listed(env))].sort(), ['hvmRxc:', 'p1Takd:'])
     assert.ok(!env.calls.some((call) => call.rpc === 'YqkSHd'))
+  })
+
+  it("an All-repos Archived lists each connected repo's archived tasks, never the whole archive at once", async () => {
+    const env = setupMoreEnvironment()
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.ok(!env.calls.some((call) => call.rpc === 'p1Takd' && call.payload[0] === 'is_archived=true'))
+    for (const account of ['1', '2']) {
+      const calls = env.calls.filter((call) => call.account === account)
+      assert.deepStrictEqual(
+        Array.from(calls, (call) => (call.rpc === 'YqkSHd' ? call.payload[1] : call.payload[0])),
+        [null, 'source_id=github/Org/Repo AND is_archived=true', 'source_id=github/org/repo-docs AND is_archived=true'],
+        'one repo list per account, then one archived list per repo'
+      )
+    }
+    assert.deepStrictEqual(
+      Array.from(archived.accounts, (account) =>
+        Array.from(account.archived, (task) => `${task.id}:${task.repo}`).join()
+      ),
+      ['archived:Org/Repo', 'archived:Org/Repo']
+    )
+    assert.ok(archived.accounts.every((account) => account.notes.length === 0))
+  })
+
+  it('lists at most Parallel per account repos at once', async () => {
+    const env = setupMoreEnvironment({ settings: { perAccountParallel: 2 } })
+    const sources = Array.from({ length: 7 }, (_, i) => [`github/org/r${i}`])
+    let open = 0
+    let peak = 0
+    let listed = 0
+    env.sandbox.callBatchExecute = async (rpc, payload, config) => {
+      if (config.accountNum !== '1') return rpc === 'YqkSHd' ? [[]] : []
+      if (rpc === 'YqkSHd') return [sources]
+      open++
+      peak = Math.max(peak, open)
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+      open--
+      listed++
+      return [[[`t-${payload[0].slice(17, 21)}`, 'T', null, null, payload[0].split(' ')[0].slice(10), 3]]]
+    }
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.strictEqual(listed, 7)
+    assert.strictEqual(peak, 2)
+    assert.strictEqual(archived.accounts[0].archived.length, 7)
+  })
+
+  it('names the repos whose archived tasks Jules could not list, and keeps the rest', async () => {
+    const env = setupMoreEnvironment()
+    const original = env.sandbox.callBatchExecute
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && archivedFilter(payload[0]) && payload[0].includes('repo-docs')) {
+        throw new Error('RPC p1Takd error code [4]')
+      }
+      return original(rpc, payload, config)
+    }
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    assert.deepStrictEqual(
+      [...archived.accounts[0].notes],
+      ['Jules could not list the archived tasks of 1 of 2 repos of u/1: org/repo-docs (RPC p1Takd error code [4]).']
+    )
+  })
+
+  it('names at most three failed repos and counts the rest', async () => {
+    const env = setupMoreEnvironment()
+    env.sandbox.callBatchExecute = async (rpc, _payload, config) => {
+      if (rpc === 'YqkSHd') return [Array.from({ length: 5 }, (_, i) => [`github/org/r${i}`])]
+      if (rpc === 'p1Takd' && config.accountNum === '1') throw new Error('RPC error [4]')
+      return [[]]
+    }
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.deepStrictEqual(
+      [...archived.accounts[0].notes],
+      [
+        'Jules could not list the archived tasks of 5 of 5 repos of u/1: org/r0 (RPC error [4]), org/r1 (RPC error [4]), org/r2 (RPC error [4]) and 2 more.'
+      ]
+    )
+    assert.deepStrictEqual([...archived.accounts[1].notes], [])
+  })
+
+  it("an account whose repos can't be read gets a note, and no archived list is asked", async () => {
+    const env = setupMoreEnvironment()
+    const original = env.sandbox.callBatchExecute
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'YqkSHd' && config.accountNum === '2') throw new Error('RPC YqkSHd error code [13]')
+      return original(rpc, payload, config)
+    }
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.ok(!env.calls.some((call) => call.rpc === 'p1Takd' && call.account === '2'))
+    assert.deepStrictEqual(
+      [...archived.accounts[1].notes],
+      ['Jules could not list the archived tasks of u/2: RPC YqkSHd error code [13].']
+    )
+    assert.strictEqual(archived.accounts[0].archived.length, 1)
+  })
+
+  it('saves how many repos the All-repos archived listing has done, for the popup', async () => {
+    const env = setupMoreEnvironment()
+    const { loadId } = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const saved = env.sessionSetData
+      .filter((data) => data.moreArchivedProgress)
+      .map((data) => data.moreArchivedProgress)
+    assert.ok(saved.length > 0)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(saved.at(-1))), { loadId, done: 4, total: 4 })
+    env.sessionSetData.length = 0
+    await env.loadArchived((await env.load('org/repo', 'archive')).loadId)
+    assert.ok(
+      !env.sessionSetData.some((data) => data.moreArchivedProgress),
+      'one repo is one request: no progress to show'
+    )
+  })
+
+  it('lists the disconnected repos too, after the connected ones', async () => {
+    const env = setupMoreEnvironment({ settings: { perAccountParallel: 1 } })
+    const asked = []
+    env.sandbox.callBatchExecute = async (rpc, payload, config) => {
+      if (config.accountNum !== '1') return [[]]
+      if (rpc === 'YqkSHd') {
+        asked.push(`YqkSHd:${payload[1]}`)
+        // Row [4]: 1 = connected, 2 = disconnected.
+        return [
+          [
+            ['github/o/gone', null, null, null, 2],
+            ['github/o/live', null, null, null, 1],
+            ['gitlab/o/other', null, null, null, 1]
+          ]
+        ]
+      }
+      asked.push(payload[0])
+      return [[[`t-${asked.length}`, 'T', null, null, payload[0].split(' ')[0].slice(10), 3]]]
+    }
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.deepStrictEqual(asked, [
+      'YqkSHd:null',
+      'source_id=github/o/live AND is_archived=true',
+      'source_id=github/o/gone AND is_archived=true'
+    ])
+    assert.deepStrictEqual(
+      Array.from(archived.accounts[0].archived, (task) => task.repo),
+      ['o/live', 'o/gone']
+    )
+  })
+
+  it('a disconnected repo can be loaded by name', async () => {
+    const env = setupMoreEnvironment()
+    const original = env.sandbox.callBatchExecute
+    env.sandbox.callBatchExecute = (rpc, payload, config) =>
+      rpc === 'YqkSHd'
+        ? [payload[1] === null ? [['github/o/Gone', null, null, null, 2]] : []]
+        : original(rpc, payload, config)
+    await env.loadArchived((await env.load('o/gone', 'archive')).loadId)
+    assert.ok(env.calls.some((call) => call.payload[0] === 'source_id=github/o/Gone AND is_archived=true'))
+  })
+
+  it("retries a repo's archived list on a 5xx before naming it", async () => {
+    const env = setupMoreEnvironment()
+    const original = env.sandbox.callBatchExecute
+    let failures = 0
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && payload[0].startsWith('source_id=github/Org/Repo') && config.accountNum === '1') {
+        if (failures++ === 0) throw new Error('HTTP 502')
+      }
+      return original(rpc, payload, config)
+    }
+    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    assert.strictEqual(failures, 2)
+    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    assert.deepStrictEqual([...archived.accounts[0].notes], [])
+  })
+
+  // Timers the test runs by hand; the worker's other timers are not used here.
+  function fakeTimers(env) {
+    const timers = []
+    env.sandbox.setTimeout = (fn, ms) => timers.push({ fn, ms, cleared: false })
+    env.sandbox.clearTimeout = (id) => {
+      if (timers[id - 1]) timers[id - 1].cleared = true
+    }
+    timers.run = () => {
+      for (const timer of timers.splice(0)) if (!timer.cleared) timer.fn()
+    }
+    return timers
+  }
+  const settle = async () => {
+    for (let i = 0; i < 200; i++) await Promise.resolve()
+  }
+  const progressSaves = (env) =>
+    env.sessionSetData
+      .filter((data) => data.moreArchivedProgress)
+      .map((data) => JSON.parse(JSON.stringify(data.moreArchivedProgress)))
+
+  it('saves the count while it lists, at most every 500 ms', async () => {
+    const env = setupMoreEnvironment({ settings: { perAccountParallel: 1 } })
+    const timers = fakeTimers(env)
+    const held = []
+    env.sandbox.callBatchExecute = (rpc, _payload, config) => {
+      if (config.accountNum !== '1') return [[]]
+      if (rpc === 'YqkSHd') return [[['github/o/r0'], ['github/o/r1'], ['github/o/r2']]]
+      return new Promise((resolve) => held.push(() => resolve([[]])))
+    }
+    const { loadId } = await env.load('', 'archive')
+    const listing = env.loadArchived(loadId)
+    await settle()
+    held.shift()()
+    await settle()
+    assert.deepStrictEqual(
+      timers.filter((timer) => !timer.cleared).map((timer) => timer.ms),
+      [500],
+      'one save waits, however many repos finish meanwhile'
+    )
+    timers.run()
+    assert.deepStrictEqual(progressSaves(env), [{ loadId, done: 1, total: 3 }])
+    while (held.length) {
+      held.shift()()
+      await settle()
+    }
+    await listing
+    assert.deepStrictEqual(progressSaves(env).at(-1), { loadId, done: 3, total: 3 })
+  })
+
+  it('stops retrying a repo, and saving its count, once a newer Load replaced the load', async () => {
+    const env = setupMoreEnvironment({ settings: { perAccountParallel: 1 } })
+    const timers = fakeTimers(env)
+    let lists = 0
+    env.sandbox.callBatchExecute = async (rpc, _payload, config) => {
+      if (config.accountNum !== '1') return [[]]
+      if (rpc === 'YqkSHd') return [[['github/o/r0'], ['github/o/r1']]]
+      if (rpc === 'hvmRxc') return [[]]
+      lists++
+      throw new Error('HTTP 502')
+    }
+    const first = await env.load('', 'archive')
+    const late = env.loadArchived(first.loadId)
+    await settle()
+    assert.strictEqual(lists, 1)
+    await env.load('', 'scheduled')
+    env.sessionSetData.length = 0
+    // The retry's wait ends after the newer Load; so do the count's saves.
+    for (let i = 0; i < 5; i++) {
+      timers.run()
+      await settle()
+    }
+    assert.match((await late).error, /newer load/i)
+    assert.strictEqual(lists, 1, 'no request after the load was replaced')
+    assert.deepStrictEqual(progressSaves(env), [])
+  })
+
+  it('keeps and answers a listing that Chrome could not save, with a note', async () => {
+    const env = setupMoreEnvironment()
+    const set = env.sandbox.chrome.storage.session.set
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreItems?.items.some((item) => item.kind === 'archived')) {
+        throw new Error('Session storage quota bytes exceeded.')
+      }
+      return set(data)
+    }
+    const { loadId } = await env.load('', 'archive')
+    const archived = await env.loadArchived(loadId)
+    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    assert.deepStrictEqual(
+      [...archived.notes],
+      [
+        'Chrome could not keep this list (Session storage quota bytes exceeded.): it is lost if the extension restarts, so act on it now or load again.'
+      ]
+    )
+    env.calls.length = 0
+    await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }], true)
+    assert.match(env.sandbox.test_state().log.join('\n'), /DRY RUN - would Unarchive \[u\/1\] \[archived\]/)
+  })
+
+  it('answers a load that Chrome could not save, with a note', async () => {
+    const env = setupMoreEnvironment()
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreItems) throw new Error('Session storage quota bytes exceeded.')
+    }
+    const load = await env.load('', 'all')
+    assert.strictEqual(load.accounts[0].tasks.length, 4)
+    assert.match(load.notes.join(' '), /Chrome could not keep this list/)
+  })
+
+  it('a newer Load stops the older All-repos archived listing from asking for more repos', async () => {
+    const env = setupMoreEnvironment({ settings: { perAccountParallel: 1 } })
+    const sources = Array.from({ length: 6 }, (_, i) => [`github/org/r${i}`])
+    const held = []
+    let asked = 0
+    env.sandbox.callBatchExecute = (rpc, _payload, config) => {
+      if (config.accountNum !== '1') return rpc === 'YqkSHd' ? [[]] : [[]]
+      if (rpc === 'YqkSHd') return [sources]
+      if (rpc === 'hvmRxc') return [[]]
+      // Only the first repo's list waits; any later one answers at once.
+      if (++asked > 1) return [[]]
+      return new Promise((resolve) => held.push(() => resolve([[]])))
+    }
+    const first = await env.load('', 'archive')
+    const late = env.loadArchived(first.loadId)
+    for (let i = 0; i < 100; i++) await Promise.resolve()
+    assert.strictEqual(asked, 1)
+    await env.load('', 'scheduled')
+    held.shift()()
+    assert.match((await late).error, /newer load/i)
+    assert.strictEqual(asked, 1, 'no repo is asked for after the load was replaced')
   })
 
   it('a Scheduled repo load needs no repo lookup', async () => {
@@ -5462,7 +5776,7 @@ describe('More Actions load choices', () => {
     const reply = await env.load('org/repo', 'all')
     assert.ok(!env.calls.some((call) => call.rpc === 'p1Takd' && call.account === '2'))
     assert.strictEqual(reply.accounts[1].tasks.length, 0)
-    assert.match(reply.accounts[1].notes.join(' '), /u\/2 has no connected repo org\/repo/)
+    assert.match(reply.accounts[1].notes.join(' '), /u\/2 has no repo org\/repo/)
     assert.strictEqual(reply.accounts[1].schedules.length, 2, 'schedules are still read')
     assert.strictEqual(reply.accounts[0].tasks.length, 3)
   })
@@ -5483,17 +5797,18 @@ describe('More Actions load choices', () => {
     assert.match(reply.accounts[0].notes.join(' '), /Could not read the repos of u\/1.*as typed/)
   })
 
-  it('an All-repos archived listing that fails suggests one repo', async () => {
+  it("a one-repo archived listing that fails says so in the account's note", async () => {
     const env = setupMoreEnvironment()
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && archivedFilter(payload[0])) throw new Error('RPC p1Takd error code [4]')
       return original(rpc, payload, config)
     }
-    const all = await env.loadArchived((await env.load('', 'archive')).loadId)
-    assert.match(all.accounts[0].notes.join(' '), /error code \[4\]\. Choose one repo/)
     const one = await env.loadArchived((await env.load('org/repo', 'archive')).loadId)
-    assert.doesNotMatch(one.accounts[0].notes.join(' '), /Choose one repo/)
+    assert.deepStrictEqual(
+      [...one.accounts[0].notes],
+      ['Jules could not list the archived tasks of u/1: RPC p1Takd error code [4].']
+    )
   })
 
   it('carries the ready-for-review flag and the prompt title of a task', async () => {

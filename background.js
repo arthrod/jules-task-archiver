@@ -857,8 +857,11 @@ const TASK = {
 // all 5 accounts: the enabled-repo count matched UTrvy exactly every time.
 const SOURCE = {
   ID: 0,
+  // 1 = connected, 2 = disconnected (no longer shown in Jules' repo list).
+  STATUS: 4,
   SUGGESTION_BLOCK: 5
 }
+const SOURCE_DISCONNECTED = 2
 const SUGGESTION_TOGGLE_ON = 2
 
 // A Jules account may enable Suggestions on at most 5 repos. The extension must
@@ -1148,6 +1151,15 @@ async function listAllSources(config) {
     }
   }
   return sources
+}
+
+// Every GitHub source the account ever had, the connected ones first: a
+// disconnected repo keeps its tasks. Read-only work only.
+async function listEverySource(config) {
+  const rows = (await callBatchExecute(rpc('ListSources'), [null, null], config))?.[0] || []
+  const github = rows.filter((row) => typeof row?.[SOURCE.ID] === 'string' && row[SOURCE.ID].startsWith('github/'))
+  const disconnected = (row) => row[SOURCE.STATUS] === SOURCE_DISCONNECTED
+  return [...github.filter((row) => !disconnected(row)), ...github.filter(disconnected)].map((row) => row[SOURCE.ID])
 }
 
 async function safeListSources(label, config, allowAll = false) {
@@ -2843,6 +2855,20 @@ function saveMoreLoad() {
   })
 }
 
+// A load Chrome can't save (over the 10 MB session storage quota, say) still
+// answers from memory, with a note. The older saved load is dropped, so a
+// restarted worker acts on no load rather than on that one.
+async function saveMoreLoadOrNote(notes) {
+  try {
+    await saveMoreLoad()
+  } catch (e) {
+    notes.push(
+      `Chrome could not keep this list (${e.message}): it is lost if the extension restarts, so act on it now or load again.`
+    )
+    await chrome.storage.session.set({ moreItems: null }).catch(() => {})
+  }
+}
+
 const MORE_MESSAGE_KEYS = {
   LOAD_ITEMS: ['action', 'protocol', 'repo', 'category'],
   LOAD_ARCHIVED: ['action', 'protocol', 'loadId'],
@@ -2903,9 +2929,41 @@ function moreScheduleItem(row) {
   }
 }
 
+// Every archived task of the account, one repo at a time: Jules
+// gives up (RPC error [4], after about 90 s) on a large account's whole
+// archive, but lists one repo's in seconds. A repo it can't list goes into a
+// note; the others still load. Once a newer Load replaces this one, no
+// more repos are asked for.
+async function listArchivedByRepo(account, config, notes, progress) {
+  const sources = await listEverySource(config)
+  progress.add(sources.length)
+  const failed = []
+  const lists = await runInPool(sources, settings.perAccountParallel, async (source) => {
+    if (progress.replaced()) return []
+    try {
+      return await withRetry(() =>
+        progress.replaced() ? [] : listTasks(`source_id=${source} AND is_archived=true`, config)
+      )
+    } catch (e) {
+      failed.push(`${source.replace(/^github\//, '')} (${e.message})`)
+      return []
+    } finally {
+      progress.done()
+    }
+  })
+  if (failed.length) {
+    const named =
+      failed.length > 3 ? `${failed.slice(0, 3).join(', ')} and ${failed.length - 3} more` : failed.join(', ')
+    notes.push(
+      `Jules could not list the archived tasks of ${failed.length} of ${sources.length} repos of ${account}: ` +
+        `${named}.`
+    )
+  }
+  return lists.flat()
+}
+
 // What each list of a load reads, and the kind its items get. With a repo,
-// Jules is asked for that repo's source only: its archived tasks then come in
-// seconds, where every archived task of a large account times out.
+// Jules is asked for that repo's source only.
 const MORE_LISTS = {
   tasks: {
     kind: 'task',
@@ -2920,18 +2978,54 @@ const MORE_LISTS = {
   archived: {
     kind: 'archived',
     label: 'archived tasks',
-    read: (config, source) =>
-      listTasks(source ? `source_id=${source} AND is_archived=true` : 'is_archived=true', config)
+    read: (config, source, { account, notes, progress }) =>
+      source
+        ? listTasks(`source_id=${source} AND is_archived=true`, config)
+        : listArchivedByRepo(account, config, notes, progress)
   }
 }
 
-// The repo's source id as the account's connected repos spell it: Jules
-// matches source_id by exact case. null when the account doesn't have it.
+// The "N of M repos" the popup shows while every repo's archived tasks list.
+// Saved at most twice a second, and once more at the end.
+function moreArchivedProgress(loadId) {
+  const counts = { loadId, done: 0, total: 0 }
+  let timer = null
+  const save = () => {
+    clearTimeout(timer)
+    timer = null
+    // A newer load's count is the one to keep.
+    if (moreLoadId === loadId) chrome.storage.session.set({ moreArchivedProgress: { ...counts } })
+  }
+  const soon = () => {
+    timer ??= setTimeout(save, 500)
+  }
+  return {
+    add(n) {
+      counts.total += n
+      soon()
+    },
+    done() {
+      counts.done++
+      soon()
+    },
+    finish() {
+      if (counts.total) save()
+      else clearTimeout(timer)
+    },
+    replaced: () => moreLoadId !== loadId
+  }
+}
+
+const NO_PROGRESS = { add() {}, done() {}, finish() {}, replaced: () => false }
+
+// The repo's source id as the account's repos spell it (a disconnected one
+// too): Jules matches source_id by exact case. null when the account
+// doesn't have it.
 async function moreRepoSource(account, repo, config, notes) {
   const wanted = `github/${repo}`
   try {
-    const source = (await listAllSources(config)).find((s) => s.toLowerCase() === wanted.toLowerCase())
-    if (!source) notes.push(`${account} has no connected repo ${repo}.`)
+    const source = (await listEverySource(config)).find((s) => s.toLowerCase() === wanted.toLowerCase())
+    if (!source) notes.push(`${account} has no repo ${repo}.`)
     return source || null
   } catch (e) {
     notes.push(`Could not read the repos of ${account}, so ${repo} is used as typed: ${e.message}`)
@@ -2941,7 +3035,7 @@ async function moreRepoSource(account, repo, config, notes) {
 
 // What Load lists for each choice of its dropdown. Jules has no filter for
 // Completed, so those are picked here. The archived tasks come only with
-// LOAD_ARCHIVED: on a large archive Jules gives up after about 90 s.
+// LOAD_ARCHIVED: for all repos they take a few minutes on a large account.
 const MORE_LOAD_CATEGORIES = {
   all: { lists: ['tasks', 'schedules'] },
   scheduled: { lists: ['schedules'] },
@@ -2951,7 +3045,7 @@ const MORE_LOAD_CATEGORIES = {
 
 // Every signed-in account's `lists`, for one repo or all of them. A list
 // Jules can't give becomes a note for that account; the rest still load.
-async function listMoreItems(repo, lists, keep = () => true) {
+async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGRESS) {
   const tabs = keepFirstTabPerAccount(await getJulesTabs())
   if (!tabs.length) throw new Error('No Jules tabs found. Open jules.google.com first.')
   const matches = (source) => !repo || String(source).toLowerCase() === `github/${repo}`.toLowerCase()
@@ -2970,18 +3064,16 @@ async function listMoreItems(repo, lists, keep = () => true) {
         repo && lists.some((list) => list !== 'schedules')
           ? await moreRepoSource(account, repo, prepared.config, result.notes)
           : ''
+      const context = { account, notes: result.notes, progress }
       const reads = await Promise.allSettled(
         lists.map((list) =>
-          list !== 'schedules' && source === null ? [] : MORE_LISTS[list].read(prepared.config, source)
+          list !== 'schedules' && source === null ? [] : MORE_LISTS[list].read(prepared.config, source, context)
         )
       )
       for (const [index, list] of lists.entries()) {
         const read = reads[index]
         if (read.status === 'rejected') {
-          const hint = list === 'archived' && !repo ? ' Choose one repo: Jules lists its archived tasks faster.' : ''
-          result.notes.push(
-            `Jules could not list the ${MORE_LISTS[list].label} of ${account}: ${read.reason.message}.${hint}`
-          )
+          result.notes.push(`Jules could not list the ${MORE_LISTS[list].label} of ${account}: ${read.reason.message}.`)
         } else if (list === 'schedules') {
           result.schedules = read.value.filter((row) => matches(row[1])).map(moreScheduleItem)
         } else {
@@ -3018,8 +3110,9 @@ async function loadMoreItems(repo, category) {
     moreArchivedDone = false
     moreItems = new Map(moreItemsOf(accounts, lists).map((item) => [moreItemKey(item), item]))
     moreItemsError = null
-    await saveMoreLoad()
-    return { loadId: id, accounts }
+    const notes = []
+    await saveMoreLoadOrNote(notes)
+    return { loadId: id, accounts, notes }
   } finally {
     stopKeepAlive()
   }
@@ -3033,18 +3126,21 @@ async function loadMoreArchived(loadId) {
   if (moreArchivedFor === loadId) throw new Error('The archived tasks of this load are already listed. Load again.')
   moreArchivedFor = loadId
   const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo(), 25000)
+  const progress = moreArchivedProgress(loadId)
   try {
-    const accounts = await listMoreItems(moreLoadRepo, ['archived'])
+    const accounts = await listMoreItems(moreLoadRepo, ['archived'], undefined, progress)
     if (loadId !== moreLoadId) throw replaced()
     for (const item of moreItemsOf(accounts, ['archived'])) moreItems.set(moreItemKey(item), item)
     moreArchivedDone = true
-    await saveMoreLoad()
-    return { loadId, accounts }
+    const notes = []
+    await saveMoreLoadOrNote(notes)
+    return { loadId, accounts, notes }
   } catch (e) {
     // Nothing was listed (no Jules tab, say): the same load may try again.
     if (moreArchivedFor === loadId && !moreArchivedDone) moreArchivedFor = null
     throw e
   } finally {
+    progress.finish()
     clearInterval(keepAlive)
   }
 }
