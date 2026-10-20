@@ -1564,10 +1564,31 @@ describe('popup.html', () => {
     assert.match(popupHtml, /<legend[^>]*id="scopeLabel"[^>]*>Scope<\/legend>/)
   })
 
+  // The extension CSP blocks a style attribute, a <style> element and any
+  // <script> without src, whatever its spacing or other attributes.
+  const INLINE_STYLE_ATTR = /\sstyle\s*=/i
+  const STYLE_ELEMENT = /<style[\s>]/i
+  const INLINE_SCRIPT = /<script\b(?![^>]*\ssrc\s*=)[^>]*>/i
+
   it('has no inline styles or scripts (blocked by the extension CSP)', () => {
-    assert.ok(!/\sstyle=/i.test(popupHtml))
-    assert.ok(!/<style[\s>]/i.test(popupHtml))
-    assert.ok(!/<script>(?!<\/script>)/i.test(popupHtml))
+    assert.ok(!INLINE_STYLE_ATTR.test(popupHtml))
+    assert.ok(!STYLE_ELEMENT.test(popupHtml))
+    assert.ok(!INLINE_SCRIPT.test(popupHtml))
+  })
+
+  it('detects inline styles and scripts whatever their spacing or attributes', () => {
+    assert.ok(INLINE_STYLE_ATTR.test('<div style="color:red">'))
+    assert.ok(INLINE_STYLE_ATTR.test('<div style ="color:red">'))
+    assert.ok(INLINE_STYLE_ATTR.test('<div\n  style\t=  "color:red">'))
+    assert.ok(STYLE_ELEMENT.test('<style>p{}</style>'))
+    assert.ok(STYLE_ELEMENT.test('<STYLE media="all">'))
+    assert.ok(INLINE_SCRIPT.test('<script>alert(1)</script>'))
+    assert.ok(INLINE_SCRIPT.test('<script type="module">import "./x.js"</script>'))
+    assert.ok(INLINE_SCRIPT.test('<script\ndefer>run()</script>'))
+    assert.ok(!INLINE_SCRIPT.test('<script src="popup.js"></script>'))
+    assert.ok(!INLINE_SCRIPT.test('<script type="module" src="popup.js"></script>'))
+    assert.ok(!INLINE_SCRIPT.test('<script defer src = "popup.js"></script>'))
+    assert.ok(!INLINE_STYLE_ATTR.test('<p>Lifestyle=good</p>'))
   })
 })
 
