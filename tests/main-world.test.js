@@ -225,7 +225,7 @@ describe('main-world.js', () => {
     assert.strictEqual(startMsg.data.config.capturedAt, 1234567890)
     // The tag tells content.js the message is from this observer, not from an
     // older one still installed on a page opened before an update.
-    assert.strictEqual(startMsg.data.observer, 3)
+    assert.strictEqual(startMsg.data.observer, 4)
   })
 
   it('captures the start config from fetch(Request), reading a clone before the page sends it', async () => {
@@ -436,6 +436,19 @@ describe('main-world.js', () => {
     const oldFetch = windowMock.fetch
     vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
     assert.notStrictEqual(windowMock.fetch, oldFetch)
+  })
+
+  it('installs over the untagged version-3 observer and tags what it posts', async () => {
+    const { sandbox, messages, windowMock } = setupSandbox({})
+    // Version 3 before the tag: content.js drops its messages, so a newer one must install.
+    windowMock.__julesArchiverObserver = 3
+    const oldFetch = windowMock.fetch
+    vm.runInContext(mainWorldJs, sandbox, { filename: mainWorldJsPath })
+    assert.notStrictEqual(windowMock.fetch, oldFetch)
+    const payload = [null, null, ['m'], null, null, null, null, null, null, null]
+    const body = `f.req=${encodeURIComponent(JSON.stringify([[['Rja83d', JSON.stringify(payload)]]]))}`
+    await windowMock.fetch('https://jules.google.com/_/Swebot/data/batchexecute?rpcids=Rja83d', { body })
+    assert.strictEqual(messages.find((m) => m.data.type === 'JULES_START_CONFIG')?.data.observer, 4)
   })
 
   it('lets a copy injected again after a reload retarget the first observer', async () => {

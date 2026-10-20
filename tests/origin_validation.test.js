@@ -96,7 +96,7 @@ describe('content.js message handler origin checks', () => {
     listeners.message({
       source: windowObj,
       origin: PAGE_ORIGIN,
-      data: { type: 'JULES_START_CONFIG', observer: 3, config: { capturedAt: 1 } }
+      data: { type: 'JULES_START_CONFIG', observer: 4, config: { capturedAt: 1 } }
     })
 
     assert.strictEqual(runtimeMessages.length, 1)
@@ -110,7 +110,7 @@ describe('content.js message handler origin checks', () => {
     listeners.message({
       source: windowObj,
       origin: 'https://evil.example.com',
-      data: { type: 'JULES_START_CONFIG', observer: 3, config: { capturedAt: 1 } }
+      data: { type: 'JULES_START_CONFIG', observer: 4, config: { capturedAt: 1 } }
     })
 
     assert.strictEqual(runtimeMessages.length, 0, 'foreign-origin message must not be relayed')
@@ -123,7 +123,7 @@ describe('content.js message handler origin checks', () => {
     listeners.message({
       source: {},
       origin: PAGE_ORIGIN,
-      data: { type: 'JULES_START_CONFIG', observer: 3, config: { capturedAt: 1 } }
+      data: { type: 'JULES_START_CONFIG', observer: 4, config: { capturedAt: 1 } }
     })
 
     assert.strictEqual(runtimeMessages.length, 0, 'cross-frame message must not be relayed')
