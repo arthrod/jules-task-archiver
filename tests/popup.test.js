@@ -373,8 +373,10 @@ function setupPopupSandbox({
     console,
     setTimeout,
     clearTimeout,
-    setInterval,
-    clearInterval,
+    // A real interval (the More Actions cache age) would keep the test
+    // process alive after the tests end; a test that needs one sets its own.
+    setInterval: () => 0,
+    clearInterval: () => {},
     Math,
     String,
     Array,
@@ -1875,6 +1877,64 @@ describe('More Actions popup edge cases', () => {
       /from the cache, 7 min old/,
       'the older part, not the newer archived one'
     )
+  })
+
+  it('keeps counting the age of a cached load while the popup stays open, and stops after a live one', async () => {
+    const env = setupPopupSandbox()
+    const timers = []
+    env.sandbox.setInterval = (fn, ms) => timers.push({ fn, ms, on: true })
+    env.sandbox.clearInterval = (id) => {
+      timers[id - 1].on = false
+    }
+    const start = 1_800_000_000_000
+    env.sandbox.__now = start
+    vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
+    const reply = moreReplies(cacheAccounts)
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      const answer = reply(msg)
+      if (cb) cb(msg.action.startsWith('LOAD_') && !msg.fresh ? { ...answer, cachedAt: start - 4 * 60000 } : answer)
+    }
+    env.load()
+    await env.tick()
+    const el = env.elements
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules · from the cache, 4 min old')
+    const running = () => timers.filter((timer) => timer.on)
+    assert.strictEqual(running().length, 1)
+    env.sandbox.__now += 6 * 60000
+    running()[0].fn()
+    assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules · from the cache, 10 min old')
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(running().length, 1, 'another cached load keeps the one timer')
+    await el['#moreRefresh'].dispatchEvent('click')
+    await env.tick()
+    running()[0].fn()
+    assert.strictEqual(running().length, 0, 'a live load needs no timer')
+    assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules')
+  })
+
+  it('offers Refresh when only the archived part came from the cache', async () => {
+    const env = setupPopupSandbox()
+    const reply = moreReplies(cacheAccounts)
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      if (!cb) return
+      cb(msg.action === 'LOAD_ARCHIVED' ? { ...reply(msg), cachedAt: Date.now() - 2 * 60000 } : reply(msg))
+    }
+    env.load()
+    await env.tick()
+    const el = env.elements
+    el['#moreCategory'].value = 'archive'
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(
+      el['#moreStatus'].textContent,
+      '1 archived tasks · from the cache, 2 min old · Archived listing note'
+    )
+    assert.ok(!el['#moreRefresh'].classList.contains('hidden'))
   })
 
   it('Archived waits for LOAD_ARCHIVED, with Load free meanwhile', async () => {
