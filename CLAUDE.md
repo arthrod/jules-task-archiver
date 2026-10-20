@@ -9,7 +9,7 @@ Chrome Extension (Manifest V3) for bulk operations on Jules tasks via batchexecu
 - `content.js` -- Content script: WIZ_global_data token extraction + fetch observer (MAIN world)
 - `items.js` -- Items list shared by popup and background: task states, labels, item resolution
 - `settings.js` -- Settings shared by popup and background: defaults and limits, Jules API values, bundle rediscovery parser
-- `popup.html/js/css` -- Popup UI: Items dropdown, Proceed/Archive, settings, schedule, progress display
+- `popup.html/js/css` -- Popup UI: Items dropdown, Proceed/Archive, settings, schedule, More Actions, progress display
 - `fonts/` -- Libre Franklin and Roboto Mono (latin subsets, OFL / Apache 2.0)
 - `icons/` -- Extension icons (16/48/128px)
 - `tests/` -- Unit tests (node:test + vm sandbox)
@@ -35,15 +35,18 @@ Task state codes (`row[5]`): 12 Waiting on You, 10 Awaiting Plan Approval, 4 Err
 2. **Proceed** (tasks) -- ListTasks (p1Takd) -> tasks of the chosen item, in this order: Waiting on You (reply: the default reply, with the message appended), Plan Approval (approve the plan), Paused (ResumeTask wk4vKd), running states (only with a message), Error (retry: the default retry prompt, with the message appended), Completed (follow-up, only with a message; under All only with Force). Replies, approvals and follow-ups go through GetTask (n74qPd, view 3) for the newest activity id -> Interact (SLmX6). Retries and follow-ups start a new run, so they are capped to the remaining daily quota (KQOO7), first come first served. A send is never retried (a 5xx may still have delivered it). Archived tasks are not covered.
 3. **Proceed** (Suggestions) -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> cap to remaining daily quota (KQOO7) -> StartSuggestion (Rja83d), one per suggestion, or with **One session for all** ONE per repo whose prompt carries every suggestion (an explicitly chosen owner/repo is used as-is). The message is appended to each prompt under "Additional instructions". Only repos whose per-repo Suggestions toggle is ON are touched; the daily session limit is never exceeded.
 4. **Archive** (Suggestions) -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> DismissSuggestion (sc1vFf) per suggestion.
-5. **Export suggestions** (link) -- ListSources (all connected repos, read-only) -> ListSuggestions (hQP40d) per repo -> JSON file via chrome.downloads (re-downloadable from the popup).
+5. **More Actions** -- Load one category across accounts, optionally for one exact repo: All (non-archived tasks and schedules, like Jules' own All tab), Scheduled, Completed or Archived. Select items in the scrolling list and confirm Archive, Unarchive, Pause task, Resume task, Pause schedule or Resume schedule. Only eligible selections run. The panel has its own Dry run and Force boxes (the main Dry-run box doesn't apply); the shared item limit applies. Archive checks the open PRs like the main Archive and skips a task with a matching one; Force skips that check, and only Archive uses it. A listing that fails appears as an account note. Unarchive checks ListTasks and retries missing ids once. No delete action exists.
+6. **Export suggestions** (link) -- ListSources (all connected repos, read-only) -> ListSuggestions (hQP40d) per repo -> JSON file via chrome.downloads (re-downloadable from the popup).
 
 START messages carry `{action: 'proceed'|'archive'|'export', item, dryRun, force, message, oneSession, ...}`; `resolveRunOptions` rejects an unknown action or item (a missing item never becomes All). The schedule (chrome.alarms) runs Archive Completed with the PR check, then optionally Proceed Suggestions.
+
+More Actions uses `LOAD_ITEMS { protocol, repo, category }`, `LOAD_ARCHIVED { protocol, loadId }` and `APPLY_ACTION { protocol, operation, dryRun, force, items }`. All three reject content scripts, unknown keys, protocol mismatches and overlapping operations. `category` is `all`, `scheduled`, `complete` or `archive` (`MORE_LOAD_CATEGORIES`); Jules has no Completed filter, so those tasks are picked in the worker. With a repo, the task lists ask Jules for that repo's `source_id` (spelled as ListSources has it), so a repo's archived tasks come in seconds; an account without the repo gets a note. LOAD_ITEMS answers with that category's lists and a `loadId`; for `archive` it lists nothing and the popup then sends LOAD_ARCHIVED, because on a large archive Jules gives up after about 90 s (RPC error [4]). LOAD_ARCHIVED is read-only: it doesn't hold runs back, keeps the worker alive with its own timer, and adds nothing once a newer Load replaced its load. The last load (id, repo, items keyed by account, kind and id) is kept in memory and session storage. APPLY_ACTION skips missing or unfit items and uses the existing progress and log view. The header order is Settings, Schedule, More Actions, Export.
 
 Every action accepts an optional repository filter (popup dropdown or typed `owner/repo`); empty = all repos. Matching is exact and case-insensitive (`owner/plate` never matches `owner/plate-docs`).
 
 ## Settings and client behavior
 
-- **Popup ↔ background version** (`RUN_PROTOCOL`, `START_OPTION_KEYS` in `settings.js`): Chrome reads the popup from disk each time it opens but keeps the old service worker until the extension is reloaded; on 2026-10-19 an old worker read a new popup's Proceed as "archive every task" (65 tasks). The popup asks `HELLO` on open and before every run and, when the answer is missing or differs, blocks every run and locks the schedule (the old worker would act on a schedule change; it stays locked until HELLO answers, and once stale it stays stale) behind a "reload the extension" banner; the background refuses a START without the same `protocol` or with an option outside `START_OPTION_KEYS`. Bump `RUN_PROTOCOL` whenever a popup↔background message changes meaning.
+- **Popup ↔ background version** (`RUN_PROTOCOL`, `START_OPTION_KEYS` in `settings.js`): Chrome reads the popup from disk each time it opens but keeps the old service worker until the extension is reloaded; on 2026-10-19 an old worker read a new popup's Proceed as "archive every task" (65 tasks). The popup asks `HELLO` on open and before every run and, when the answer is missing or differs, blocks every run and locks the schedule (the old worker would act on a schedule change; it stays locked until HELLO answers, and once stale it stays stale) behind a "reload the extension" banner; the background refuses a START without the same `protocol` or with an option outside `START_OPTION_KEYS`. More Actions messages also require the same protocol and known keys. Bump `RUN_PROTOCOL` whenever a popup↔background message changes meaning.
 - **Settings** (`chrome.storage.sync`: key `settings` for the numbers and switches, `defaultReply` / `defaultRetry` each under their own key so neither passes sync's 8 KB per item; `settingsFromSync` / `settingsToSync` in `settings.js`; the old popup's `continueMessage` / `continueErrorMessage` are read until the first successful save removes them): request timeout 30 s, task-list timeout 300 s, extra jitter (off, up to 10 s), parallel requests 6 per account / 12 total, Run up to N items (0 = no limit; dry and scheduled runs count too; a scheduled tick's archive and suggestion steps share one budget, and an account the archive step paused or stopped stays so for the suggestions (`resetRunLimits` runs once per tick); Export is read-only and not counted), default reply / retry (empty = built-in), reload the tab on sign-in failure (on). The background keeps them in memory and follows `storage.onChanged`; if the start-up read fails, START and the scheduled tick refuse until the extension is reloaded. START also waits for the run state a woken worker restores.
 - **Pacing** (`postBatchExecute`, at each POST to Jules): the per-account and total parallel limits apply to every physical request, retries included, until its reply has downloaded (`jFetch({ buffer: true })` reads the body under the request timeout; of the error bodies only a 400's is read, for its sign-in token, so a 429 pauses the account on its headers and one that stalls keeps its status); a request sent while others of its account are in flight waits a random 500–2000 ms first, plus the extra jitter; a lone request goes straight out. GitHub PR checks sent together wait the same random delay (`githubActive`), and their bodies are buffered too.
 - **HTTP 429**: the account's requests wait out Retry-After (seconds or a date; 30 s when absent). More than 5 minutes, or a 4th 429 in a row for the account (counted across its requests, reset by any success), stops that account for the run. `isRetryable` does not retry 429.
@@ -56,9 +59,12 @@ Background service worker makes all API calls. No DOM automation.
 
 ## Key RPC IDs
 
-- `p1Takd` -- ListTasks (filter, state)
+- `p1Takd` -- ListTasks `[filter, 4]`: `''` = every non-archived task, `is_archived=true` = every archived task (times out after ~90 s on a large account), `source_id=github/owner/repo AND is_archived=true|false` = one repo (exact case, as ListSources spells it; no quotes)
 - `Tjmm5c` -- ArchiveTasks `[taskIds, 1]` archives, `[taskIds]` unarchives (the Jules client drops `false`); a `[]` reply can still skip an id, so check with ListTasks
-- `tqq5v` -- PauseTask / stop a running session (taskId)
+- `tqq5v` -- PauseTask `[taskId]` (Queued, In Progress, Planning or Queued Restart only)
+- `hvmRxc` -- ListScheduledTasks `[]`
+- `gBUOb` -- PauseScheduledTask `[scheduleId]` (active schedules only)
+- `XuzQWe` -- ResumeScheduledTask `[scheduleId]` (paused schedules only)
 - `YqkSHd` -- ListSources (connected repos); row `[5][2][0] === 2` => Suggestions toggle ON
 - `hQP40d` -- ListSuggestions (repo); returns the raw pool, does NOT respect the toggle
 - `e4motb` -- SetSuggestionsToggle (repo, [2]=enable / [1]=disable)
@@ -68,7 +74,7 @@ Background service worker makes all API calls. No DOM automation.
 - `KQOO7` -- Daily session quota `[usedToday, [windowSeconds], dailyLimit, ...]`
 - `n74qPd` -- GetTask `[taskId, 3]`; view 3 includes the activity log at `[0][3]`
 - `SLmX6` -- Interact `[taskId, [_, [planId], [text, null, clientUuid], lastActivityId], null, [experimentIds]]`; `[1]` approves a plan, `[2]` sends a reply
-- `wk4vKd` -- ResumeTask `[taskId]` (resumes a paused session; payload not yet confirmed against a live capture)
+- `wk4vKd` -- ResumeTask `[taskId]` (resumes a paused session)
 
 ## Development
 

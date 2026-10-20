@@ -95,13 +95,54 @@ function taskStateFor(task, states = activeTaskStates) {
   return states.find((s) => s.code === code) || null
 }
 
+function isCompletedTask(task, states = activeTaskStates) {
+  return taskStateFor(task, states)?.kind === 'completed'
+}
+
 function itemIncludesTask(item, task) {
   if (item?.type !== 'tasks') return false
   return item.codes === null || item.codes.includes(taskStateCode(task))
 }
 
+// Shared eligibility keeps the action counts and the worker's checks in step.
+const MORE_ACTIONS = {
+  archive: { label: 'Archive', method: 'ArchiveTasks' },
+  unarchive: { label: 'Unarchive', method: 'ArchiveTasks' },
+  pauseTask: { label: 'Pause task', method: 'PauseTask' },
+  resumeTask: { label: 'Resume task', method: 'ResumeTask' },
+  pauseSchedule: { label: 'Pause schedule', method: 'PauseScheduledTask' },
+  resumeSchedule: { label: 'Resume schedule', method: 'ResumeScheduledTask' }
+}
+
+function moreItemKey(item) {
+  return JSON.stringify([item.account, item.kind, item.id])
+}
+
+function moreActionFits(action, item) {
+  if (!item) return false
+  switch (action) {
+    case 'archive':
+      return item.kind === 'task'
+    case 'unarchive':
+      return item.kind === 'archived'
+    case 'pauseTask':
+      return item.kind === 'task' && taskStateFor(item)?.kind === 'running'
+    case 'resumeTask':
+      return item.kind === 'task' && taskStateFor(item)?.kind === 'paused'
+    case 'pauseSchedule':
+      return item.kind === 'schedule' && item.state === 2
+    case 'resumeSchedule':
+      return item.kind === 'schedule' && item.state === 3
+    default:
+      return false
+  }
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
+    MORE_ACTIONS,
+    moreItemKey,
+    moreActionFits,
     TASK_STATES,
     NO_STATE_CODE,
     ITEM_ALL,
@@ -111,6 +152,7 @@ if (typeof module !== 'undefined') {
     listItems,
     resolveItem,
     taskStateCode,
+    isCompletedTask,
     taskStateFor,
     itemIncludesTask
   }

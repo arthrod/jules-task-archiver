@@ -66,7 +66,12 @@ function setupEnvironment(initialStorage = {}) {
   }
 
   vm.createContext(sandbox)
-  vm.runInContext(itemsScriptContent + settingsScriptContent + bgScriptContent, sandbox, { filename: bgScriptPath })
+  for (const [source, filename] of [
+    [itemsScriptContent, path.join(__dirname, '..', 'items.js')],
+    [settingsScriptContent, path.join(__dirname, '..', 'settings.js')],
+    [bgScriptContent, bgScriptPath]
+  ])
+    vm.runInContext(source, sandbox, { filename })
   sandbox.burstDelayMs = () => 0 // no pacing waits in tests
 
   return sandbox

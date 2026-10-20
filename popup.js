@@ -50,6 +50,21 @@ const settingsToggle = $('#settingsToggle')
 const scheduleToggle = $('#scheduleToggle')
 const settingsPanel = $('#settingsPanel')
 const schedulePanel = $('#schedulePanel')
+const moreToggle = $('#moreToggle')
+const morePanel = $('#morePanel')
+const moreAll = $('#moreAll')
+const moreRepoScope = $('#moreRepoScope')
+const moreRepo = $('#moreRepo')
+const moreCategorySelect = $('#moreCategory')
+const moreLoad = $('#moreLoad')
+const moreStatus = $('#moreStatus')
+const moreChips = $('#moreChips')
+const moreList = $('#moreList')
+const moreSelectAll = $('#moreSelectAll')
+const moreDryRun = $('#moreDryRun')
+const moreForce = $('#moreForce')
+const moreAction = $('#moreAction')
+const moreConfirm = $('#moreConfirm')
 const mainView = $('#mainView')
 const staleBanner = $('#staleBanner')
 
@@ -69,6 +84,18 @@ let backgroundStale = false
 // The worker answered HELLO with this popup's protocol. The schedule waits
 // for it: an old worker would act on a schedule change with its own rules.
 let backgroundOk = false
+let moreLoading = false
+let loadedMoreItems = []
+let selectedMoreItems = new Set()
+let moreCategory = 'all'
+// What the last Load listed: 'all', 'scheduled', 'complete' or 'archive'.
+let moreLoadedCategory = null
+// The worker's id for the last Load; the archived tasks come in a second
+// answer, which a newer Load makes stale. moreArchived: 'none', 'loading',
+// 'done' or 'failed'.
+let moreLoadId = null
+let moreArchived = 'none'
+let moreNotes = []
 
 // Storage-side bounds match background.js; the background re-validates anyway,
 // these just keep obviously-bad values out of sync storage.
@@ -342,7 +369,8 @@ messageInput.addEventListener('change', saveMessage)
 // never needs to scroll. ---
 const PANELS = [
   [settingsToggle, settingsPanel],
-  [scheduleToggle, schedulePanel]
+  [scheduleToggle, schedulePanel],
+  [moreToggle, morePanel]
 ]
 function togglePanel(toggle) {
   let anyOpen = false
@@ -771,15 +799,21 @@ customRepoInput.addEventListener('input', () => {
 // Run: Proceed, Archive, Export
 // =============================================================================
 
-const RUN_BUTTONS = { proceed: proceedBtn, archive: archiveBtn, export: exportBtn }
-const RUN_BUTTON_TEXT = { proceed: 'Proceed', archive: 'Archive', export: '↓ Export' }
-const RUNNING_TEXT = { proceed: '⏳ Proceeding…', archive: '⏳ Archiving…', export: '⏳ Exporting…' }
+const RUN_BUTTONS = { proceed: proceedBtn, archive: archiveBtn, export: exportBtn, more: moreConfirm }
+const RUN_BUTTON_TEXT = { proceed: 'Proceed', archive: 'Archive', export: '↓ Export', more: 'Confirm' }
+const RUNNING_TEXT = {
+  proceed: '⏳ Proceeding…',
+  archive: '⏳ Archiving…',
+  export: '⏳ Exporting…',
+  more: '⏳ Applying…'
+}
 
 function isRunning() {
   return runningAction !== null
 }
 
 function setRunning(action, dryRun) {
+  moreLoad.disabled = true
   runningAction = RUN_BUTTONS[action] ? action : 'proceed'
   for (const [name, btn] of Object.entries(RUN_BUTTONS)) {
     btn.disabled = true
@@ -801,6 +835,7 @@ function setIdle() {
 
 // Proceed and Archive need an item; nothing runs on a stale worker.
 function updateRunButtons() {
+  updateMoreControls()
   if (isRunning()) return
   const noItem = !getSelectedItem()
   proceedBtn.disabled = backgroundStale || noItem
@@ -829,6 +864,7 @@ function showStaleBackground() {
   backgroundStale = true
   backgroundOk = false
   for (const btn of Object.values(RUN_BUTTONS)) btn.disabled = true
+  updateMoreControls()
   lockSchedule(true)
   staleBanner.classList.remove('hidden')
 }
@@ -936,6 +972,280 @@ proceedBtn.addEventListener('click', () => startRun('proceed'))
 archiveBtn.addEventListener('click', () => startRun('archive'))
 exportBtn.addEventListener('click', () => startRun('export'))
 
+// =============================================================================
+// More Actions
+// =============================================================================
+
+function shownMoreItems(category = moreCategory) {
+  return loadedMoreItems.filter(
+    (item) =>
+      category === 'all' ||
+      (category === 'scheduled' && item.kind === 'schedule') ||
+      (category === 'completed' && item.kind === 'task' && isCompletedTask(item))
+  )
+}
+
+function fittingMoreItems(action) {
+  return loadedMoreItems.filter((item) => selectedMoreItems.has(moreItemKey(item)) && moreActionFits(action, item))
+}
+
+function updateMoreControls() {
+  const locked = backgroundStale || !backgroundOk || isRunning() || moreLoading
+  moreLoad.disabled = locked || (moreRepoScope.checked && !/^[\w.-]+\/[\w.-]+$/.test(moreRepo.value.trim()))
+  moreConfirm.disabled = locked || fittingMoreItems(moreAction.value).length === 0
+  // Force only skips Archive's open-PR check.
+  moreForce.disabled = moreAction.value !== 'archive'
+  if (!isRunning()) moreConfirm.textContent = moreDryRun.checked ? 'Confirm (dry run)' : 'Confirm'
+}
+
+function renderMoreSelection() {
+  const previous = moreAction.value
+  moreAction.textContent = ''
+  const choose = document.createElement('option')
+  choose.value = ''
+  choose.textContent = 'Choose an action'
+  moreAction.appendChild(choose)
+  for (const [action, details] of Object.entries(MORE_ACTIONS)) {
+    const count = fittingMoreItems(action).length
+    const option = document.createElement('option')
+    option.value = action
+    option.textContent = `${details.label} (${count})`
+    option.disabled = count === 0
+    moreAction.appendChild(option)
+  }
+  moreAction.value = fittingMoreItems(previous).length ? previous : ''
+  const shown = shownMoreItems()
+  const checked = shown.filter((item) => selectedMoreItems.has(moreItemKey(item))).length
+  moreSelectAll.checked = shown.length > 0 && checked === shown.length
+  moreSelectAll.indeterminate = checked > 0 && checked < shown.length
+  moreSelectAll.disabled = shown.length === 0
+  updateMoreControls()
+}
+
+function renderMoreItems() {
+  moreChips.textContent = ''
+  // A load of one category needs no chips.
+  const chips =
+    moreLoadedCategory === 'all'
+      ? [
+          ['all', 'All'],
+          ['scheduled', 'Scheduled'],
+          ['completed', 'Completed']
+        ]
+      : []
+  for (const [category, label] of chips) {
+    const chip = document.createElement('button')
+    chip.type = 'button'
+    chip.className = 'more-chip'
+    chip.textContent = `${label} (${shownMoreItems(category).length})`
+    chip.setAttribute('aria-pressed', String(category === moreCategory))
+    chip.addEventListener('click', () => {
+      moreCategory = category
+      renderMoreItems()
+    })
+    moreChips.appendChild(chip)
+  }
+  moreList.textContent = ''
+  const fragment = document.createDocumentFragment()
+  for (const item of shownMoreItems()) {
+    const row = document.createElement('label')
+    row.className = 'more-row'
+    const checkbox = document.createElement('input')
+    checkbox.type = 'checkbox'
+    checkbox.checked = selectedMoreItems.has(moreItemKey(item))
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) selectedMoreItems.add(moreItemKey(item))
+      else selectedMoreItems.delete(moreItemKey(item))
+      renderMoreSelection()
+    })
+    const text = document.createElement('span')
+    text.className = 'more-text'
+    const title = document.createElement('span')
+    title.className = 'more-title'
+    title.textContent = item.title
+    title.title = item.title
+    const meta = document.createElement('span')
+    meta.className = 'more-meta'
+    const kind = item.kind === 'schedule' ? 'Scheduled' : item.kind === 'archived' ? 'Archived' : 'Task'
+    const state =
+      item.kind === 'schedule'
+        ? item.state === 2
+          ? 'Active'
+          : item.state === 3
+            ? 'Paused'
+            : `State ${item.state}`
+        : item.awaitingReview && isCompletedTask(item)
+          ? 'Ready for review'
+          : taskStateFor(item)?.name || `State ${item.state}`
+    meta.textContent = `${kind} · ${state} · ${item.repo || '(no repo)'} · ${item.account}`
+    text.appendChild(title)
+    text.appendChild(meta)
+    row.appendChild(checkbox)
+    row.appendChild(text)
+    fragment.appendChild(row)
+  }
+  moreList.appendChild(fragment)
+  renderMoreSelection()
+}
+
+for (const input of [moreAll, moreRepoScope]) input.addEventListener('change', updateMoreControls)
+moreRepo.addEventListener('input', () => {
+  if (moreRepo.value.trim()) moreRepoScope.checked = true
+  updateMoreControls()
+})
+moreAction.addEventListener('change', updateMoreControls)
+moreDryRun.addEventListener('change', updateMoreControls)
+moreSelectAll.addEventListener('change', () => {
+  for (const item of shownMoreItems()) {
+    if (moreSelectAll.checked) selectedMoreItems.add(moreItemKey(item))
+    else selectedMoreItems.delete(moreItemKey(item))
+  }
+  renderMoreItems()
+})
+
+const MORE_KINDS = { tasks: 'task', schedules: 'schedule', archived: 'archived' }
+
+function moreItemsFrom(accounts) {
+  return accounts.flatMap((account) =>
+    Object.entries(MORE_KINDS).flatMap(([list, kind]) =>
+      (account[list] || []).map((item) => ({ ...item, account: account.account, kind }))
+    )
+  )
+}
+
+function renderMoreStatus() {
+  const count = (kind) => loadedMoreItems.filter((item) => item.kind === kind).length
+  const archived = {
+    loading: 'Listing the archived tasks…',
+    done: `${count('archived')} archived tasks`,
+    failed: '',
+    none: ''
+  }[moreArchived]
+  const counts = {
+    all: `${count('task')} tasks, ${count('schedule')} schedules`,
+    scheduled: `${count('schedule')} schedules`,
+    complete: `${count('task')} completed tasks`,
+    archive: archived
+  }[moreLoadedCategory]
+  moreStatus.textContent = [counts, ...moreNotes].filter(Boolean).join(' · ')
+}
+
+function sendMore(msg) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(msg, (reply) => {
+      resolve(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : reply)
+    })
+  })
+}
+
+// Jules can take about 90 s on a large archive (and then give up), so the
+// list is usable before the archived tasks arrive.
+async function loadMoreArchived(loadId) {
+  const reply = await sendMore({ action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId })
+  if (loadId !== moreLoadId) return
+  if (!reply?.accounts || reply.error) {
+    moreArchived = 'failed'
+    moreNotes.push(`Could not list the archived tasks: ${reply?.error || 'no answer'}`)
+  } else {
+    moreArchived = 'done'
+    loadedMoreItems.push(...moreItemsFrom(reply.accounts))
+    moreNotes.push(...reply.accounts.flatMap((account) => account.notes || []))
+  }
+  renderMoreStatus()
+  renderMoreItems()
+}
+
+moreLoad.addEventListener('click', async () => {
+  updateMoreControls()
+  if (moreLoad.disabled) return
+  moreLoading = true
+  moreLoad.textContent = 'Loading…'
+  moreLoad.setAttribute('aria-busy', 'true')
+  updateMoreControls()
+  try {
+    if (!(await checkBackground()) || backgroundStale) {
+      showStaleBackground()
+      return
+    }
+    const category = moreCategorySelect.value
+    const response = await sendMore({
+      action: 'LOAD_ITEMS',
+      protocol: RUN_PROTOCOL,
+      repo: moreRepoScope.checked ? moreRepo.value.trim() : '',
+      category
+    })
+    if (!response?.accounts || response.error) throw new Error(response?.error || 'Could not load items.')
+    moreLoadId = response.loadId
+    moreLoadedCategory = category
+    moreArchived = category === 'archive' ? 'loading' : 'none'
+    loadedMoreItems = moreItemsFrom(response.accounts)
+    moreNotes = response.accounts.flatMap((account) => account.notes || [])
+    selectedMoreItems = new Set()
+    moreCategory = 'all'
+    renderMoreStatus()
+    renderMoreItems()
+    if (category === 'archive') loadMoreArchived(response.loadId)
+  } catch (e) {
+    moreLoadId = null
+    moreLoadedCategory = null
+    moreArchived = 'none'
+    loadedMoreItems = []
+    selectedMoreItems.clear()
+    renderMoreItems()
+    moreStatus.textContent = e.message
+  } finally {
+    moreLoading = false
+    moreLoad.textContent = 'Load'
+    moreLoad.removeAttribute('aria-busy')
+    updateMoreControls()
+  }
+})
+
+moreConfirm.addEventListener('click', async () => {
+  updateMoreControls()
+  if (moreConfirm.disabled) return
+  const operation = moreAction.value
+  const items = fittingMoreItems(operation).map(({ account, kind, id }) => ({ account, kind, id }))
+  const dryRun = moreDryRun.checked
+  const force = operation === 'archive' && moreForce.checked
+  setRunning('more', dryRun)
+  togglePanel(null)
+  resetBtn.classList.add('hidden')
+  downloadBtn.classList.add('hidden')
+  lastExportData = null
+  summarySection.classList.add('hidden')
+  idleText.classList.add('hidden')
+  logPre.textContent = ''
+  logStatus.textContent = dryRun ? 'Starting · dry-run' : 'Starting'
+  currentInfo.textContent = 'Starting...'
+  progressFill.style.width = '0%'
+  progressFill.style.background = ''
+  if (!(await checkBackground()) || backgroundStale) {
+    setIdle()
+    showStaleBackground()
+    currentInfo.textContent = 'Not started: reload the extension first.'
+    logStatus.textContent = 'Error'
+    return
+  }
+  chrome.runtime.sendMessage(
+    { action: 'APPLY_ACTION', protocol: RUN_PROTOCOL, operation, dryRun, force, items },
+    (response) => {
+      const error = chrome.runtime.lastError?.message || response?.error || (!response?.ok && 'Could not start action.')
+      if (error) {
+        setIdle()
+        currentInfo.textContent = `Error: ${error}`
+        logStatus.textContent = 'Error'
+      } else if (!dryRun) {
+        for (const item of items) selectedMoreItems.delete(moreItemKey(item))
+        renderMoreItems()
+        moreStatus.textContent = 'Load again to refresh item states after this action.'
+      }
+    }
+  )
+})
+
+renderMoreItems()
+
 // --- Reset ---
 resetBtn.addEventListener('click', () => {
   chrome.runtime.sendMessage({ action: 'RESET' })
@@ -983,6 +1293,7 @@ function renderState(state) {
   // Current info
   if (state.status === 'running') {
     clearExportResult() // a scheduled run starts without startRun
+    if (!isRunning()) setRunning(state.options?.action || 'proceed', dryRun)
     const parts = []
     if (state.currentTab) parts.push(state.currentTab)
     if (state.currentRepo) parts.push(state.currentRepo)
@@ -1071,6 +1382,7 @@ checkBackground().then((ok) => {
   // A check before a run may have failed while this answer was on its way.
   if (!ok || backgroundStale) return showStaleBackground()
   backgroundOk = true
+  updateMoreControls()
   lockSchedule(false)
 })
 chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {

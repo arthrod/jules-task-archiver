@@ -9,12 +9,15 @@
   <body>
     <header class="top">
       <h1 class="brand mono">JULES<span class="dot" aria-hidden="true">·</span>TASK ARCHIVER</h1>
-      <nav class="lrow" aria-label="Settings, schedule and export">
+      <nav class="lrow" aria-label="Settings, schedule, more actions and export">
         <button type="button" class="xbtn" id="settingsToggle" aria-expanded="false" aria-controls="settingsPanel">
           <span class="caret" aria-hidden="true"></span>Settings
         </button>
         <button type="button" class="xbtn" id="scheduleToggle" aria-expanded="false" aria-controls="schedulePanel">
           <span class="caret" aria-hidden="true"></span>Schedule
+        </button>
+        <button type="button" class="xbtn" id="moreToggle" aria-expanded="false" aria-controls="morePanel">
+          <span class="caret" aria-hidden="true"></span>More Actions
         </button>
         <button
           type="button"
@@ -365,6 +368,39 @@
           aria-describedby="schedMaxStartsHint"
         />
         <span class="u" id="schedMaxStartsHint">1–500, shared across accounts</span>
+      </div>
+    </section>
+
+    <section class="xb hidden" id="morePanel" aria-labelledby="moreToggle">
+      <fieldset class="more-scope">
+        <legend class="k mono">Scope</legend>
+        <div class="line">
+          <label class="cb"><input type="radio" name="moreScope" id="moreAll" value="all" checked />All</label>
+          <label class="cb"><input type="radio" name="moreScope" id="moreRepoScope" value="repo" />Repo</label>
+          <input type="text" id="moreRepo" placeholder="org/repo" aria-label="Repository (org/repo)" />
+          <select id="moreCategory" aria-label="Items to load">
+            <option value="all" selected>All</option>
+            <option value="scheduled">Scheduled</option>
+            <option value="complete">Completed</option>
+            <option value="archive">Archived</option>
+          </select>
+          <button type="button" class="sb" id="moreLoad">Load</button>
+        </div>
+      </fieldset>
+      <span class="shint" id="moreStatus" aria-live="polite">Load items to choose actions.</span>
+      <fieldset class="more-chips" id="moreChips" aria-label="Item categories"></fieldset>
+      <div class="line">
+        <label class="cb"><input type="checkbox" id="moreSelectAll" />Select all shown</label>
+        <label class="cb"><input type="checkbox" id="moreDryRun" />Dry run</label>
+        <label class="cb" title="Archive without the open-PR check"
+          ><input type="checkbox" id="moreForce" disabled />Force</label
+        >
+      </div>
+      <section id="moreList" aria-label="Loaded items"></section>
+      <div class="line">
+        <label class="l" for="moreAction">Action</label>
+        <select id="moreAction"><option value="">Choose an action</option></select>
+        <button type="button" class="sb" id="moreConfirm" disabled>Confirm</button>
       </div>
     </section>
 

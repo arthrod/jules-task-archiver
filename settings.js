@@ -15,7 +15,7 @@
 // RUN_PROTOCOL before every run, and the background refuses a START with
 // another protocol or an option it doesn't know. Bump RUN_PROTOCOL whenever a
 // message between the two changes meaning.
-const RUN_PROTOCOL = 3
+const RUN_PROTOCOL = 5
 // Every option the popup may put in a START message.
 const START_OPTION_KEYS = [
   'action',
@@ -134,6 +134,10 @@ const JULES_RPC_DEFAULTS = {
   ListTasks: 'p1Takd',
   ArchiveTasks: 'Tjmm5c',
   ResumeTask: 'wk4vKd',
+  PauseTask: 'tqq5v',
+  ListScheduledTasks: 'hvmRxc',
+  PauseScheduledTask: 'gBUOb',
+  ResumeScheduledTask: 'XuzQWe',
   GetTask: 'n74qPd',
   Interact: 'SLmX6',
   GetTaskUsage: 'KQOO7',

@@ -188,17 +188,20 @@ function setupEnvironment(initialTabs = {}) {
 
   vm.createContext(sandbox)
 
-  const scriptContent =
-    utilsScriptContent +
-    itemsScriptContent +
-    settingsScriptContent +
-    bgScriptContent +
-    `
+  for (const [source, filename] of [
+    [utilsScriptContent, utilsScriptPath],
+    [itemsScriptContent, path.join(__dirname, '..', 'items.js')],
+    [settingsScriptContent, path.join(__dirname, '..', 'settings.js')],
+    [bgScriptContent, bgScriptPath]
+  ])
+    vm.runInContext(source, sandbox, { filename })
+
+  const scriptContent = `
     globalThis.test_ensureContentScript = ensureContentScript;
     globalThis.test_JULES_ORIGIN = JULES_ORIGIN;
   `
 
-  vm.runInContext(scriptContent, sandbox, { filename: bgScriptPath })
+  vm.runInContext(scriptContent, sandbox, { filename: path.join(__dirname, 'security-hooks.js') })
   sandbox.burstDelayMs = () => 0 // no pacing waits in tests
   return { sandbox, chromeMock, onMessageListeners }
 }
