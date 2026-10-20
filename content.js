@@ -10,14 +10,35 @@
 // Store config extracted from MAIN world
 let cachedConfig = null
 
+// Tell main-world.js which CreateTask RPC id to watch: the one saved in the
+// Jules API values (settings.js), or null for the built-in one.
+function postCreateTaskRpc(julesApi) {
+  const rpcId = julesApi?.rpc?.CreateTask
+  window.postMessage(
+    { type: 'JULES_CREATE_TASK_RPC', rpcId: typeof rpcId === 'string' ? rpcId : null },
+    window.location.origin
+  )
+}
+
+function sendCreateTaskRpc() {
+  chrome.storage?.local?.get?.('julesApi', (data) => postCreateTaskRpc(data?.julesApi))
+}
+
 // Inject main-world.js into the page to access variables
 function injectMainWorldScript() {
   const script = document.createElement('script')
   script.src = chrome.runtime.getURL('main-world.js')
-  script.onload = () => script.remove()
+  script.onload = () => {
+    script.remove()
+    sendCreateTaskRpc()
+  }
   ;(document.head || document.documentElement).appendChild(script)
 }
 injectMainWorldScript()
+
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  if (area === 'local' && 'julesApi' in changes) postCreateTaskRpc(changes.julesApi.newValue)
+})
 
 // Reject messages that did not originate from this page's own window/origin.
 // The MAIN world script and isolated world share the same window and origin,
@@ -45,9 +66,11 @@ window.addEventListener('message', (event) => {
 })
 
 // Request fresh config from MAIN world script
-function extractConfig() {
+// `fresh` skips the cache: the background asks for it when Jules rejected the
+// cached tokens.
+function extractConfig(fresh = false) {
   // If already cached and fresh (less than 5 min old), return it
-  if (cachedConfig?.timestamp && Date.now() - cachedConfig.timestamp < 300000) {
+  if (!fresh && cachedConfig?.timestamp && Date.now() - cachedConfig.timestamp < 300000) {
     return Promise.resolve(cachedConfig)
   }
 
@@ -99,7 +122,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       break
 
     case 'GET_CONFIG':
-      extractConfig().then((config) => {
+      extractConfig(msg.fresh === true).then((config) => {
         sendResponse({
           config,
           accountNum: getAccountNum(),

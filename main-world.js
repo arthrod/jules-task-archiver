@@ -3,7 +3,7 @@
  *
  * Runs in the page's MAIN world (not isolated).
  * Reads WIZ_global_data tokens and installs a fetch observer
- * for StartSuggestion (Rja83d) config capture.
+ * for StartSuggestion (CreateTask, Rja83d today) config capture.
  *
  * Communicates with content.js (isolated world) via window.postMessage.
  */
@@ -30,20 +30,65 @@ function broadcastConfig() {
   )
 }
 
-// Install fetch observer for StartSuggestion config capture (once)
-if (!window.__julesArchiver) {
+// The CreateTask RPC id to watch. content.js sends the one in force (Settings
+// or the last rediscovery), so a renamed id keeps working. It lives on window,
+// not in a top-level let: an extension reload injects this file into the same
+// page again, where a second let would throw, and the observer the first copy
+// installed must see the id the second copy receives.
+function createTaskRpc() {
+  const rpcId = window.__julesArchiverCreateTaskRpc
+  return typeof rpcId === 'string' && /^[A-Za-z0-9]{5,6}$/.test(rpcId) ? rpcId : 'Rja83d'
+}
+
+function callsRpc(url, rpcId) {
+  const match = /[?&]rpcids=([^&#]*)/.exec(url)
+  if (!match) return false
+  try {
+    return decodeURIComponent(match[1]).split(',').includes(rpcId)
+  } catch (_e) {
+    return false
+  }
+}
+
+// The page may call fetch(url, init), fetch(URL) or fetch(Request).
+function requestUrl(input) {
+  if (typeof input === 'string') return input
+  return typeof input?.url === 'string' ? input.url : String(input ?? '')
+}
+
+// A Request carries its own body, which the page's fetch then consumes, so a
+// clone is read before the call. A body in init wins over the Request's.
+function requestBody(input, opts) {
+  if (opts?.body != null) return Promise.resolve(opts.body)
+  if (typeof input?.clone === 'function')
+    return input
+      .clone()
+      .text()
+      .catch(() => '')
+  return Promise.resolve('')
+}
+
+// Install fetch observer for StartSuggestion config capture, once per
+// version: a page kept open across an update still runs the old observer
+// (Part 1's watched only a hardcoded Rja83d; version 2 read the first RPC of
+// a request, whichever it was), so a newer one installs on top.
+if (window.__julesArchiverObserver !== 3) {
+  window.__julesArchiverObserver = 3
   window.__julesArchiver = true
 
   const _origFetch = window.fetch
   window.fetch = async function (...args) {
-    const [url, opts] = args
+    const [input, opts] = args
+    const rpcId = createTaskRpc()
+    const body = callsRpc(requestUrl(input), rpcId) ? requestBody(input, opts) : null
     const resp = await _origFetch.apply(this, args)
-    if (typeof url === 'string' && url.includes('rpcids=Rja83d')) {
+    if (body) {
       try {
-        const body = opts?.body || ''
-        const params = new URLSearchParams(body)
+        const params = new URLSearchParams(await body)
         const freq = JSON.parse(params.get('f.req'))
-        const payload = JSON.parse(freq[0][0][1])
+        // One request can carry several RPCs, each as [rpcId, payload, ...].
+        const entry = freq[0].find((e) => e?.[0] === rpcId)
+        const payload = JSON.parse(entry[1])
         window.postMessage(
           {
             type: 'JULES_START_CONFIG',
@@ -76,4 +121,5 @@ window.addEventListener('message', (event) => {
   if (event.data?.type === 'JULES_REQUEST_CONFIG') {
     broadcastConfig()
   }
+  if (event.data?.type === 'JULES_CREATE_TASK_RPC') window.__julesArchiverCreateTaskRpc = event.data.rpcId
 })

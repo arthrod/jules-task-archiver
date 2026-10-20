@@ -7,6 +7,7 @@ const path = require('node:path')
 const bgScriptPath = path.join(__dirname, '..', 'background.js')
 const bgScriptContent = fs.readFileSync(bgScriptPath, 'utf8')
 const itemsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'items.js'), 'utf8')
+const settingsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8')
 
 function setupEnvironment(initialStorage = {}) {
   let currentStorage = { ...initialStorage }
@@ -65,7 +66,8 @@ function setupEnvironment(initialStorage = {}) {
   }
 
   vm.createContext(sandbox)
-  vm.runInContext(itemsScriptContent + bgScriptContent, sandbox, { filename: bgScriptPath })
+  vm.runInContext(itemsScriptContent + settingsScriptContent + bgScriptContent, sandbox, { filename: bgScriptPath })
+  sandbox.burstDelayMs = () => 0 // no pacing waits in tests
 
   return sandbox
 }

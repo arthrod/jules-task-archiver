@@ -153,7 +153,7 @@ describe('Release packaging', () => {
   const cdYml = fs.readFileSync(path.join(rootDir, '.github', 'workflows', 'cd.yml'), 'utf8')
   const zipBlock = cdYml.slice(cdYml.indexOf('zip -r'), cdYml.indexOf('icons/', cdYml.indexOf('zip -r')))
 
-  for (const file of ['license.html', 'license.css', 'LICENSE', 'items.js', 'fonts/']) {
+  for (const file of ['license.html', 'license.css', 'LICENSE', 'items.js', 'settings.js', 'fonts/']) {
     it(`release zip ships ${file}`, () => {
       assert.ok(new RegExp(`\\s${file.replace('.', '\\.')}\\s`).test(zipBlock), `${file} missing from zip command`)
     })

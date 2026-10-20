@@ -3,7 +3,8 @@
  * Jules Task Archiver — Popup Script
  *
  * The Items dropdown with Proceed and Archive, settings persistence and
- * progress display. items.js (loaded first) provides the dropdown entries.
+ * progress display. items.js (loaded first) provides the dropdown entries and
+ * settings.js the Settings panel's defaults and limits.
  */
 
 const $ = (sel) => document.querySelector(sel)
@@ -13,8 +14,6 @@ const $ = (sel) => document.querySelector(sel)
 // (devtools, extension context) and bypasses the input's typing limit.
 const MAX_OWNER_LEN = 39
 const MAX_TOKEN_LEN = 255
-// Matches #message's maxlength and the background's cap.
-const MAX_MESSAGE_LEN = 2000
 const JULES_TABS_URL = 'https://jules.google.com/*'
 const SCHEDULE_ALARM_NAME = 'jta-scheduled-tick'
 
@@ -52,6 +51,7 @@ const scheduleToggle = $('#scheduleToggle')
 const settingsPanel = $('#settingsPanel')
 const schedulePanel = $('#schedulePanel')
 const mainView = $('#mainView')
+const staleBanner = $('#staleBanner')
 
 // --- Schedule settings (read by background.js's chrome.alarms tick) ---
 const schedEnabledInput = $('#schedEnabled')
@@ -64,6 +64,11 @@ const schedNext = $('#schedNext')
 // asynchronously, but nothing guarantees it.
 let runningAction = null
 let lastExportData = null
+// The background runs other code than this popup; nothing may start.
+let backgroundStale = false
+// The worker answered HELLO with this popup's protocol. The schedule waits
+// for it: an old worker would act on a schedule change with its own rules.
+let backgroundOk = false
 
 // Storage-side bounds match background.js; the background re-validates anyway,
 // these just keep obviously-bad values out of sync storage.
@@ -77,19 +82,23 @@ function readClampedNumber(input, min, max, fallback) {
 // Items dropdown
 // =============================================================================
 
-const ITEMS = listItems()
+let ITEMS = listItems()
 let selectedItemId = ITEM_ALL
+// A saved item the current task states don't have: a rediscovered state
+// whose table hasn't loaded yet, or one Jules dropped. Nothing is selected
+// meanwhile, because falling back to All would widen the next run.
+let missingItemId = null
 let activeOptionIndex = -1
 let optionEls = []
 
 function getSelectedItem() {
-  return ITEMS.find((i) => i.id === selectedItemId) || ITEMS[0]
+  return ITEMS.find((i) => i.id === selectedItemId) || null
 }
 
 function itemKind(item) {
   if (item.type === 'suggestions') return 'suggestions'
   if (item.codes === null) return 'all'
-  return TASK_STATES.find((s) => s.code === item.code)?.kind || 'unknown'
+  return getTaskStates().find((s) => s.code === item.code)?.kind || 'unknown'
 }
 
 // What the message does for the chosen item, shown under the message box.
@@ -158,22 +167,39 @@ function renderItemsMenu() {
 
 function selectItem(id, { save = true } = {}) {
   if (!ITEMS.some((i) => i.id === id)) return
+  missingItemId = null
   selectedItemId = id
+  showSelectedItem()
+  if (save) chrome.storage.sync.set({ item: id })
+}
+
+// Selects a saved item, or nothing while the task states lack it.
+function restoreItem(id) {
+  if (ITEMS.some((i) => i.id === id)) {
+    selectItem(id, { save: false })
+    return
+  }
+  missingItemId = id
+  selectedItemId = null
+  showSelectedItem()
+}
+
+function showSelectedItem() {
   const item = getSelectedItem()
-  itemsBtnText.textContent = item.label
+  itemsBtnText.textContent = item ? item.label : 'Choose an item'
   for (const opt of optionEls) {
-    const selected = opt.dataset.id === id
+    const selected = opt.dataset.id === selectedItemId
     opt.setAttribute('aria-selected', String(selected))
     opt.classList.toggle('cur', selected)
   }
   updateItemUI()
-  if (save) chrome.storage.sync.set({ item: id })
+  updateRunButtons()
 }
 
 function updateItemUI() {
   const item = getSelectedItem()
-  oneSessionRow.classList.toggle('hidden', item.type !== 'suggestions')
-  messageHint.textContent = MESSAGE_HINTS[itemKind(item)]
+  oneSessionRow.classList.toggle('hidden', item?.type !== 'suggestions')
+  messageHint.textContent = item ? MESSAGE_HINTS[itemKind(item)] : ''
 }
 
 function setActiveOption(index) {
@@ -187,7 +213,17 @@ function setActiveOption(index) {
   active.scrollIntoView?.({ block: 'nearest' })
 }
 
+// The menu must end inside the popup (past its bottom edge the popup would
+// grow or scroll), so a list longer than the room scrolls inside the menu.
+function fitMenuToPopup() {
+  const bottom = document.body?.getBoundingClientRect?.().bottom
+  const top = itemsBtn.getBoundingClientRect?.().bottom
+  if (!itemsMenu.style || !Number.isFinite(bottom) || !Number.isFinite(top)) return
+  itemsMenu.style.maxHeight = `${Math.max(160, Math.floor(bottom - top - 8))}px`
+}
+
 function openItemsMenu() {
+  fitMenuToPopup()
   itemsBtn.setAttribute('aria-expanded', 'true')
   itemsBtn.classList.add('open')
   itemsMenu.classList.add('open')
@@ -265,6 +301,14 @@ document.addEventListener?.('click', (e) => {
 })
 
 renderItemsMenu()
+
+// Rebuilds the dropdown when the Jules API values bring a new state table.
+function applyTaskStates(states) {
+  setTaskStates(states)
+  ITEMS = listItems()
+  renderItemsMenu()
+  restoreItem(missingItemId ?? selectedItemId)
+}
 selectItem(ITEM_ALL, { save: false })
 
 // =============================================================================
@@ -327,6 +371,222 @@ dryRunInput.addEventListener('change', () => {
 })
 
 // =============================================================================
+// Settings panel (settings.js holds the defaults and limits)
+// =============================================================================
+
+const SETTING_NUMBERS = Object.keys(SETTING_LIMITS)
+const SETTING_CHECKS = ['extraJitter', 'reloadTabOnSignIn']
+const SETTING_TEXTS = ['defaultReply', 'defaultRetry']
+const settingInputs = Object.fromEntries(
+  [...SETTING_NUMBERS, ...SETTING_CHECKS, ...SETTING_TEXTS].map((key) => [key, $(`#${key}`)])
+)
+$('#defaultReply').placeholder = DEFAULT_CONTINUE_MESSAGE
+$('#defaultRetry').placeholder = DEFAULT_ERROR_CONTINUE_MESSAGE
+
+function fillSettings(values) {
+  for (const key of SETTING_NUMBERS) settingInputs[key].value = String(values[key])
+  for (const key of SETTING_CHECKS) settingInputs[key].checked = values[key]
+  for (const key of SETTING_TEXTS) {
+    if (document.activeElement !== settingInputs[key]) settingInputs[key].value = values[key]
+  }
+  settingInputs.extraJitterMaxSec.disabled = !values.extraJitter
+}
+
+function readSettings() {
+  const raw = {}
+  for (const key of SETTING_NUMBERS) raw[key] = settingInputs[key].value.trim()
+  for (const key of SETTING_CHECKS) raw[key] = settingInputs[key].checked
+  for (const key of SETTING_TEXTS) raw[key] = settingInputs[key].value
+  return normalizeSettings(raw)
+}
+
+const settingsStatus = $('#settingsStatus')
+let settingsSaveTimer = null
+// The old popup's reply boxes are still in sync storage until a save lands.
+let legacyMessagesStored = false
+
+function writeSettings(values) {
+  chrome.storage.sync.set(settingsToSync(values), () => {
+    const error = chrome.runtime.lastError
+    settingsStatus.textContent = error ? `Settings not saved: ${error.message}` : ''
+    settingsStatus.classList.toggle('hidden', !error)
+    if (error || !legacyMessagesStored) return
+    legacyMessagesStored = false
+    chrome.storage.sync.remove(Object.values(LEGACY_MESSAGE_KEYS))
+  })
+}
+
+function saveSettings() {
+  clearTimeout(settingsSaveTimer)
+  const values = readSettings()
+  fillSettings(values)
+  writeSettings(values)
+}
+
+// The old popup kept its two reply boxes under their own keys; they become
+// the default reply and retry (settingsFromSync), saved under the new keys.
+function loadSettings(syncData) {
+  const values = settingsFromSync(syncData)
+  fillSettings(values)
+  legacyMessagesStored = Object.values(LEGACY_MESSAGE_KEYS).some((key) => syncData[key] !== undefined)
+  if (legacyMessagesStored) writeSettings(values)
+}
+
+for (const key of [...SETTING_NUMBERS, ...SETTING_CHECKS]) settingInputs[key].addEventListener('change', saveSettings)
+for (const key of SETTING_TEXTS) {
+  // Saved shortly after typing stops, like the message box.
+  settingInputs[key].addEventListener('input', () => {
+    clearTimeout(settingsSaveTimer)
+    settingsSaveTimer = setTimeout(saveSettings, 400)
+  })
+  settingInputs[key].addEventListener('change', saveSettings)
+}
+
+// --- Jules API values (chrome.storage.local) ---
+// Short names for the methods, in the order of JULES_RPC_DEFAULTS.
+const RPC_LABELS = {
+  ListTasks: 'List tasks',
+  ArchiveTasks: 'Archive',
+  ResumeTask: 'Resume',
+  GetTask: 'Get task',
+  Interact: 'Reply',
+  GetTaskUsage: 'Daily quota',
+  CreateTask: 'Start session',
+  ListSources: 'List repos',
+  ListProactiveSuggestions: 'Suggestions',
+  UpdateProactiveSuggestionStatus: 'Dismiss'
+}
+const rpcInputsEl = $('#rpcInputs')
+const archiveBatchInput = $('#archiveBatch')
+const archiveSplitInput = $('#archiveSplit')
+const apiStatesEl = $('#apiStates')
+const apiStatusEl = $('#apiStatus')
+const rediscoverBtn = $('#rediscoverBtn')
+const resetApiBtn = $('#resetApiBtn')
+const rpcInputs = {}
+let julesApiValues = normalizeJulesApi()
+
+for (const method of Object.keys(JULES_RPC_DEFAULTS)) {
+  const label = document.createElement('label')
+  const name = document.createElement('span')
+  name.textContent = RPC_LABELS[method] || method
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.className = 'mono-in'
+  input.maxLength = 6
+  input.pattern = '[A-Za-z0-9]{5,6}'
+  input.spellcheck = false
+  input.autocomplete = 'off'
+  input.title = `SweBotService.${method}`
+  input.setAttribute('aria-label', `RPC id for ${method}`)
+  input.addEventListener('change', saveJulesApi)
+  label.appendChild(name)
+  label.appendChild(input)
+  rpcInputsEl.appendChild(label)
+  rpcInputs[method] = input
+}
+
+function formatCheck(at) {
+  return new Date(at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function fillJulesApi(api, log) {
+  julesApiValues = api
+  for (const [method, input] of Object.entries(rpcInputs)) input.value = api.rpc[method]
+  archiveBatchInput.value = String(api.archiveBatch)
+  archiveSplitInput.value = String(api.archiveSplit)
+  const states = api.states ? `from Jules, ${api.states.length} codes` : `built-in, ${TASK_STATES.length} codes`
+  const checked = api.checkedAt ? `last checked ${formatCheck(api.checkedAt)}` : 'not checked yet'
+  apiStatesEl.textContent = `Task states: ${states} · ${checked}`
+  const last = Array.isArray(log) ? log[0] : null
+  if (last && !apiStatusEl.dataset.busy) showDiscovery(last)
+  applyTaskStates(api.states)
+}
+
+function setApiStatus(text, details = '') {
+  apiStatusEl.textContent = text
+  apiStatusEl.title = details
+}
+
+// A short summary in the panel (clamped to three lines), the full report in
+// the tooltip: a reshaped bundle can report a dozen changes and problems.
+function showDiscovery({ changes = [], problems = [] }) {
+  const parts = []
+  if (!changes.length) parts.push('No changes.')
+  else if (changes.length <= 2) parts.push(`Changed: ${changes.join('; ')}.`)
+  else parts.push(`Changed: ${changes.slice(0, 2).join('; ')} and ${changes.length - 2} more.`)
+  if (problems.length === 1) parts.push(problems[0])
+  if (problems.length > 1) parts.push(`${problems.length} problems; hover for details.`)
+  const full = [changes.length ? `Changed: ${changes.join('; ')}` : 'No changes.', ...problems].join('\n')
+  setApiStatus(parts.join(' '), full)
+}
+
+function saveJulesApi() {
+  const rpc = {}
+  for (const [method, input] of Object.entries(rpcInputs)) {
+    const id = input.value.trim()
+    if (!RPC_ID_REGEX.test(id)) {
+      input.value = julesApiValues.rpc[method]
+      setApiStatus('An RPC id is 5 or 6 letters or digits.')
+      return
+    }
+    rpc[method] = id
+  }
+  const api = normalizeJulesApi({
+    ...julesApiValues,
+    rpc,
+    archiveBatch: archiveBatchInput.value.trim(),
+    archiveSplit: archiveSplitInput.value.trim()
+  })
+  fillJulesApi(api)
+  chrome.storage.local.set({ [JULES_API_KEY]: api })
+}
+archiveBatchInput.addEventListener('change', saveJulesApi)
+archiveSplitInput.addEventListener('change', saveJulesApi)
+
+chrome.storage.local.get([JULES_API_KEY, JULES_API_LOG_KEY], (data) => {
+  fillJulesApi(normalizeJulesApi(data?.[JULES_API_KEY]), data?.[JULES_API_LOG_KEY])
+})
+
+rediscoverBtn.addEventListener('click', () => {
+  rediscoverBtn.disabled = true
+  rediscoverBtn.setAttribute('aria-busy', 'true')
+  apiStatusEl.dataset.busy = '1'
+  setApiStatus('Reading the Jules web app…')
+  chrome.runtime.sendMessage({ action: 'REDISCOVER_API' }, (resp) => {
+    rediscoverBtn.disabled = false
+    rediscoverBtn.removeAttribute('aria-busy')
+    delete apiStatusEl.dataset.busy
+    if (chrome.runtime.lastError || !resp) {
+      setApiStatus('Could not reach the extension. Try again.')
+      return
+    }
+    if (resp.error) {
+      setApiStatus(resp.error)
+      return
+    }
+    fillJulesApi(normalizeJulesApi(resp.api))
+    showDiscovery(resp)
+  })
+})
+
+resetApiBtn.addEventListener('click', () => {
+  chrome.storage.local.remove(JULES_API_KEY, () => {
+    fillJulesApi(normalizeJulesApi())
+    setApiStatus('Back to the built-in values.')
+  })
+})
+
+chrome.storage.onChanged?.addListener((changes, area) => {
+  if (area === 'sync' && SETTINGS_SYNC_KEYS.some((key) => key in changes)) {
+    chrome.storage.sync.get(SETTINGS_SYNC_KEYS, (data) => fillSettings(settingsFromSync(data)))
+  }
+  if (area === 'local' && changes[JULES_API_KEY]) {
+    fillJulesApi(normalizeJulesApi(changes[JULES_API_KEY].newValue), changes[JULES_API_LOG_KEY]?.newValue)
+  }
+})
+
+// =============================================================================
 // Load saved settings & cleanup insecure storage
 // =============================================================================
 
@@ -339,10 +599,12 @@ chrome.storage.sync.get(
     'schedEnabled',
     'schedIntervalMin',
     'schedStartSuggestions',
-    'schedMaxStarts'
+    'schedMaxStarts',
+    ...SETTINGS_SYNC_KEYS
   ],
   (syncData) => {
-    if (typeof syncData.item === 'string' && !isRunning()) selectItem(syncData.item, { save: false })
+    loadSettings(syncData)
+    if (typeof syncData.item === 'string' && !isRunning()) restoreItem(syncData.item)
     if (typeof syncData.message === 'string') messageInput.value = syncData.message
     schedEnabledInput.checked = syncData.schedEnabled === true
     if (syncData.schedIntervalMin !== undefined) schedIntervalInput.value = String(syncData.schedIntervalMin)
@@ -376,21 +638,31 @@ ghTokenInput.addEventListener('change', () => {
 
 // Schedule settings persist on change; background.js's storage.onChanged
 // listener reconciles the chrome.alarms schedule — no message needed.
+const SCHEDULE_INPUTS = [schedEnabledInput, schedIntervalInput, schedSuggestionsInput, schedMaxStartsInput]
+function lockSchedule(locked) {
+  for (const input of SCHEDULE_INPUTS) input.disabled = locked
+}
+lockSchedule(true)
+
 schedEnabledInput.addEventListener('change', () => {
+  if (!backgroundOk) return
   chrome.storage.sync.set({ schedEnabled: schedEnabledInput.checked === true })
   // The background re-creates the alarm after the write lands.
   setTimeout(showNextScheduledRun, 300)
 })
 schedIntervalInput.addEventListener('change', () => {
+  if (!backgroundOk) return
   const minutes = readClampedNumber(schedIntervalInput, 1, 1440, 60)
   schedIntervalInput.value = String(minutes)
   chrome.storage.sync.set({ schedIntervalMin: minutes })
   setTimeout(showNextScheduledRun, 300)
 })
 schedSuggestionsInput.addEventListener('change', () => {
+  if (!backgroundOk) return
   chrome.storage.sync.set({ schedStartSuggestions: schedSuggestionsInput.checked === true })
 })
 schedMaxStartsInput.addEventListener('change', () => {
+  if (!backgroundOk) return
   const maxStarts = readClampedNumber(schedMaxStartsInput, 1, 500, 20)
   schedMaxStartsInput.value = String(maxStarts)
   chrome.storage.sync.set({ schedMaxStarts: maxStarts })
@@ -500,7 +772,7 @@ customRepoInput.addEventListener('input', () => {
 // =============================================================================
 
 const RUN_BUTTONS = { proceed: proceedBtn, archive: archiveBtn, export: exportBtn }
-const RUN_BUTTON_TEXT = { proceed: 'Proceed', archive: 'Archive', export: 'Export suggestions' }
+const RUN_BUTTON_TEXT = { proceed: 'Proceed', archive: 'Archive', export: '↓ Export' }
 const RUNNING_TEXT = { proceed: '⏳ Proceeding…', archive: '⏳ Archiving…', export: '⏳ Exporting…' }
 
 function isRunning() {
@@ -521,10 +793,19 @@ function setRunning(action, dryRun) {
 function setIdle() {
   runningAction = null
   for (const [name, btn] of Object.entries(RUN_BUTTONS)) {
-    btn.disabled = false
     btn.removeAttribute('aria-busy')
     btn.textContent = RUN_BUTTON_TEXT[name]
   }
+  updateRunButtons()
+}
+
+// Proceed and Archive need an item; nothing runs on a stale worker.
+function updateRunButtons() {
+  if (isRunning()) return
+  const noItem = !getSelectedItem()
+  proceedBtn.disabled = backgroundStale || noItem
+  archiveBtn.disabled = backgroundStale || noItem
+  exportBtn.disabled = backgroundStale
 }
 
 function showIdle() {
@@ -532,6 +813,24 @@ function showIdle() {
   idleText.textContent = dryRunInput.checked
     ? 'Dry-run is on: Proceed and Archive only list what they would do.'
     : 'Dry-run is off: Proceed and Archive change your tasks.'
+}
+
+// --- Background version check (RUN_PROTOCOL in settings.js says why) ---
+function checkBackground() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: 'HELLO' }, (resp) => {
+      // A worker older than HELLO doesn't answer: the port closes empty.
+      resolve(!chrome.runtime.lastError && resp?.protocol === RUN_PROTOCOL)
+    })
+  })
+}
+
+function showStaleBackground() {
+  backgroundStale = true
+  backgroundOk = false
+  for (const btn of Object.values(RUN_BUTTONS)) btn.disabled = true
+  lockSchedule(true)
+  staleBanner.classList.remove('hidden')
 }
 
 // Live runs that can't be undone from the popup ask first.
@@ -558,6 +857,10 @@ function confirmLiveRun(action, item, force, message) {
 async function startRun(action) {
   if (isRunning()) return
   const item = getSelectedItem()
+  if (!item && action !== 'export') {
+    currentInfo.textContent = 'Choose an item first.'
+    return
+  }
   const dryRun = action === 'export' ? false : dryRunInput.checked
   const force = forceInput.checked
   const message = addMessageInput.checked ? (messageInput.value || '').trim().slice(0, MAX_MESSAGE_LEN) : ''
@@ -568,9 +871,7 @@ async function startRun(action) {
   setRunning(action, dryRun)
   togglePanel(null) // show the log
   resetBtn.classList.add('hidden')
-  // A previous Export JSON result belongs to that run only.
-  downloadBtn.classList.add('hidden')
-  lastExportData = null
+  clearExportResult()
   summarySection.classList.add('hidden')
   idleText.classList.add('hidden')
   logStatus.textContent = dryRun ? 'Starting · dry-run' : 'Starting'
@@ -602,17 +903,27 @@ async function startRun(action) {
 
   const options = {
     action,
-    item: item.id,
+    item: item?.id ?? null,
     dryRun,
     force,
     message,
-    oneSession: item.type === 'suggestions' && oneSessionInput.checked,
+    oneSession: item?.type === 'suggestions' && oneSessionInput.checked,
     scope,
     activeTabId,
     repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim()
   }
 
-  chrome.runtime.sendMessage({ action: 'START', options }, (response) => {
+  // The worker can be replaced while the popup is open; ask right before.
+  // The popup may have gone stale (an earlier check failing) while this one was out.
+  if (!(await checkBackground()) || backgroundStale) {
+    setIdle()
+    showStaleBackground()
+    logStatus.textContent = 'Error'
+    currentInfo.textContent = 'Not started: reload the extension first.'
+    return
+  }
+
+  chrome.runtime.sendMessage({ action: 'START', protocol: RUN_PROTOCOL, options }, (response) => {
     if (response?.error) {
       setIdle()
       currentInfo.textContent = `Error: ${response.error}`
@@ -652,6 +963,13 @@ chrome.storage.onChanged.addListener((changes) => {
 })
 
 // --- Render state ---
+// A previous Export JSON result belongs to that run only.
+function clearExportResult() {
+  downloadBtn.classList.add('hidden')
+  lastExportData = null
+  if (runningAction !== 'export') exportBtn.textContent = RUN_BUTTON_TEXT.export
+}
+
 function renderState(state) {
   const dryRun = state.options?.dryRun === true
   // Log
@@ -664,6 +982,7 @@ function renderState(state) {
 
   // Current info
   if (state.status === 'running') {
+    clearExportResult() // a scheduled run starts without startRun
     const parts = []
     if (state.currentTab) parts.push(state.currentTab)
     if (state.currentRepo) parts.push(state.currentRepo)
@@ -693,8 +1012,11 @@ function renderState(state) {
       renderSummary(state.results)
       if (state.exportData) {
         lastExportData = state.exportData
+        const found = state.exportData.totalSuggestions || 0
+        // The header button says the export finished; the file waits below.
+        exportBtn.textContent = `✓ ${found} exported`
         downloadBtn.classList.remove('hidden')
-        downloadBtn.textContent = `⬇ Download suggestions JSON (${state.exportData.totalSuggestions || 0} found)`
+        downloadBtn.textContent = `⬇ Download suggestions JSON (${found} found)`
       }
     } else {
       currentInfo.textContent = `Error: ${state.error}`
@@ -745,6 +1067,12 @@ function renderSummary(results) {
 
 // --- Check for existing state on popup open ---
 showIdle()
+checkBackground().then((ok) => {
+  // A check before a run may have failed while this answer was on its way.
+  if (!ok || backgroundStale) return showStaleBackground()
+  backgroundOk = true
+  lockSchedule(false)
+})
 chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
   if (state && state.status !== 'idle') {
     // Rehydrate the item the run was started with.

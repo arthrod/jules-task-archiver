@@ -4,6 +4,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const vm = require('node:vm')
 const path = require('node:path')
+const { RUN_PROTOCOL } = require('../settings.js')
 
 const bgScriptPath = path.join(__dirname, '..', 'background.js')
 const utilsScriptPath = path.join(__dirname, '..', 'utils.js')
@@ -11,8 +12,9 @@ const itemsScriptPath = path.join(__dirname, '..', 'items.js')
 const bgScriptContent = fs.readFileSync(bgScriptPath, 'utf8')
 const utilsScriptContent = fs.readFileSync(utilsScriptPath, 'utf8')
 const itemsScriptContent = fs.readFileSync(itemsScriptPath, 'utf8')
+const settingsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8')
 
-function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
+function setupEnvironment(initialStorage = {}, initialSyncStorage = {}, { sessionReady = null, prepare = null } = {}) {
   const sessionSetData = []
   let currentStorage = { ...initialStorage }
   let syncStorage = { ...initialSyncStorage }
@@ -25,6 +27,8 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     storage: {
       session: {
         get: async (key) => {
+          // A worker that just woke up reads its saved state a little later.
+          if (sessionReady) await sessionReady
           return key ? { [key]: currentStorage[key] } : currentStorage
         },
         set: async (data) => {
@@ -136,10 +140,13 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
   }
 
   vm.createContext(sandbox)
+  // Changes the mocks before background.js reads them at start-up.
+  if (prepare) prepare(chromeMock)
 
   const scriptContent =
     utilsScriptContent +
     itemsScriptContent +
+    settingsScriptContent +
     bgScriptContent +
     `\n
     globalThis.test_stateReadyPromise = stateReadyPromise;
@@ -151,6 +158,16 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
     globalThis.test_LOG_BUFFER = LOG_BUFFER;
     globalThis.test_buildBatchRequest = buildBatchRequest;
     globalThis.test_callBatchExecute = callBatchExecute;
+    globalThis.test_burstDelayMs = burstDelayMs;
+    globalThis.test_postBatchExecute = postBatchExecute;
+    globalThis.test_takeRunBudget = takeRunBudget;
+    globalThis.test_accountRunState = () => ({ accountPauses, stoppedAccounts, accountRateLimits });
+    globalThis.test_settings = () => settings;
+    globalThis.test_julesApi = () => julesApi;
+    globalThis.test_readJulesBundle = readJulesBundle;
+    globalThis.test_rediscoverJulesApi = rediscoverJulesApi;
+    globalThis.test_API_REDISCOVER_ALARM = API_REDISCOVER_ALARM;
+    globalThis.test_settingsReady = () => settingsReadyPromise;
     globalThis.test_runInPool = runInPool;
     globalThis.test_createLimiter = createLimiter;
     globalThis.test_archiveTasksWithRetry = archiveTasksWithRetry;
@@ -222,6 +239,8 @@ function setupEnvironment(initialStorage = {}, initialSyncStorage = {}) {
 
   const script = new vm.Script(scriptContent, { filename: bgScriptPath })
   script.runInContext(sandbox)
+  // Pacing waits 0.5-2 s per burst request; tests that check it put it back.
+  sandbox.burstDelayMs = () => 0
 
   return {
     sandbox,
@@ -508,9 +527,8 @@ describe('createLimiter', () => {
 
 describe('Retry Utilities', () => {
   describe('isRetryable', () => {
-    it('matches rate-limit and transient errors', () => {
+    it('matches transient errors', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(sandbox.test_isRetryable('batchexecute Tjmm5c failed: HTTP 429'), true)
       assert.strictEqual(sandbox.test_isRetryable('HTTP 500'), true)
       assert.strictEqual(sandbox.test_isRetryable('HTTP 502'), true)
       assert.strictEqual(sandbox.test_isRetryable('HTTP 503'), true)
@@ -519,9 +537,14 @@ describe('Retry Utilities', () => {
       assert.strictEqual(sandbox.test_isRetryable('NetworkError'), true)
     })
 
+    it('leaves HTTP 429 to the account pause instead of retrying it blindly', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(sandbox.test_isRetryable('batchexecute Tjmm5c failed: HTTP 429'), false)
+    })
+
     it('is case-insensitive', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(sandbox.test_isRetryable('http 429'), true)
+      assert.strictEqual(sandbox.test_isRetryable('http 503'), true)
       assert.strictEqual(sandbox.test_isRetryable('networkerror'), true)
       assert.strictEqual(sandbox.test_isRetryable('FAILED TO FETCH'), true)
     })
@@ -560,7 +583,7 @@ describe('Retry Utilities', () => {
       sandbox.setTimeout = (fn) => fn() // Instant retry
       const result = await sandbox.test_withRetry(async () => {
         calls++
-        if (calls === 1) throw new Error('HTTP 429')
+        if (calls === 1) throw new Error('HTTP 503')
         return 'retry-success'
       })
       assert.strictEqual(calls, 2)
@@ -609,7 +632,7 @@ describe('Retry Utilities', () => {
       let calls = 0
       await sandbox.test_withRetry(async () => {
         calls++
-        if (calls < 4) throw new Error('HTTP 429')
+        if (calls < 4) throw new Error('HTTP 503')
         return 'ok'
       })
 
@@ -626,12 +649,12 @@ describe('Retry Utilities', () => {
 })
 
 describe('archiveTasksWithRetry Integration', () => {
-  it('retries on a 429 then succeeds', async () => {
+  it('retries on a 503 then succeeds', async () => {
     const { sandbox } = setupEnvironment()
     let calls = 0
     sandbox.archiveTasks = async () => {
       calls++
-      if (calls === 1) throw new Error('batchexecute Tjmm5c failed: HTTP 429')
+      if (calls === 1) throw new Error('batchexecute Tjmm5c failed: HTTP 503')
     }
     sandbox.setTimeout = (fn) => fn()
     await sandbox.test_archiveTasksWithRetry(['t1'], {})
@@ -817,6 +840,17 @@ describe('processTab archives the chosen item', () => {
     assert.deepStrictEqual(archived, [])
   })
 
+  it("skips a repo's tasks when its open PRs can't be read", async () => {
+    const prTask = { id: 'x', title: 'Fix the bug', state: 3, source: 'github/o/r', owner: 'o', repoName: 'r' }
+    const { sandbox, archived } = setupArchiveEnv([prTask])
+    sandbox.getOpenPRs = async () => null
+    await sandbox.processTab(TAB, { item: sandbox.resolveItem('Completed'), dryRun: false })
+    assert.deepStrictEqual(archived, [])
+    const log = sandbox.test_state().log
+    assert.ok(log.some((l) => l.includes("SKIP [x] Fix the bug (couldn't check its open PRs)")))
+    assert.ok(log.some((l) => l.includes('Nothing to archive: every task was skipped by the open-PR check.')))
+  })
+
   it('Force archives a task even when it has a matching open PR', async () => {
     const prTask = { id: 'x', title: 'Fix the bug', state: 12, source: 'github/o/r', owner: 'o', repoName: 'r' }
     const { sandbox, archived } = setupArchiveEnv([prTask])
@@ -902,10 +936,11 @@ describe('getOpenPRs', () => {
     const { sandbox } = setupEnvironment()
     sandbox.fetch = async () => ({
       ok: true,
-      json: async () => [
-        { title: 'Fix bug', head: { ref: 'fix/bug-123' } },
-        { title: 'Add feature', head: { ref: 'feat/feature-456' } }
-      ]
+      text: async () =>
+        JSON.stringify([
+          { title: 'Fix bug', head: { ref: 'fix/bug-123' } },
+          { title: 'Add feature', head: { ref: 'feat/feature-456' } }
+        ])
     })
     const prs = await sandbox.test_getOpenPRs('owner', 'repo', null)
     assert.strictEqual(prs.length, 2)
@@ -918,7 +953,7 @@ describe('getOpenPRs', () => {
     const { sandbox } = setupEnvironment()
     sandbox.fetch = async () => ({
       ok: true,
-      json: async () => [{ title: 'PR1', head: { ref: 'branch1' } }]
+      text: async () => JSON.stringify([{ title: 'PR1', head: { ref: 'branch1' } }])
     })
     const first = await sandbox.test_getOpenPRs('cacheOwner', 'cacheRepo', null)
     assert.strictEqual(first.length, 1)
@@ -930,20 +965,63 @@ describe('getOpenPRs', () => {
     assert.strictEqual(second.length, 1)
   })
 
-  it('should return empty array on HTTP error', async () => {
+  function githubEnv(replies) {
     const { sandbox } = setupEnvironment()
-    sandbox.fetch = async () => ({ ok: false, status: 404 })
-    const prs = await sandbox.test_getOpenPRs('err1', 'err1', null)
-    assert.strictEqual(prs.length, 0)
+    const calls = []
+    sandbox.jFetch = async (_url, opts) => {
+      calls.push(opts.timeout)
+      const reply = replies[Math.min(calls.length - 1, replies.length - 1)]
+      if (reply instanceof Error) throw reply
+      if (reply.status !== 200) throw Object.assign(new Error(`HTTP ${reply.status}`), { status: reply.status })
+      return { ok: true, status: 200, json: async () => reply.prs }
+    }
+    const waits = []
+    sandbox.pause = async (ms) => {
+      waits.push(ms)
+    }
+    sandbox.burstDelayMs = () => 1234
+    return { sandbox, calls, waits }
+  }
+
+  it('gives up on a PR list whose body stops arriving', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 30000 ? 5 : ms)
+    sandbox.fetch = async (_url, opts) => {
+      const stall = () =>
+        new Promise((_r, reject) => {
+          opts.signal.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          )
+        })
+      return { ok: true, status: 200, text: stall, json: stall }
+    }
+    assert.strictEqual(await sandbox.test_getOpenPRs('slow', 'body', null), null)
   })
 
-  it('should return empty array on network error', async () => {
-    const { sandbox } = setupEnvironment()
-    sandbox.fetch = async () => {
-      throw new Error('network error')
+  it('retries a 404 once, after a random wait and with one more second to answer', async () => {
+    const { sandbox, calls, waits } = githubEnv([{ status: 404 }, { status: 200, prs: [{ title: 'A' }] }])
+    await sandbox.test_settingsReady()
+    sandbox.test_settings().requestTimeoutSec = 30
+    const prs = await sandbox.test_getOpenPRs('o404', 'r404', null)
+    assert.strictEqual(prs.length, 1)
+    assert.deepStrictEqual(calls, [undefined, 31000])
+    assert.deepStrictEqual(waits, [1234])
+  })
+
+  it('returns null (unknown) when the 404 repeats', async () => {
+    const { sandbox, calls } = githubEnv([{ status: 404 }])
+    const prs = await sandbox.test_getOpenPRs('err1', 'err1', null)
+    assert.strictEqual(prs, null)
+    assert.strictEqual(calls.length, 2)
+    assert.ok(sandbox.test_state().log.some((l) => l.includes('Could not check PRs for err1/err1: HTTP 404')))
+  })
+
+  it('returns null without a retry on a network error or another status', async () => {
+    for (const reply of [new Error('network error'), { status: 500 }, { status: 403 }]) {
+      const { sandbox, calls } = githubEnv([reply])
+      assert.strictEqual(await sandbox.test_getOpenPRs('err2', 'err2', null), null)
+      assert.strictEqual(calls.length, 1)
     }
-    const prs = await sandbox.test_getOpenPRs('err2', 'err2', null)
-    assert.strictEqual(prs.length, 0)
   })
 
   it('should encode owner and repo in URL', async () => {
@@ -960,9 +1038,14 @@ describe('getOpenPRs', () => {
 
   it('should reject tokens with newlines', async () => {
     const { sandbox } = setupEnvironment()
-    sandbox.fetch = async () => ({ ok: true, json: async () => [] })
+    let sent = 0
+    sandbox.fetch = async () => {
+      sent++
+      return { ok: true, json: async () => [] }
+    }
     const prs = await sandbox.test_getOpenPRs('own5', 'rep5', 'token\r\nEvil: header')
-    assert.strictEqual(prs.length, 0)
+    assert.strictEqual(prs, null, 'no check ran, so the open PRs are unknown')
+    assert.strictEqual(sent, 0)
   })
 
   it('should use Authorization header when token is provided', async () => {
@@ -980,7 +1063,7 @@ describe('getOpenPRs', () => {
     const { sandbox } = setupEnvironment()
     sandbox.fetch = async () => ({
       ok: true,
-      json: async () => [{ title: 'PR', head: { ref: 'b' } }]
+      text: async () => JSON.stringify([{ title: 'PR', head: { ref: 'b' } }])
     })
 
     // Clear cache first just in case
@@ -996,30 +1079,30 @@ describe('getOpenPRs', () => {
     assert.strictEqual(cached.length, 1)
     assert.strictEqual(cached[0].title, 'PR')
   })
-  it('should return empty array and log warning on invalid input types', async () => {
+  it('returns null (unknown) and logs a warning on invalid input types', async () => {
     const { sandbox } = setupEnvironment()
     sandbox.test_prCache.clear()
 
     // Test null owner
     let prs = await sandbox.test_getOpenPRs(null, 'repo', null)
-    assert.strictEqual(prs.length, 0)
+    assert.strictEqual(prs, null)
     assert.ok(sandbox.test_state().log.some((msg) => msg.includes('Owner and repo must be strings')))
 
     // Test undefined repo
     prs = await sandbox.test_getOpenPRs('owner', undefined, null)
-    assert.strictEqual(prs.length, 0)
+    assert.strictEqual(prs, null)
 
     // Test null repo
     prs = await sandbox.test_getOpenPRs('owner', null, null)
-    assert.strictEqual(prs.length, 0)
+    assert.strictEqual(prs, null)
 
     // Test number repo
     prs = await sandbox.test_getOpenPRs('owner', 123, null)
-    assert.strictEqual(prs.length, 0)
+    assert.strictEqual(prs, null)
 
     // Test object owner
     prs = await sandbox.test_getOpenPRs({}, 'repo', null)
-    assert.strictEqual(prs.length, 0)
+    assert.strictEqual(prs, null)
   })
 })
 
@@ -3190,11 +3273,19 @@ describe('stale XSRF token recovery (HTTP 400)', () => {
     ])
   })
 
-  it('gives up after a single refresh', async () => {
+  it('stops with a sign-in hint when no step brings a working token', async () => {
     const { sandbox } = setupEnvironment()
     const calls = scriptedFetch(sandbox, [{ status: 400, text: XSRF_BODY('FRESH:4') }])
-    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', ['', 4], CONFIG()), /HTTP 400/)
-    assert.strictEqual(calls.length, 2)
+    await assert.rejects(
+      sandbox.test_callBatchExecute('p1Takd', ['', 4], CONFIG()),
+      /HTTP 400: Jules rejected the sign-in for default\. Open that Jules tab, check you're signed in/
+    )
+    // The 400 token once, then the mint (which hands back the same token);
+    // no tab to read or reload.
+    assert.deepStrictEqual(
+      calls.map((c) => c.rpcId),
+      ['p1Takd', 'p1Takd', 'KQOO7']
+    )
   })
 
   it('does not touch the token on non-400 failures', async () => {
@@ -3204,6 +3295,301 @@ describe('stale XSRF token recovery (HTTP 400)', () => {
     await assert.rejects(sandbox.test_callBatchExecute('p1Takd', ['', 4], config), /HTTP 500/)
     assert.strictEqual(calls.length, 1)
     assert.strictEqual(config.at, 'STALE:1')
+  })
+})
+
+describe('HTTP 429: pausing the account', () => {
+  const OK = ')]}\'\n\n60\n[["wrb.fr","p1Takd","[[\\"ok\\"]]",null,null,null,"generic"]]'
+  const config = (accountNum = '0') => ({ at: 'a', bl: 'b', fsid: 'f', accountNum })
+  const reply = (status, retryAfter) => ({
+    ok: status === 200,
+    status,
+    headers: { get: (h) => (h === 'retry-after' ? (retryAfter ?? null) : null) },
+    text: async () => (status === 200 ? OK : 'slow down')
+  })
+
+  function setup(responses) {
+    const { sandbox } = setupEnvironment()
+    const calls = []
+    sandbox.fetch = async (url) => {
+      calls.push(new URL(url).pathname.split('/')[3])
+      return responses[Math.min(calls.length - 1, responses.length - 1)]
+    }
+    const waits = []
+    sandbox.pause = async (ms) => {
+      waits.push(ms)
+    }
+    const logs = []
+    sandbox.addLog = (m) => logs.push(m)
+    return { sandbox, calls, waits, logs }
+  }
+
+  it('waits out Retry-After, then sends again', async () => {
+    const { sandbox, calls, waits, logs } = setup([reply(429, '7'), reply(200)])
+    const result = await sandbox.test_callBatchExecute('p1Takd', [], config())
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(result)), [['ok']])
+    assert.strictEqual(calls.length, 2)
+    assert.strictEqual(waits.length, 1)
+    assert.ok(waits[0] > 6000 && waits[0] <= 7000, `waited ${waits[0]} ms`)
+    assert.match(logs[0], /\[default\] Jules is rate-limiting this account \(HTTP 429\): pausing its requests for 7 s/)
+  })
+
+  it('waits out a 429 on the sign-in mint as well', async () => {
+    const bad = (text) => ({ ok: false, status: 400, headers: { get: () => null }, text: async () => text })
+    const { sandbox, calls, waits } = setup([
+      bad('no token here'),
+      reply(429, '3'),
+      bad('[["xsrf","FRESH"]]'),
+      reply(200)
+    ])
+    const used = config()
+    await sandbox.test_callBatchExecute('p1Takd', [], used)
+    assert.strictEqual(calls.length, 4, 'the request, the mint, the mint again, the request again')
+    // The clock is frozen, so the retried request also lands inside the pause.
+    assert.ok(waits.length > 0, 'the account paused for the 429')
+    assert.ok(
+      waits.every((ms) => ms > 2000 && ms <= 3000),
+      `waited ${waits} ms`
+    )
+    assert.strictEqual(used.at, 'FRESH')
+  })
+
+  it('reads Retry-After as an HTTP date and waits 30 s when Jules gives none', async () => {
+    const date = new Date(Date.now() + 12000).toUTCString()
+    const a = setup([reply(429, date), reply(200)])
+    await a.sandbox.test_callBatchExecute('p1Takd', [], config())
+    assert.ok(a.waits[0] > 10000 && a.waits[0] <= 12000, `waited ${a.waits[0]} ms`)
+
+    const b = setup([reply(429), reply(200)])
+    await b.sandbox.test_callBatchExecute('p1Takd', [], config())
+    assert.ok(b.waits[0] > 29000 && b.waits[0] <= 30000, `waited ${b.waits[0]} ms`)
+  })
+
+  it('makes the next request of the same account wait too, but not another account', async () => {
+    const { sandbox, waits } = setup([reply(429, '20'), reply(200)])
+    await sandbox.test_callBatchExecute('p1Takd', [], config('0'))
+    assert.strictEqual(waits.length, 1)
+    await sandbox.test_callBatchExecute('p1Takd', [], config('0'))
+    assert.strictEqual(waits.length, 2, 'the same account is still paused')
+    await sandbox.test_callBatchExecute('p1Takd', [], config('1'))
+    assert.strictEqual(waits.length, 2, 'another account goes straight through')
+  })
+
+  it('stops the account for the run when Jules asks for more than 5 minutes', async () => {
+    const { sandbox, calls, waits } = setup([reply(429, '600'), reply(200)])
+    await assert.rejects(
+      sandbox.test_callBatchExecute('p1Takd', [], config()),
+      /Jules rate-limited default \(asked to wait 600 s\); stopped this account for the run/
+    )
+    assert.strictEqual(waits.length, 0)
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /stopped this account for the run/)
+    assert.strictEqual(calls.length, 1, 'a stopped account sends nothing more')
+  })
+
+  it('keeps a 429 and its Retry-After when the error body stalls', async () => {
+    const { sandbox, calls } = setup([])
+    sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 30000 ? 5 : ms)
+    sandbox.fetch = async (url, opts) => {
+      calls.push(new URL(url).pathname.split('/')[3])
+      return {
+        ok: false,
+        status: 429,
+        headers: { get: (h) => (h === 'retry-after' ? '600' : null) },
+        text: () =>
+          new Promise((_r, reject) => {
+            opts.signal.addEventListener('abort', () =>
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            )
+          })
+      }
+    }
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /stopped this account for the run/)
+    assert.strictEqual(calls.length, 1, 'nothing more goes to the account')
+  })
+
+  it('pauses the account on the 429 headers, without waiting for its body', async () => {
+    const { sandbox, calls } = setup([])
+    let bodyReads = 0
+    sandbox.fetch = async (url) => {
+      calls.push(new URL(url).pathname.split('/')[3])
+      return {
+        ok: false,
+        status: 429,
+        headers: { get: (h) => (h === 'retry-after' ? '600' : null) },
+        text: () => {
+          bodyReads++
+          return new Promise(() => {})
+        }
+      }
+    }
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /stopped this account for the run/)
+    assert.strictEqual(bodyReads, 0, 'a 429 body has nothing the run needs')
+  })
+
+  it('stops the account after 3 waits in a row', async () => {
+    const { sandbox, calls, waits } = setup([reply(429, '1')])
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /stopped this account for the run/)
+    assert.strictEqual(calls.length, 4)
+    assert.strictEqual(waits.length, 3)
+  })
+
+  it('counts 429s in a row per account, not per request', async () => {
+    const { sandbox, calls } = setup([reply(429, '1')])
+    const results = await Promise.allSettled(
+      Array.from({ length: 6 }, () => sandbox.test_callBatchExecute('p1Takd', [], config()))
+    )
+    assert.ok(results.every((r) => r.status === 'rejected' && /stopped this account/.test(r.reason.message)))
+    assert.ok(calls.length <= 6, `${calls.length} POSTs; the six went out together, then the account stopped`)
+  })
+
+  it('starts the count over after a request gets through', async () => {
+    const { sandbox, calls } = setup([reply(429, '1'), reply(429, '1'), reply(429, '1'), reply(200), reply(429, '1')])
+    await sandbox.test_callBatchExecute('p1Takd', [], config())
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /stopped this account/)
+    assert.strictEqual(calls.length, 8, 'three 429s and a success, then four 429s')
+  })
+})
+
+describe('sign-in ladder', () => {
+  const OK = (rpcId) => `)]}'\n\n60\n[["wrb.fr","${rpcId}","[[\\"ok\\"]]",null,null,null,"generic"]]`
+  const NO_TOKEN = `)]}'\n\n60\n[["er",null,null,null,null,400,null,null,null,3]]`
+
+  // Jules accepts only `goodToken`; every other token answers 400 with no
+  // fresh token in the body (so steps 1 and 2 bring nothing).
+  function setup({ goodToken, pageTokens, reloadedTokens, reloadTabOnSignIn } = {}) {
+    const { sandbox } = setupEnvironment({}, reloadTabOnSignIn === undefined ? {} : { settings: { reloadTabOnSignIn } })
+    const calls = []
+    sandbox.fetch = async (url, opts) => {
+      const at = new URLSearchParams(opts.body).get('at')
+      calls.push({ rpcId: new URL(url).searchParams.get('rpcids'), at })
+      await new Promise((r) => setTimeout(r, 1))
+      return at === goodToken
+        ? { ok: true, status: 200, text: async () => OK('p1Takd') }
+        : { ok: false, status: 400, text: async () => NO_TOKEN }
+    }
+    const reads = []
+    let reloaded = false
+    sandbox.chrome.tabs.sendMessage = async (_tabId, msg) => {
+      if (msg.action === 'PING') return { ok: true }
+      reads.push(msg)
+      return { config: reloaded ? reloadedTokens : pageTokens, accountNum: '0' }
+    }
+    const reloads = []
+    const updated = []
+    sandbox.chrome.tabs.onUpdated = {
+      addListener: (fn) => updated.push(fn),
+      removeListener: (fn) => updated.splice(updated.indexOf(fn), 1)
+    }
+    sandbox.chrome.tabs.reload = async (tabId) => {
+      reloads.push(tabId)
+      reloaded = true
+      setTimeout(() => {
+        for (const fn of [...updated]) fn(tabId, { status: 'complete' })
+      }, 1)
+    }
+    const logs = []
+    sandbox.addLog = (m) => logs.push(m)
+    return { sandbox, calls, reads, reloads, logs }
+  }
+  const config = () => ({ at: 'OLD', bl: 'bl1', fsid: 'f1', accountNum: '0', tabId: 5 })
+
+  it('re-reads the tokens from the page, past the cache, before reloading', async () => {
+    const { sandbox, calls, reads, reloads } = setup({
+      goodToken: 'PAGE',
+      pageTokens: { at: 'PAGE', bl: 'bl2', fsid: 'f2' }
+    })
+    const cfg = config()
+    await sandbox.test_settingsReady()
+    await sandbox.test_callBatchExecute('p1Takd', [], cfg)
+    assert.deepStrictEqual(
+      calls.map((c) => `${c.rpcId}:${c.at}`),
+      ['p1Takd:OLD', 'KQOO7:', 'p1Takd:PAGE']
+    )
+    assert.strictEqual(reads.length, 1)
+    assert.strictEqual(reads[0].fresh, true, 'the content script is told to skip its cache')
+    assert.deepStrictEqual([cfg.at, cfg.bl, cfg.fsid], ['PAGE', 'bl2', 'f2'], 'bl and f.sid are refreshed too')
+    assert.strictEqual(reloads.length, 0)
+  })
+
+  it("ignores the page's tokens when the tab switched to another account", async () => {
+    const { sandbox, calls } = setup({ goodToken: 'OTHER', pageTokens: { at: 'OTHER' }, reloadTabOnSignIn: false })
+    sandbox.chrome.tabs.sendMessage = async (_tabId, msg) =>
+      msg.action === 'PING' ? { ok: true } : { config: { at: 'OTHER' }, accountNum: '1' }
+    await sandbox.test_settingsReady()
+    await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /Jules rejected the sign-in/)
+    assert.ok(!calls.some((c) => c.at === 'OTHER'), 'account 1 tokens never go out for account 0')
+  })
+
+  it('reloads the Jules tab when the page still holds the old token', async () => {
+    const { sandbox, calls, reloads, logs } = setup({
+      goodToken: 'RELOADED',
+      pageTokens: { at: 'OLD', bl: 'bl1', fsid: 'f1' },
+      reloadedTokens: { at: 'RELOADED', bl: 'bl3', fsid: 'f3' }
+    })
+    await sandbox.test_settingsReady()
+    await sandbox.test_callBatchExecute('p1Takd', [], config())
+    assert.deepStrictEqual(reloads, [5])
+    assert.strictEqual(calls.at(-1).at, 'RELOADED')
+    assert.ok(logs.some((l) => l.includes('trying reloading the Jules tab')))
+  })
+
+  it('does not reload a tab that has left Jules or moved to another account', async () => {
+    for (const url of ['https://example.com/inbox', 'https://jules.google.com/u/2/session', undefined]) {
+      const { sandbox, reloads, logs } = setup({
+        goodToken: 'RELOADED',
+        pageTokens: { at: 'OLD' },
+        reloadedTokens: { at: 'RELOADED' }
+      })
+      sandbox.chrome.tabs.get = async (id) => ({ id, url })
+      await sandbox.test_settingsReady()
+      await assert.rejects(sandbox.test_callBatchExecute('p1Takd', [], config()), /Jules rejected the sign-in/)
+      assert.deepStrictEqual(reloads, [], `no reload for ${url}`)
+      assert.ok(logs.some((l) => l.includes('the tab is no longer on Jules for default')))
+    }
+  })
+
+  it('does not reload the tab when Settings turned that off', async () => {
+    const { sandbox, reloads } = setup({
+      goodToken: 'RELOADED',
+      pageTokens: { at: 'OLD' },
+      reloadedTokens: { at: 'RELOADED' },
+      reloadTabOnSignIn: false
+    })
+    await sandbox.test_settingsReady()
+    await assert.rejects(
+      sandbox.test_callBatchExecute('p1Takd', [], config()),
+      /Jules rejected the sign-in for default/
+    )
+    assert.deepStrictEqual(reloads, [])
+  })
+
+  it('renews once for requests that fail together', async () => {
+    const { sandbox, calls, reads, reloads } = setup({
+      goodToken: 'RELOADED',
+      pageTokens: { at: 'OLD' },
+      reloadedTokens: { at: 'RELOADED' }
+    })
+    await sandbox.test_settingsReady()
+    const cfg = config()
+    await Promise.all([1, 2, 3].map(() => sandbox.test_callBatchExecute('p1Takd', [], cfg)))
+    assert.strictEqual(calls.filter((c) => c.rpcId === 'KQOO7').length, 1, 'one mint')
+    assert.strictEqual(reloads.length, 1, 'one reload')
+    assert.strictEqual(reads.length, 2, 'one read before and one after the reload')
+    assert.strictEqual(calls.filter((c) => c.at === 'RELOADED').length, 3, 'all three go out again')
+  })
+
+  it('starts the ladder over after the tokens worked', async () => {
+    const { sandbox, calls } = setup({ goodToken: 'PAGE', pageTokens: { at: 'PAGE' } })
+    await sandbox.test_settingsReady()
+    const cfg = config()
+    await sandbox.test_callBatchExecute('p1Takd', [], cfg)
+    assert.strictEqual(cfg.signInStep, 0)
+    cfg.at = 'EXPIRED'
+    await sandbox.test_callBatchExecute('p1Takd', [], cfg)
+    assert.deepStrictEqual(
+      calls.slice(3).map((c) => `${c.rpcId}:${c.at}`),
+      ['p1Takd:EXPIRED', 'KQOO7:', 'p1Takd:PAGE']
+    )
   })
 })
 
@@ -3491,6 +3877,25 @@ describe('proceed', () => {
       )
     })
 
+    it('stops at "Run up to N items" from Settings', async () => {
+      const tasks = [task('fb', 12), task('plan', 10, { planId: 'p1' }), task('paused', 8)]
+      const { sandbox, writes, log } = setupProceedEnv(tasks)
+      await sandbox.test_settingsReady()
+      vm.runInContext('runBudget = 1', sandbox)
+      sandbox.test_settings().runLimit = 1
+      const count = await run(sandbox, 'All')
+      assert.strictEqual(count, 1)
+      assert.deepStrictEqual(
+        writes().map((c) => c.payload[0]),
+        ['fb'],
+        'the first in Proceed order'
+      )
+      assert.ok(
+        log().some((l) => l.includes('Settings: run up to 1 item(s), so only 1 of 3 task(s) to proceed')),
+        log().join('\n')
+      )
+    })
+
     it('only touches tasks in the selected repository', async () => {
       const tasks = [task('mine', 12), task('other', 12, { source: 'github/x/y', repo: 'x/y' })]
       const { sandbox, writes } = setupProceedEnv(tasks)
@@ -3652,11 +4057,98 @@ describe('proceed', () => {
   })
 
   describe('START message', () => {
-    function send(env, options) {
+    function send(env, options, { protocol = RUN_PROTOCOL } = {}) {
       return new Promise((resolve) => {
-        for (const listener of env.messageListeners) listener({ action: 'START', options }, {}, resolve)
+        for (const listener of env.messageListeners) listener({ action: 'START', protocol, options }, {}, resolve)
       })
     }
+    const plain = (value) => JSON.parse(JSON.stringify(value))
+
+    it('answers HELLO with its protocol, but not to a content script', async () => {
+      const env = setupEnvironment()
+      const ask = (sender) =>
+        new Promise((resolve) => {
+          for (const listener of env.messageListeners) listener({ action: 'HELLO' }, sender, resolve)
+        })
+      assert.deepStrictEqual(plain(await ask({})), { protocol: RUN_PROTOCOL })
+      assert.match(plain(await ask({ tab: { id: 1 } })).error, /Unauthorized/)
+    })
+
+    it("refuses an older popup's START, the message that archived 65 tasks", async () => {
+      const env = setupEnvironment()
+      let started = false
+      env.sandbox.startOperation = async () => {
+        started = true
+      }
+      // The pre-2026-10-19 popup sent no protocol and an opMode.
+      const old = { action: 'START', options: { opMode: 'archive', force: true, dryRun: false } }
+      const response = await new Promise((resolve) => {
+        for (const listener of env.messageListeners) listener(old, {}, resolve)
+      })
+      assert.match(plain(response).error, /different versions\. Reload the extension/)
+      const other = await send(env, { action: 'archive', item: 'All' }, { protocol: RUN_PROTOCOL + 1 })
+      assert.match(plain(other).error, /different versions/)
+      assert.strictEqual(started, false)
+    })
+
+    it('refuses an option it does not know, instead of ignoring it', async () => {
+      const env = setupEnvironment()
+      let started = false
+      env.sandbox.startOperation = async () => {
+        started = true
+      }
+      const response = await send(env, { action: 'proceed', item: 'All', dryRun: true, keepGoing: true })
+      assert.match(plain(response).error, /^Unknown option keepGoing\. Reload the extension/)
+      assert.strictEqual(started, false)
+    })
+
+    it('refuses a second START that arrives while the first waits for the settings', async () => {
+      const env = setupEnvironment()
+      const seen = []
+      env.sandbox.startOperation = async (options) => {
+        seen.push(options.action)
+      }
+      const first = send(env, { action: 'proceed', item: 'All', dryRun: true })
+      const second = send(env, { action: 'archive', item: 'All', dryRun: true })
+      assert.match(plain(await second).error, /already going/)
+      assert.deepStrictEqual(plain(await first), { ok: true })
+      assert.deepStrictEqual(seen, ['proceed'])
+    })
+
+    it('waits for the saved state before starting, so a woken worker cannot run twice', async () => {
+      let ready
+      const sessionReady = new Promise((resolve) => {
+        ready = resolve
+      })
+      const env = setupEnvironment({ archiveState: { status: 'done', log: [] } }, {}, { sessionReady })
+      const seen = []
+      env.sandbox.startOperation = async (options) => {
+        seen.push(options.action)
+        env.sandbox.test_updateState({ status: 'running' })
+      }
+      const first = send(env, { action: 'proceed', item: 'All', dryRun: true })
+      await new Promise((r) => setTimeout(r, 5))
+      ready()
+      assert.deepStrictEqual(plain(await first), { ok: true })
+      await new Promise((r) => setTimeout(r, 5))
+      assert.strictEqual(env.sandbox.test_state().status, 'running', 'the restore did not undo the run')
+      const second = await send(env, { action: 'archive', item: 'All', dryRun: true })
+      assert.match(plain(second).error, /already going/)
+      assert.deepStrictEqual(seen, ['proceed'])
+    })
+
+    it('does not let a scheduled tick start beside a manual START', async () => {
+      const env = setupEnvironment({}, { schedEnabled: true })
+      const seen = []
+      env.sandbox.startOperation = async (options) => {
+        seen.push(options.scheduled ? 'tick' : options.action)
+        env.sandbox.test_updateState({ status: 'running' })
+      }
+      const manual = send(env, { action: 'proceed', item: 'All', dryRun: true })
+      await env.sandbox.test_runScheduledTick()
+      await manual
+      assert.deepStrictEqual(seen, ['proceed'])
+    })
 
     it('answers with an error for an unknown item and starts nothing', async () => {
       const env = setupEnvironment()
@@ -3675,7 +4167,7 @@ describe('proceed', () => {
       env.sandbox.startOperation = async () => {
         started = true
       }
-      const response = await send(env, { opMode: 'proceed', dryRun: false })
+      const response = await send(env, { dryRun: false })
       assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), { error: 'Unknown action "undefined"' })
       assert.strictEqual(started, false)
     })
@@ -3806,5 +4298,581 @@ describe('proceed', () => {
       await sandbox.processSuggestionsForTab({ id: 1, url: 'https://jules.google.com/u/0/' }, { message: 'Extra' })
       assert.deepStrictEqual(messages, ['Extra'])
     })
+  })
+})
+
+// =============================================================================
+// Settings, pacing and Jules API rediscovery
+// =============================================================================
+
+describe('pacing requests sent together', () => {
+  it('paces GitHub PR checks sent together too, and sends a lone one straight out', async () => {
+    const { sandbox } = setupEnvironment()
+    const waits = []
+    sandbox.pause = async (ms) => {
+      waits.push(ms)
+    }
+    sandbox.burstDelayMs = () => 900
+    sandbox.fetch = async () => {
+      await new Promise((r) => setTimeout(r, 5))
+      return { ok: true, status: 200, json: async () => [] }
+    }
+    await sandbox.getOpenPRs('o', 'alone', '')
+    assert.deepStrictEqual(waits, [])
+    await Promise.all([
+      sandbox.getOpenPRs('o', 'a', ''),
+      sandbox.getOpenPRs('o', 'b', ''),
+      sandbox.getOpenPRs('o', 'c', '')
+    ])
+    assert.deepStrictEqual(waits, [900, 900])
+  })
+
+  it('waits 0.5-2 s, plus up to the extra jitter when it is on', () => {
+    const { sandbox } = setupEnvironment()
+    const delay = sandbox.test_burstDelayMs
+    const random = sandbox.Math.random
+    try {
+      sandbox.Math.random = () => 0
+      assert.strictEqual(delay(), 500)
+      sandbox.Math.random = () => 0.999999
+      assert.ok(delay() >= 1999 && delay() <= 2000)
+      sandbox.test_settings().extraJitter = true
+      sandbox.test_settings().extraJitterMaxSec = 10
+      assert.ok(delay() > 11900 && delay() <= 12000, `got ${delay()}`)
+    } finally {
+      sandbox.Math.random = random
+    }
+  })
+
+  async function postEnv(settingsPatch = {}) {
+    const { sandbox } = setupEnvironment()
+    await sandbox.test_settingsReady()
+    Object.assign(sandbox.test_settings(), settingsPatch)
+    const waits = []
+    sandbox.pause = async (ms) => {
+      waits.push(ms)
+    }
+    sandbox.burstDelayMs = () => 700
+    let inFlight = 0
+    let peak = 0
+    const peakByAccount = {}
+    const live = {}
+    sandbox.fetch = async (url) => {
+      const account = new URL(url).pathname.split('/')[2]
+      inFlight++
+      live[account] = (live[account] || 0) + 1
+      peak = Math.max(peak, inFlight)
+      peakByAccount[account] = Math.max(peakByAccount[account] || 0, live[account])
+      await new Promise((r) => setTimeout(r, 5))
+      inFlight--
+      live[account]--
+      return { ok: true, status: 200, text: async () => ")]}'\n\n4\n[[]]" }
+    }
+    const post = (accountNum) =>
+      sandbox.test_postBatchExecute('p1Takd', [], { at: 'a', bl: 'b', fsid: 'f', accountNum })
+    return { sandbox, waits, post, stats: () => ({ peak, peakByAccount }) }
+  }
+
+  it('holds its slot until the reply body has downloaded', async () => {
+    const { sandbox, post } = await postEnv({ totalParallel: 1 })
+    let downloading = 0
+    let peak = 0
+    sandbox.fetch = async () => {
+      downloading++
+      peak = Math.max(peak, downloading)
+      return {
+        ok: true,
+        status: 200,
+        text: () =>
+          new Promise((r) =>
+            setTimeout(() => {
+              downloading--
+              r(")]}'\n\n4\n[[]]")
+            }, 10)
+          )
+      }
+    }
+    await Promise.all([post('0'), post('1'), post('2')])
+    assert.strictEqual(peak, 1, 'a 100 MB task list counts against the limit while it downloads')
+  })
+
+  it('times out a reply body that stops arriving', async () => {
+    const { sandbox, post } = await postEnv({ requestTimeoutSec: 5 })
+    sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 5000 ? 5 : ms)
+    sandbox.fetch = async (_url, opts) => ({
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise((_r, reject) => {
+          opts.signal.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          )
+        })
+    })
+    await assert.rejects(post('0'), /timed out/)
+  })
+
+  it('ends an error body that stops arriving at the timeout, keeping the status', async () => {
+    const { sandbox, post } = await postEnv({ requestTimeoutSec: 5 })
+    sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 5000 ? 5 : ms)
+    sandbox.fetch = async (_url, opts) => ({
+      ok: false,
+      status: 400,
+      text: () =>
+        new Promise((_r, reject) => {
+          opts.signal.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          )
+        })
+    })
+    await assert.rejects(post('0'), /HTTP 400/)
+  })
+
+  it('reads an error body once, while the request holds its slot', async () => {
+    const { sandbox } = await postEnv()
+    let reads = 0
+    sandbox.fetch = async () => ({
+      ok: false,
+      status: 400,
+      text: async () => {
+        reads++
+        return 'xsrf reply'
+      }
+    })
+    const err = await sandbox.test_jFetch('https://jules.google.com/x', { buffer: true }).catch((e) => e)
+    assert.strictEqual(err.status, 400)
+    assert.strictEqual(reads, 1, 'read inside jFetch')
+    assert.strictEqual(await err.response.text(), 'xsrf reply')
+    assert.strictEqual(await err.response.text(), 'xsrf reply')
+    assert.strictEqual(reads, 1)
+  })
+
+  it('sends a lone request straight out, and paces the rest of a burst', async () => {
+    const { waits, post } = await postEnv()
+    await post('0')
+    assert.deepStrictEqual(waits, [], 'a lone request does not wait')
+    await Promise.all([post('0'), post('0'), post('0')])
+    assert.deepStrictEqual(waits, [700, 700], 'every request after the first of a burst waits')
+  })
+
+  it('keeps the total and per-account limits for every request, across accounts', async () => {
+    const one = await postEnv({ totalParallel: 1 })
+    await Promise.all([one.post('0'), one.post('1'), one.post('2')])
+    assert.strictEqual(one.stats().peak, 1)
+
+    const two = await postEnv({ perAccountParallel: 2, totalParallel: 12 })
+    await Promise.all([1, 2, 3, 4, 5].map(() => two.post('0')))
+    assert.strictEqual(two.stats().peakByAccount['0'], 2)
+  })
+
+  it('sends nothing while the account is paused, even if the pause starts after the request queued', async () => {
+    const { sandbox, waits, post } = await postEnv()
+    let sentAt = null
+    const fetch = sandbox.fetch
+    sandbox.fetch = async (...args) => {
+      sentAt = vm.runInContext("accountPauses.get('0') || 0", sandbox)
+      return fetch(...args)
+    }
+    // A 429 elsewhere pauses the account while this request is in its jitter.
+    sandbox.pause = async (ms) => {
+      waits.push(ms)
+      if (waits.length === 1) vm.runInContext("accountPauses.set('0', Date.now() + 60000)", sandbox)
+    }
+    sandbox.burstDelayMs = () => 700
+    vm.runInContext("accountActive.set('0', 1)", sandbox) // another request of the account is in flight
+    await post('0')
+    assert.deepStrictEqual(waits.slice(0, 1), [700])
+    assert.ok(waits[1] > 59000, `waited out the pause: ${waits}`)
+    assert.ok(sentAt > 0, 'the request went out only after waiting for the pause')
+  })
+})
+
+describe('Run up to N items', () => {
+  it('hands out the budget across calls and logs when it cuts', () => {
+    const { sandbox } = setupEnvironment()
+    const logs = []
+    sandbox.addLog = (m) => logs.push(m)
+    vm.runInContext('settings.runLimit = 3; runBudget = 3', sandbox)
+    assert.deepStrictEqual(sandbox.test_takeRunBudget('a', [1, 2], 'tasks'), [1, 2])
+    assert.deepStrictEqual(sandbox.test_takeRunBudget('b', [3, 4, 5], 'tasks'), [3])
+    assert.deepStrictEqual(sandbox.test_takeRunBudget('c', [6], 'tasks'), [])
+    assert.deepStrictEqual(logs, [
+      '[b] Settings: run up to 3 item(s), so only 1 of 3 tasks',
+      '[c] Settings: run up to 3 item(s), so only 0 of 1 tasks'
+    ])
+  })
+
+  it('has no limit by default', () => {
+    const { sandbox } = setupEnvironment()
+    const many = Array.from({ length: 500 }, (_, i) => i)
+    assert.strictEqual(sandbox.test_takeRunBudget('a', many, 'tasks').length, 500)
+  })
+})
+
+describe('settings in the background', () => {
+  it('keeps a change that lands while the start-up read is still in flight', async () => {
+    const env = setupEnvironment({}, { settings: { runLimit: 0 } })
+    await env.sandbox.chrome.storage.sync.set({ settings: { runLimit: 1 } })
+    await env.sandbox.test_settingsReady()
+    assert.strictEqual(env.sandbox.test_settings().runLimit, 1)
+  })
+
+  it('loads the saved settings and Jules API values at start-up', async () => {
+    const env = setupEnvironment({}, { settings: { requestTimeoutSec: 45, runLimit: 1 } })
+    await env.sandbox.test_settingsReady()
+    assert.strictEqual(env.sandbox.test_settings().requestTimeoutSec, 45)
+    assert.strictEqual(env.sandbox.test_settings().runLimit, 1)
+  })
+
+  it('picks up a change from the popup without a restart', async () => {
+    const env = setupEnvironment()
+    await env.sandbox.test_settingsReady()
+    await env.sandbox.chrome.storage.sync.set({ settings: { perAccountParallel: 2 } })
+    assert.strictEqual(env.sandbox.test_settings().perAccountParallel, 2)
+    assert.strictEqual(env.sandbox.test_settings().requestTimeoutSec, 30, 'missing keys take their default')
+    for (const listener of env.storageChangeListeners) {
+      listener({ julesApi: { newValue: { rpc: { ListTasks: 'Abc12' } } } }, 'local')
+    }
+    assert.strictEqual(env.sandbox.rpc('ListTasks'), 'Abc12')
+    for (const listener of env.storageChangeListeners) listener({ julesApi: { newValue: undefined } }, 'local')
+    assert.strictEqual(env.sandbox.rpc('ListTasks'), 'p1Takd', 'Reset to defaults removes the stored values')
+  })
+
+  it('refuses to run, manually or on schedule, when the settings could not be read', async () => {
+    const env = setupEnvironment(
+      {},
+      { schedEnabled: true, settings: { runLimit: 1 } },
+      {
+        prepare: (chrome) => {
+          chrome.storage.local.get = async () => {
+            throw new Error('IO error')
+          }
+        }
+      }
+    )
+    await env.sandbox.test_settingsReady()
+    assert.strictEqual(env.sandbox.test_settings().runLimit, 1, 'what could be read still applies')
+    let started = 0
+    env.sandbox.startOperation = async () => {
+      started++
+    }
+    const response = await new Promise((resolve) => {
+      const msg = { action: 'START', protocol: RUN_PROTOCOL, options: { action: 'archive', item: 'All' } }
+      for (const listener of env.messageListeners) listener(msg, {}, resolve)
+    })
+    assert.match(JSON.parse(JSON.stringify(response)).error, /Could not read the settings \(IO error\)\. Reload/)
+    await env.sandbox.test_runScheduledTick()
+    assert.strictEqual(started, 0)
+  })
+
+  it("counts a scheduled tick's archive and suggestion steps against one budget", async () => {
+    const env = setupEnvironment(
+      {},
+      { schedEnabled: true, schedStartSuggestions: true, schedMaxStarts: 5, settings: { runLimit: 1 } }
+    )
+    await env.sandbox.test_settingsReady()
+    const kept = []
+    env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/0/' }]
+    env.sandbox.processAllTabs = async (_tabs, options) => {
+      kept.push([options.action, env.sandbox.test_takeRunBudget('u/0', ['a', 'b'], 'items').length])
+      return []
+    }
+    await env.sandbox.test_runScheduledTick()
+    assert.deepStrictEqual(kept, [
+      ['archive', 1],
+      ['proceed', 0]
+    ])
+  })
+
+  it("sets the tick's budget before either step, so a failed archive step can't free the suggestions", async () => {
+    const env = setupEnvironment(
+      {},
+      { schedEnabled: true, schedStartSuggestions: true, schedMaxStarts: 5, settings: { runLimit: 1 } }
+    )
+    await env.sandbox.test_settingsReady()
+    const resolveItem = env.sandbox.resolveItem
+    // A rediscovered state table without "Completed": the archive step fails before it runs.
+    env.sandbox.resolveItem = (id) => (id === 'Completed' ? null : resolveItem(id))
+    const kept = []
+    env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/0/' }]
+    env.sandbox.processAllTabs = async (_tabs, options) => {
+      kept.push([options.action, env.sandbox.test_takeRunBudget('u/0', ['a', 'b', 'c'], 'items').length])
+      return []
+    }
+    await env.sandbox.test_runScheduledTick()
+    assert.deepStrictEqual(kept, [['proceed', 1]])
+  })
+
+  it("keeps the archive step's account pauses, stops and 429 counts for the suggestions step", async () => {
+    const env = setupEnvironment({}, { schedEnabled: true, schedStartSuggestions: true, schedMaxStarts: 5 })
+    await env.sandbox.test_settingsReady()
+    const seen = []
+    env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/1/' }]
+    env.sandbox.processAllTabs = async (_tabs, options) => {
+      const run = env.sandbox.test_accountRunState()
+      if (options.action === 'archive') {
+        run.stoppedAccounts.set('1', 'Jules asked to wait 600 s')
+        run.accountPauses.set('2', Date.now() + 60000)
+        run.accountRateLimits.set('3', 2)
+      } else {
+        seen.push(run.stoppedAccounts.has('1'), run.accountPauses.has('2'), run.accountRateLimits.get('3'))
+      }
+      return []
+    }
+    await env.sandbox.test_runScheduledTick()
+    assert.deepStrictEqual(seen, [true, true, 2])
+    // The next run starts clean.
+    let stoppedAtStart
+    env.sandbox.processAllTabs = async () => {
+      stoppedAtStart = env.sandbox.test_accountRunState().stoppedAccounts.size
+      return []
+    }
+    await env.sandbox.test_startOperation({ action: 'archive', item: 'Completed' })
+    assert.strictEqual(stoppedAtStart, 0)
+  })
+
+  it('reads each message from its own key and merges a change to one key with the rest', async () => {
+    const env = setupEnvironment({}, { settings: { runLimit: 3 }, defaultReply: 'Mine', continueErrorMessage: 'Old' })
+    await env.sandbox.test_settingsReady()
+    assert.strictEqual(env.sandbox.test_settings().defaultReply, 'Mine')
+    assert.strictEqual(env.sandbox.test_settings().defaultRetry, 'Old', "the old popup's box until the popup saves")
+    for (const listener of env.storageChangeListeners) listener({ defaultRetry: { newValue: 'New' } }, 'sync')
+    assert.strictEqual(env.sandbox.test_settings().defaultRetry, 'New')
+    assert.strictEqual(env.sandbox.test_settings().runLimit, 3)
+    assert.strictEqual(env.sandbox.test_settings().defaultReply, 'Mine')
+  })
+
+  it('gives each run the default reply and retry, the run limit and fresh account pauses', async () => {
+    const env = setupEnvironment({}, { settings: { defaultReply: 'Mine', defaultRetry: 'Again', runLimit: 2 } })
+    let seen = null
+    env.sandbox.discoverTabs = async (options) => {
+      seen = { ...options, budget: vm.runInContext('runBudget', env.sandbox) }
+      return null
+    }
+    vm.runInContext("stoppedAccounts.set('0', 'old stop')", env.sandbox)
+    await env.sandbox.test_startOperation({ action: 'proceed', item: 'All', dryRun: true })
+    assert.strictEqual(seen.defaultReply, 'Mine')
+    assert.strictEqual(seen.defaultRetry, 'Again')
+    assert.strictEqual(seen.budget, 2)
+    assert.strictEqual(vm.runInContext('stoppedAccounts.size', env.sandbox), 0)
+  })
+})
+
+describe('Jules API rediscovery', () => {
+  const { JULES_RPC_DEFAULTS } = require('../settings.js')
+  const ROW5 =
+    '[[0,"Unknown"],[1,"Queued"],[11,"Queued restart"],[2,"In progress"],[9,"Planning"],[12,"Awaiting user feedback"],[10,"Awaiting plan approval"],[3,"Completed"],[4,"Error"],[8,"Paused"],[7,"Completed"]]'
+  const ROW25 = '[[0,"Unknown"],[1,"Pending"],[2,"Queued"]]'
+  const bundle = (rpc) =>
+    `var a=1;${Object.entries(rpc)
+      .map(([m, id]) => `x({S:"${id}",V:"/SweBotService.${m}",T:1});`)
+      .join('')}var s=new Map(${ROW5});var t=new Map(${ROW25});`
+
+  it('reads RPC ids and state maps only from Jules and gstatic scripts', async () => {
+    const { sandbox } = setupEnvironment()
+    const fetched = []
+    sandbox.document = {
+      scripts: [
+        { src: 'https://www.gstatic.com/_/mss/boq-swebot/js/k=main.js' },
+        { src: 'https://evil.example.com/steal.js' },
+        { src: 'http://www.gstatic.com/plain.js' },
+        { src: '' }
+      ]
+    }
+    sandbox.performance = {
+      getEntriesByType: () => [
+        { initiatorType: 'script', name: 'https://jules.google.com/_/lazy.js' },
+        { initiatorType: 'img', name: 'https://www.gstatic.com/logo.js' }
+      ]
+    }
+    sandbox.fetch = async (url) => {
+      fetched.push(url)
+      return {
+        text: async () => (url.includes('main') ? bundle(JULES_RPC_DEFAULTS) : 'x({S:"Zz9Yy",V:"/Other.Thing"})')
+      }
+    }
+    const found = JSON.parse(JSON.stringify(await sandbox.test_readJulesBundle()))
+    assert.deepStrictEqual(fetched.sort(), [
+      'https://jules.google.com/_/lazy.js',
+      'https://www.gstatic.com/_/mss/boq-swebot/js/k=main.js'
+    ])
+    assert.strictEqual(found.scripts, 2)
+    assert.ok(found.rpc.some(([id, m]) => id === 'p1Takd' && m === 'SweBotService.ListTasks'))
+    assert.ok(found.rpc.some(([id, m]) => id === 'Zz9Yy' && m === 'Other.Thing'))
+    assert.strictEqual(found.stateMaps.length, 2)
+    assert.deepStrictEqual(found.stateMaps[0], JSON.parse(ROW5))
+  })
+
+  function rediscoverEnv(found, { running = false } = {}) {
+    const env = setupEnvironment()
+    const local = {}
+    env.sandbox.chrome.storage.local = {
+      get: async (keys) => Object.fromEntries([].concat(keys).map((k) => [k, local[k]])),
+      set: async (data) => Object.assign(local, data)
+    }
+    env.sandbox.chrome.tabs.query = async () => [{ id: 7, url: 'https://jules.google.com/u/0/' }]
+    const injected = []
+    env.sandbox.chrome.scripting.executeScript = async (opts) => {
+      injected.push(opts)
+      return [{ result: found }]
+    }
+    if (running) vm.runInContext("state.status = 'running'", env.sandbox)
+    const ask = (sender = {}) =>
+      new Promise((resolve) => {
+        for (const listener of env.messageListeners) listener({ action: 'REDISCOVER_API' }, sender, resolve)
+      })
+    return { env, local, injected, ask }
+  }
+  const liveFound = (overrides = {}) => ({
+    rpc: Object.entries({ ...JULES_RPC_DEFAULTS, ...overrides }).map(([m, id]) => [id, `SweBotService.${m}`]),
+    stateMaps: [JSON.parse(ROW5), JSON.parse(ROW25)],
+    scripts: 5
+  })
+
+  it('applies a renamed RPC at once, saves it and logs the change', async () => {
+    const { env, local, injected, ask } = rediscoverEnv(liveFound({ ArchiveTasks: 'Qq7Rr' }))
+    const response = JSON.parse(JSON.stringify(await ask()))
+    assert.deepStrictEqual(response.changes, ['ArchiveTasks: Tjmm5c → Qq7Rr'])
+    assert.strictEqual(local.julesApi.rpc.ArchiveTasks, 'Qq7Rr')
+    assert.ok(Number.isFinite(local.julesApi.checkedAt))
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(local.julesApiLog[0].changes)), ['ArchiveTasks: Tjmm5c → Qq7Rr'])
+    assert.strictEqual(env.sandbox.rpc('ArchiveTasks'), 'Qq7Rr')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(injected[0].target)), { tabId: 7, documentIds: ['doc1'] })
+  })
+
+  it('reports no changes when Jules matches the current values', async () => {
+    const { ask, local } = rediscoverEnv(liveFound())
+    const response = await ask()
+    assert.deepStrictEqual(Array.from(response.changes), [])
+    assert.deepStrictEqual(Array.from(response.problems), [])
+    assert.strictEqual(local.julesApi.states, null)
+  })
+
+  it('refuses while a run is going, and from a content script', async () => {
+    const busy = rediscoverEnv(liveFound(), { running: true })
+    assert.match((await busy.ask()).error, /A run is going/)
+    assert.strictEqual(busy.injected.length, 0)
+    const tab = rediscoverEnv(liveFound())
+    assert.match((await tab.ask({ tab: { id: 7 } })).error, /Unauthorized/)
+    assert.strictEqual(tab.injected.length, 0)
+  })
+
+  it('holds new values until the run in progress ends', async () => {
+    const env = setupEnvironment()
+    await env.sandbox.test_settingsReady()
+    const seen = []
+    env.sandbox.discoverTabs = async () => {
+      for (const listener of env.storageChangeListeners) {
+        listener({ julesApi: { newValue: { rpc: { ListTasks: 'Abc12' } } } }, 'local')
+      }
+      seen.push(env.sandbox.rpc('ListTasks'))
+      env.sandbox.test_updateState({ status: 'error', error: 'No Jules tabs found' })
+      return null
+    }
+    await env.sandbox.test_startOperation({ action: 'proceed', item: 'All', dryRun: true })
+    assert.deepStrictEqual(seen, ['p1Takd'], 'the run kept the values it started with')
+    assert.strictEqual(env.sandbox.rpc('ListTasks'), 'Abc12', 'applied once the run ended')
+  })
+
+  it('gives up on a script that stops arriving and reads the rest', async () => {
+    const { sandbox } = setupEnvironment()
+    sandbox.document = {
+      scripts: [{ src: 'https://www.gstatic.com/stuck.js' }, { src: 'https://www.gstatic.com/main.js' }]
+    }
+    sandbox.performance = { getEntriesByType: () => [] }
+    sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 20000 ? 5 : ms)
+    sandbox.fetch = async (url, opts) => {
+      if (url.includes('main')) return { text: async () => bundle(JULES_RPC_DEFAULTS) }
+      // Without a signal it never ends, as a stalled download would.
+      return new Promise((_r, reject) => {
+        opts?.signal?.addEventListener('abort', () =>
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+        )
+      })
+    }
+    const found = await sandbox.test_readJulesBundle()
+    assert.ok(found.rpc.some(([id, m]) => id === 'p1Takd' && m === 'SweBotService.ListTasks'))
+  })
+
+  it('ends a check that takes too long, so the next one can start', async () => {
+    const { env, injected, ask } = rediscoverEnv(liveFound())
+    env.sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 120000 ? 5 : ms)
+    env.sandbox.chrome.scripting.executeScript = async (opts) => {
+      injected.push(opts)
+      return new Promise(() => {})
+    }
+    assert.match((await ask()).error, /took too long/)
+    await ask()
+    assert.strictEqual(injected.length, 2, 'a stuck check does not hold later ones')
+  })
+
+  it('never lets a check that ran out of time overwrite a newer one', async () => {
+    const { env, local, injected, ask } = rediscoverEnv(liveFound())
+    env.sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 120000 ? 5 : ms)
+    let finishFirst
+    env.sandbox.chrome.scripting.executeScript = async (opts) => {
+      injected.push(opts)
+      if (injected.length === 1) return new Promise((resolve) => (finishFirst = resolve))
+      return [{ result: liveFound({ ArchiveTasks: 'Newer1' }) }]
+    }
+    assert.match((await ask()).error, /took too long/)
+    await ask()
+    assert.strictEqual(local.julesApi.rpc.ArchiveTasks, 'Newer1')
+    finishFirst([{ result: liveFound({ ArchiveTasks: 'Older1' }) }])
+    await new Promise((r) => setTimeout(r, 10))
+    assert.strictEqual(local.julesApi.rpc.ArchiveTasks, 'Newer1', 'the late check is dropped')
+    assert.strictEqual(env.sandbox.test_julesApi().rpc.ArchiveTasks, 'Newer1')
+  })
+
+  it('never applies a check that ran out of time while it was saving', async () => {
+    const { env, local, ask } = rediscoverEnv(liveFound({ ArchiveTasks: 'Older1' }))
+    env.sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 120000 ? 5 : ms)
+    let saves = 0
+    let finishFirstSave
+    env.sandbox.chrome.storage.local.set = async (data) => {
+      saves++
+      if (saves === 1) {
+        await new Promise((resolve) => (finishFirstSave = resolve))
+        return
+      }
+      Object.assign(local, data)
+    }
+    assert.match((await ask()).error, /took too long/)
+    env.sandbox.chrome.scripting.executeScript = async () => [{ result: liveFound({ ArchiveTasks: 'Newer1' }) }]
+    await ask()
+    assert.strictEqual(env.sandbox.test_julesApi().rpc.ArchiveTasks, 'Newer1')
+    finishFirstSave()
+    await new Promise((r) => setTimeout(r, 10))
+    assert.strictEqual(env.sandbox.test_julesApi().rpc.ArchiveTasks, 'Newer1', 'the late save is not applied')
+  })
+
+  it('runs one check at a time', async () => {
+    const { injected, ask } = rediscoverEnv(liveFound())
+    const [a, b] = await Promise.all([ask(), ask()])
+    assert.strictEqual(injected.length, 1)
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)))
+  })
+
+  it('needs a Jules tab', async () => {
+    const { env, ask } = rediscoverEnv(liveFound())
+    env.sandbox.chrome.tabs.query = async () => []
+    assert.strictEqual((await ask()).error, 'Open a Jules tab first.')
+  })
+
+  it('schedules a daily check, which skips while a run is going', async () => {
+    const env = setupEnvironment()
+    await new Promise((r) => setTimeout(r, 0))
+    const alarm = env.alarmsStore.get(env.sandbox.test_API_REDISCOVER_ALARM)
+    assert.strictEqual(alarm.periodInMinutes, 24 * 60)
+    let checks = 0
+    env.sandbox.rediscoverJulesApi = async () => {
+      checks++
+    }
+    vm.runInContext("state.status = 'running'", env.sandbox)
+    for (const listener of env.alarmListeners) listener({ name: 'jta-api-rediscover' })
+    assert.strictEqual(checks, 0)
+    vm.runInContext("state.status = 'idle'", env.sandbox)
+    for (const listener of env.alarmListeners) listener({ name: 'jta-api-rediscover' })
+    assert.strictEqual(checks, 1)
   })
 })

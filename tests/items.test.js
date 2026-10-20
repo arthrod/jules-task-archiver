@@ -4,6 +4,8 @@ const {
   TASK_STATES,
   ITEM_ALL,
   ITEM_SUGGESTIONS,
+  setTaskStates,
+  getTaskStates,
   listItems,
   resolveItem,
   taskStateCode,
@@ -142,5 +144,28 @@ describe('itemIncludesTask', () => {
 
   it('Suggestions never includes a task', () => {
     assert.strictEqual(itemIncludesTask(resolveItem('Suggestions'), { state: 12 }), false)
+  })
+})
+
+describe('setTaskStates', () => {
+  it('swaps the table every helper uses, and an empty table restores the built-in one', () => {
+    const states = [
+      { code: 42, name: 'Waiting on You', kind: 'feedback' },
+      { code: 3, name: 'Completed', kind: 'completed' }
+    ]
+    try {
+      setTaskStates(states)
+      assert.strictEqual(getTaskStates(), states)
+      assert.deepStrictEqual(
+        listItems().map((i) => i.label),
+        ['All', 'Waiting on You (42)', 'Completed (3)', 'Suggestions']
+      )
+      assert.deepStrictEqual(resolveItem('Waiting on You').codes, [42])
+      assert.strictEqual(taskStateFor({ state: 12 }), null)
+      setTaskStates([])
+      assert.strictEqual(getTaskStates(), TASK_STATES)
+    } finally {
+      setTaskStates(null)
+    }
   })
 })
