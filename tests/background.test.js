@@ -1750,7 +1750,7 @@ describe('startOperation refactoring', () => {
 
   it('startOperation should orchestrate successfully', async () => {
     const { sandbox } = setupEnvironment()
-    const options = { action: 'archive', item: 'Completed' }
+    const options = { action: 'archive', items: ['Completed'] }
 
     // Mock helpers
     sandbox.chrome.tabs.query = async () => [{ id: 1, url: 'https://jules.google.com/u/0/session' }]
@@ -4044,19 +4044,19 @@ describe('proceed', () => {
 
     it('maps an action and a task item to the matching orchestrator', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(resolve(sandbox, { action: 'proceed', item: 'Error (4)' }).opMode, 'proceed')
-      assert.strictEqual(resolve(sandbox, { action: 'archive', item: 'All' }).opMode, 'archive')
-      assert.deepStrictEqual(resolve(sandbox, { action: 'archive', item: 'Error' }).item.codes, [4])
+      assert.strictEqual(resolve(sandbox, { action: 'proceed', items: ['Error (4)'] }).opMode, 'proceed')
+      assert.strictEqual(resolve(sandbox, { action: 'archive', items: ['All'] }).opMode, 'archive')
+      assert.deepStrictEqual(resolve(sandbox, { action: 'archive', items: ['Error'] }).item.codes, [4])
     })
 
     it('maps Suggestions to start, batch or remove', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(resolve(sandbox, { action: 'proceed', item: 'Suggestions' }).opMode, 'suggestions')
+      assert.strictEqual(resolve(sandbox, { action: 'proceed', items: ['Suggestions'] }).opMode, 'suggestions')
       assert.strictEqual(
-        resolve(sandbox, { action: 'proceed', item: 'Suggestions', oneSession: true }).opMode,
+        resolve(sandbox, { action: 'proceed', items: ['Suggestions'], oneSession: true }).opMode,
         'agent_batch'
       )
-      assert.strictEqual(resolve(sandbox, { action: 'archive', item: 'Suggestions' }).opMode, 'remove_suggestions')
+      assert.strictEqual(resolve(sandbox, { action: 'archive', items: ['Suggestions'] }).opMode, 'remove_suggestions')
     })
 
     it('maps export to the suggestions export', () => {
@@ -4066,21 +4066,264 @@ describe('proceed', () => {
 
     it('normalizes the message', () => {
       const { sandbox } = setupEnvironment()
-      assert.strictEqual(resolve(sandbox, { action: 'proceed', item: 'All', message: '  hi ' }).message, 'hi')
+      assert.strictEqual(resolve(sandbox, { action: 'proceed', items: ['All'], message: '  hi ' }).message, 'hi')
     })
 
     it('rejects an unknown action or item', () => {
       const { sandbox } = setupEnvironment()
-      assert.throws(() => sandbox.resolveRunOptions({ action: 'delete', item: 'All' }), /Unknown action "delete"/)
-      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', item: 'Nope' }), /Unknown item "Nope"/)
-      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', item: { codes: null } }), /Unknown item/)
-      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive' }), /Unknown item "undefined"/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'delete', items: ['All'] }), /Unknown action "delete"/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', items: ['Nope'] }), /Unknown item "Nope"/)
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: { codes: null } }),
+        /Choose at least one item/
+      )
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive' }), /Choose at least one item/)
     })
 
     it('rejects options without an action, whatever else they carry', () => {
       const { sandbox } = setupEnvironment()
       assert.throws(() => sandbox.resolveRunOptions({ opMode: 'proceed', dryRun: false }), /Unknown action "undefined"/)
       assert.throws(() => sandbox.resolveRunOptions({}), /Unknown action "undefined"/)
+    })
+  })
+
+  describe('Several items', () => {
+    const resolve = (sandbox, options) => JSON.parse(JSON.stringify(sandbox.resolveRunOptions(options)))
+
+    it('keeps the item strings the popup sent, verbatim', () => {
+      const { sandbox } = setupEnvironment()
+      assert.deepStrictEqual(resolve(sandbox, { action: 'archive', items: ['Completed'] }).items, ['Completed'])
+      assert.deepStrictEqual(resolve(sandbox, { action: 'proceed', items: ['all', 'suggestions'] }).items, [
+        'all',
+        'suggestions'
+      ])
+    })
+
+    it('refuses a missing, non-array or empty items, never a default All', () => {
+      const { sandbox } = setupEnvironment()
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive' }), /Choose at least one item/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', items: [] }), /Choose at least one item/)
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', items: 'all' }), /Choose at least one item/)
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: { 0: 'all' } }),
+        /Choose at least one item/
+      )
+    })
+
+    it('refuses more entries than the dropdown has, before resolving them', () => {
+      const { sandbox } = setupEnvironment()
+      const many = Array(sandbox.listItems().length + 1).fill('state:12')
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: many }),
+        new RegExp(`Too many items \\(at most ${sandbox.listItems().length}\\)`)
+      )
+      // Repeats are dropped after the length check, so exactly that many is fine.
+      const exact = Array(sandbox.listItems().length).fill('state:12')
+      assert.deepStrictEqual(resolve(sandbox, { action: 'archive', items: exact }).phases[0].item.codes, [12])
+    })
+
+    it('refuses a non-string or unknown entry with its own words', () => {
+      const { sandbox } = setupEnvironment()
+      assert.throws(() => sandbox.resolveRunOptions({ action: 'archive', items: [4] }), /Every item must be a string/)
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: ['state:12', null] }),
+        /Every item must be a string/
+      )
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: [{ codes: null }] }),
+        /Every item must be a string/
+      )
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: ['state:12', 'Bogus'] }),
+        /Unknown item "Bogus"/
+      )
+    })
+
+    it('refuses All beside a task state', () => {
+      const { sandbox } = setupEnvironment()
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'archive', items: ['all', 'state:4'] }),
+        /All already covers every task state; pick All or states/
+      )
+      assert.throws(
+        () => sandbox.resolveRunOptions({ action: 'proceed', items: ['Error (4)', 'All'] }),
+        /All already covers every task state; pick All or states/
+      )
+    })
+
+    it('keeps one distinct task item as itself, with repeats dropped', () => {
+      const { sandbox } = setupEnvironment()
+      const r = resolve(sandbox, { action: 'proceed', items: ['Error (4)', 'Error (4)'] })
+      assert.strictEqual(r.phases.length, 1)
+      assert.deepStrictEqual(r.phases[0], { opMode: 'proceed', item: r.item })
+      assert.strictEqual(r.item.id, 'state:4')
+      assert.deepStrictEqual(r.item.codes, [4])
+    })
+
+    it('merges several task states into one item', () => {
+      const { sandbox } = setupEnvironment()
+      const r = resolve(sandbox, { action: 'proceed', items: ['state:12', 'state:4'] })
+      assert.strictEqual(r.phases.length, 1)
+      assert.deepStrictEqual(r.phases[0].item, {
+        id: 'multi:state:12+state:4',
+        label: 'Waiting on You (12), Error (4)',
+        group: 'Tasks',
+        type: 'tasks',
+        codes: [12, 4]
+      })
+      assert.strictEqual(r.opMode, r.phases[0].opMode, 'opMode mirrors the first phase')
+      assert.deepStrictEqual(r.item, r.phases[0].item, 'item mirrors the first phase')
+    })
+
+    it('runs the tasks phase first, then Suggestions', () => {
+      const { sandbox } = setupEnvironment()
+      const r = resolve(sandbox, { action: 'proceed', items: ['all', 'suggestions'] })
+      assert.deepStrictEqual(
+        r.phases.map((p) => [p.opMode, p.item.id]),
+        [
+          ['proceed', 'all'],
+          ['suggestions', 'suggestions']
+        ]
+      )
+      assert.strictEqual(r.opMode, 'proceed')
+      assert.deepStrictEqual(r.item, r.phases[0].item)
+      const one = resolve(sandbox, { action: 'proceed', items: ['all', 'suggestions'], oneSession: true })
+      assert.deepStrictEqual(
+        one.phases.map((p) => p.opMode),
+        ['proceed', 'agent_batch']
+      )
+      const archived = resolve(sandbox, { action: 'archive', items: ['all', 'suggestions'] })
+      assert.deepStrictEqual(
+        archived.phases.map((p) => [p.opMode, p.item.id]),
+        [
+          ['archive', 'all'],
+          ['remove_suggestions', 'suggestions']
+        ]
+      )
+    })
+
+    it('keeps Suggestions alone on one phase, and oneSession only with it', () => {
+      const { sandbox } = setupEnvironment()
+      assert.deepStrictEqual(
+        resolve(sandbox, { action: 'proceed', items: ['suggestions'] }).phases.map((p) => p.opMode),
+        ['suggestions']
+      )
+      assert.deepStrictEqual(
+        resolve(sandbox, { action: 'proceed', items: ['suggestions'], oneSession: true }).phases.map((p) => p.opMode),
+        ['agent_batch']
+      )
+      assert.deepStrictEqual(
+        resolve(sandbox, { action: 'archive', items: ['suggestions'] }).phases.map((p) => p.opMode),
+        ['remove_suggestions']
+      )
+      assert.deepStrictEqual(
+        resolve(sandbox, { action: 'proceed', items: ['state:4'], oneSession: true }).phases.map((p) => p.opMode),
+        ['proceed']
+      )
+    })
+
+    it('export ignores items, as it always did', () => {
+      const { sandbox } = setupEnvironment()
+      assert.strictEqual(resolve(sandbox, { action: 'export', items: 'anything' }).opMode, 'export_suggestions')
+      assert.strictEqual(resolve(sandbox, { action: 'export', items: ['Bogus'] }).opMode, 'export_suggestions')
+    })
+
+    const setupRun = () => {
+      const env = setupEnvironment()
+      env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/0/' }]
+      return env
+    }
+
+    it('runs the tasks phase, then the Suggestions phase, in one log', async () => {
+      const env = setupRun()
+      const calls = []
+      env.sandbox.processAllTabs = async (_tabs, options) => {
+        calls.push([options.opMode, options.item.id])
+        return [calls.length === 1 ? { label: 'u/1', count: 2 } : { label: 'u/1', count: 5 }]
+      }
+      await env.sandbox.test_startOperation({
+        action: 'proceed',
+        items: ['state:12', 'state:4', 'suggestions'],
+        dryRun: true
+      })
+      assert.deepStrictEqual(calls, [
+        ['proceed', 'multi:state:12+state:4'],
+        ['suggestions', 'suggestions']
+      ])
+      const state = env.sandbox.test_state()
+      assert.strictEqual(state.status, 'done')
+      assert.deepStrictEqual(state.options.items, ['state:12', 'state:4', 'suggestions'], 'the strings stay verbatim')
+      assert.deepStrictEqual(state.results, [
+        { label: 'u/1 · Tasks', count: 2, phase: 'Tasks' },
+        { label: 'u/1 · Suggestions', count: 5, phase: 'Suggestions' }
+      ])
+      const log = state.log
+      assert.strictEqual(log.filter((l) => l === '=== DRY RUN MODE ===').length, 2, 'each phase logs its own header')
+      const tasks = log.indexOf('=== ITEM: Waiting on You (12), Error (4) ===')
+      const grandTasks = log.findIndex((l) => l.includes('GRAND TOTAL: 2 tasks proceeded'))
+      const suggestions = log.indexOf('=== ITEM: Suggestions ===')
+      const grandSuggestions = log.findIndex((l) => l.includes('GRAND TOTAL: 5 suggestions started'))
+      assert.ok(
+        tasks >= 0 && grandTasks > tasks && suggestions > grandTasks && grandSuggestions > suggestions,
+        'each phase is logged and summed up, in order'
+      )
+      assert.strictEqual(log.filter((l) => l === 'SUMMARY').length, 2, 'one SUMMARY per phase')
+    })
+
+    it('builds the phase options once and hands every tab of the phase the same object', async () => {
+      const env = setupEnvironment()
+      env.sandbox.discoverTabs = async () => [
+        { id: 1, url: 'https://jules.google.com/u/0/' },
+        { id: 2, url: 'https://jules.google.com/u/1/' }
+      ]
+      const seen = []
+      env.sandbox.processProceedForTab = async (_tab, options) => {
+        seen.push(options)
+        return 1
+      }
+      env.sandbox.processSuggestionsForTab = async (_tab, options) => {
+        seen.push(options)
+        return 0
+      }
+      await env.sandbox.test_startOperation({ action: 'proceed', items: ['state:12', 'suggestions'], dryRun: true })
+      assert.strictEqual(seen.length, 4, 'two tabs in each of the two phases')
+      assert.strictEqual(seen[0], seen[1], 'the tabs of a phase share one options object')
+      assert.strictEqual(seen[2], seen[3])
+      assert.notStrictEqual(seen[0], seen[2], 'each phase gets its own')
+      assert.strictEqual(seen[0].item.id, 'state:12')
+      assert.strictEqual(seen[2].item.id, 'suggestions')
+    })
+
+    it('stops before the next phase when a Reset landed between phases', async () => {
+      const env = setupRun()
+      const calls = []
+      env.sandbox.processAllTabs = async (_tabs, options) => {
+        calls.push(options.opMode)
+        // A RESET (status idle) lands while the first phase finishes.
+        if (calls.length === 1) env.sandbox.test_updateState({ status: 'idle' })
+        return [{ label: 'u/1', count: 2 }]
+      }
+      await env.sandbox.test_startOperation({ action: 'proceed', items: ['state:12', 'suggestions'], dryRun: true })
+      const state = env.sandbox.test_state()
+      assert.deepStrictEqual(calls, ['proceed'])
+      assert.strictEqual(state.status, 'idle', 'a Reset is never overwritten with done')
+      assert.deepStrictEqual(state.results, [])
+      assert.strictEqual(state.log.filter((l) => l === 'SUMMARY').length, 1, 'only the phase that ran is summed up')
+      assert.ok(!state.log.some((l) => l.includes('suggestions started')))
+    })
+
+    it('logs a single-phase run exactly as before', async () => {
+      const env = setupRun()
+      env.sandbox.processAllTabs = async () => [{ label: 'u/1', count: 2 }]
+      await env.sandbox.test_startOperation({ action: 'proceed', items: ['state:12'], dryRun: true })
+      const state = env.sandbox.test_state()
+      assert.strictEqual(state.status, 'done')
+      assert.deepStrictEqual(state.results, [{ label: 'u/1', count: 2 }])
+      const log = state.log
+      assert.strictEqual(log.filter((l) => l === '=== DRY RUN MODE ===').length, 1)
+      assert.strictEqual(log.filter((l) => l === '=== ITEM: Waiting on You (12) ===').length, 1)
+      assert.strictEqual(log.filter((l) => l === 'SUMMARY').length, 1)
+      assert.ok(log.some((l) => l.includes('GRAND TOTAL: 2 tasks proceeded')))
     })
   })
 
@@ -4114,7 +4357,7 @@ describe('proceed', () => {
         for (const listener of env.messageListeners) listener(old, {}, resolve)
       })
       assert.match(plain(response).error, /different versions\. Reload the extension/)
-      const other = await send(env, { action: 'archive', item: 'All' }, { protocol: RUN_PROTOCOL + 1 })
+      const other = await send(env, { action: 'archive', items: ['All'] }, { protocol: RUN_PROTOCOL + 1 })
       assert.match(plain(other).error, /different versions/)
       assert.strictEqual(started, false)
     })
@@ -4125,8 +4368,19 @@ describe('proceed', () => {
       env.sandbox.startOperation = async () => {
         started = true
       }
-      const response = await send(env, { action: 'proceed', item: 'All', dryRun: true, keepGoing: true })
+      const response = await send(env, { action: 'proceed', items: ['all'], dryRun: true, keepGoing: true })
       assert.match(plain(response).error, /^Unknown option keepGoing\. Reload the extension/)
+      assert.strictEqual(started, false)
+    })
+
+    it('refuses the old single-item START, whose option no longer exists', async () => {
+      const env = setupEnvironment()
+      let started = false
+      env.sandbox.startOperation = async () => {
+        started = true
+      }
+      const response = await send(env, { action: 'proceed', item: 'All', dryRun: true })
+      assert.match(plain(response).error, /^Unknown option item\. Reload the extension/)
       assert.strictEqual(started, false)
     })
 
@@ -4136,8 +4390,8 @@ describe('proceed', () => {
       env.sandbox.startOperation = async (options) => {
         seen.push(options.action)
       }
-      const first = send(env, { action: 'proceed', item: 'All', dryRun: true })
-      const second = send(env, { action: 'archive', item: 'All', dryRun: true })
+      const first = send(env, { action: 'proceed', items: ['all'], dryRun: true })
+      const second = send(env, { action: 'archive', items: ['all'], dryRun: true })
       assert.match(plain(await second).error, /already going/)
       assert.deepStrictEqual(plain(await first), { ok: true })
       assert.deepStrictEqual(seen, ['proceed'])
@@ -4154,13 +4408,13 @@ describe('proceed', () => {
         seen.push(options.action)
         env.sandbox.test_updateState({ status: 'running' })
       }
-      const first = send(env, { action: 'proceed', item: 'All', dryRun: true })
+      const first = send(env, { action: 'proceed', items: ['all'], dryRun: true })
       await new Promise((r) => setTimeout(r, 5))
       ready()
       assert.deepStrictEqual(plain(await first), { ok: true })
       await new Promise((r) => setTimeout(r, 5))
       assert.strictEqual(env.sandbox.test_state().status, 'running', 'the restore did not undo the run')
-      const second = await send(env, { action: 'archive', item: 'All', dryRun: true })
+      const second = await send(env, { action: 'archive', items: ['all'], dryRun: true })
       assert.match(plain(second).error, /already going/)
       assert.deepStrictEqual(seen, ['proceed'])
     })
@@ -4172,7 +4426,7 @@ describe('proceed', () => {
         seen.push(options.scheduled ? 'tick' : options.action)
         env.sandbox.test_updateState({ status: 'running' })
       }
-      const manual = send(env, { action: 'proceed', item: 'All', dryRun: true })
+      const manual = send(env, { action: 'proceed', items: ['all'], dryRun: true })
       await env.sandbox.test_runScheduledTick()
       await manual
       assert.deepStrictEqual(seen, ['proceed'])
@@ -4184,7 +4438,7 @@ describe('proceed', () => {
       env.sandbox.startOperation = async () => {
         started = true
       }
-      const response = await send(env, { action: 'archive', item: 'Bogus' })
+      const response = await send(env, { action: 'archive', items: ['Bogus'] })
       assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), { error: 'Unknown item "Bogus"' })
       assert.strictEqual(started, false)
     })
@@ -4207,7 +4461,7 @@ describe('proceed', () => {
         started++
       }
       env.sandbox.test_updateState({ status: 'running' })
-      const response = await send(env, { action: 'proceed', item: 'All', dryRun: true })
+      const response = await send(env, { action: 'proceed', items: ['all'], dryRun: true })
       assert.match(JSON.parse(JSON.stringify(response)).error, /already going/)
       assert.strictEqual(started, 0)
     })
@@ -4218,7 +4472,7 @@ describe('proceed', () => {
       env.sandbox.startOperation = async (options) => {
         seen.push(options)
       }
-      const response = await send(env, { action: 'proceed', item: 'Waiting on You (12)', dryRun: true })
+      const response = await send(env, { action: 'proceed', items: ['Waiting on You (12)'], dryRun: true })
       assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), { ok: true })
       assert.strictEqual(seen.length, 1)
     })
@@ -4243,7 +4497,7 @@ describe('proceed', () => {
 
     it('labels the run, its item and its summary', () => {
       const { sandbox } = setupEnvironment()
-      const options = sandbox.resolveRunOptions({ action: 'proceed', item: 'Waiting on You (12)', dryRun: false })
+      const options = sandbox.resolveRunOptions({ action: 'proceed', items: ['Waiting on You (12)'], dryRun: false })
       sandbox.test_initOperationState(options)
       sandbox.finalizeOperation([{ label: 'u/1', count: 4 }], options)
       const log = sandbox.test_state().log
@@ -4255,15 +4509,15 @@ describe('proceed', () => {
 
     it('notes that Archive ignores the message', () => {
       const { sandbox } = setupEnvironment()
-      sandbox.test_initOperationState(sandbox.resolveRunOptions({ action: 'archive', item: 'All', message: 'Hi' }))
+      sandbox.test_initOperationState(sandbox.resolveRunOptions({ action: 'archive', items: ['All'], message: 'Hi' }))
       assert.ok(sandbox.test_state().log.includes("Archive doesn't use the message; it is ignored."))
-      sandbox.test_initOperationState(sandbox.resolveRunOptions({ action: 'proceed', item: 'All', message: 'Hi' }))
+      sandbox.test_initOperationState(sandbox.resolveRunOptions({ action: 'proceed', items: ['All'], message: 'Hi' }))
       assert.ok(!sandbox.test_state().log.some((l) => l.includes("doesn't use the message")))
     })
 
     it('ends in an error state for an unknown item', async () => {
       const { sandbox } = setupEnvironment()
-      await sandbox.test_startOperation({ action: 'archive', item: 'Bogus' })
+      await sandbox.test_startOperation({ action: 'archive', items: ['Bogus'] })
       const state = sandbox.test_state()
       assert.strictEqual(state.status, 'error')
       assert.strictEqual(state.error, 'Unknown item "Bogus"')
@@ -4277,14 +4531,14 @@ describe('proceed', () => {
       }
       await sandbox.test_runScheduledTick()
       assert.deepStrictEqual(
-        runs.map((r) => [r.action, r.item, r.force]),
+        runs.map((r) => [r.action, r.items, r.force]),
         [
-          ['archive', 'Completed', false],
-          ['proceed', 'suggestions', false]
+          ['archive', ['Completed'], false],
+          ['proceed', ['suggestions'], false]
         ]
       )
       assert.strictEqual(runs[1].maxSuggestions, 3)
-      assert.deepStrictEqual(Array.from(sandbox.resolveItem(runs[0].item).codes), [3, 7])
+      assert.deepStrictEqual(Array.from(sandbox.resolveItem(runs[0].items[0]).codes), [3, 7])
     })
   })
 
@@ -4585,7 +4839,7 @@ describe('settings in the background', () => {
       started++
     }
     const response = await new Promise((resolve) => {
-      const msg = { action: 'START', protocol: RUN_PROTOCOL, options: { action: 'archive', item: 'All' } }
+      const msg = { action: 'START', protocol: RUN_PROTOCOL, options: { action: 'archive', items: ['all'] } }
       for (const listener of env.messageListeners) listener(msg, {}, resolve)
     })
     assert.match(JSON.parse(JSON.stringify(response)).error, /Could not read the settings \(IO error\)\. Reload/)
@@ -4655,7 +4909,7 @@ describe('settings in the background', () => {
       stoppedAtStart = env.sandbox.test_accountRunState().stoppedAccounts.size
       return []
     }
-    await env.sandbox.test_startOperation({ action: 'archive', item: 'Completed' })
+    await env.sandbox.test_startOperation({ action: 'archive', items: ['Completed'] })
     assert.strictEqual(stoppedAtStart, 0)
   })
 
@@ -4678,7 +4932,7 @@ describe('settings in the background', () => {
       return null
     }
     vm.runInContext("stoppedAccounts.set('0', 'old stop')", env.sandbox)
-    await env.sandbox.test_startOperation({ action: 'proceed', item: 'All', dryRun: true })
+    await env.sandbox.test_startOperation({ action: 'proceed', items: ['all'], dryRun: true })
     assert.strictEqual(seen.defaultReply, 'Mine')
     assert.strictEqual(seen.defaultRetry, 'Again')
     assert.strictEqual(seen.budget, 2)
@@ -4797,7 +5051,7 @@ describe('Jules API rediscovery', () => {
       env.sandbox.test_updateState({ status: 'error', error: 'No Jules tabs found' })
       return null
     }
-    await env.sandbox.test_startOperation({ action: 'proceed', item: 'All', dryRun: true })
+    await env.sandbox.test_startOperation({ action: 'proceed', items: ['all'], dryRun: true })
     assert.deepStrictEqual(seen, ['p1Takd'], 'the run kept the values it started with')
     assert.strictEqual(env.sandbox.rpc('ListTasks'), 'Abc12', 'applied once the run ended')
   })
@@ -6154,7 +6408,7 @@ describe('More Actions startup locking', () => {
     const starting = moreMessage(env, {
       action: 'START',
       protocol: RUN_PROTOCOL,
-      options: { action: 'archive', item: 'all', dryRun: true }
+      options: { action: 'archive', items: ['all'], dryRun: true }
     })
     assert.match(
       (await moreMessage(env, { action: 'LOAD_ITEMS', protocol: RUN_PROTOCOL, repo: '' })).error,
@@ -6402,7 +6656,7 @@ describe('More Actions cache', () => {
     env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/1/' }]
     env.sandbox.processAllTabs = async () => []
     const start = (dryRun) =>
-      env.sandbox.startOperation({ action: 'archive', item: 'Completed', dryRun, force: false, scope: 'all' })
+      env.sandbox.startOperation({ action: 'archive', items: ['Completed'], dryRun, force: false, scope: 'all' })
     await start(true)
     env.calls.length = 0
     await env.loadAll()

@@ -7,6 +7,8 @@ const {
   setTaskStates,
   getTaskStates,
   listItems,
+  toggleItemSelection,
+  combineItems,
   resolveItem,
   taskStateCode,
   taskStateFor,
@@ -45,6 +47,124 @@ describe('listItems', () => {
   it('gives every item a unique id', () => {
     const ids = listItems().map((i) => i.id)
     assert.strictEqual(new Set(ids).size, ids.length)
+  })
+})
+
+describe('toggleItemSelection', () => {
+  it('adds a task state, in listItems order', () => {
+    assert.deepStrictEqual(toggleItemSelection(['state:12'], 'state:4'), ['state:12', 'state:4'])
+    assert.deepStrictEqual(toggleItemSelection(['state:4'], 'state:12'), ['state:12', 'state:4'])
+  })
+
+  it('removes an already selected id and allows an empty selection', () => {
+    assert.deepStrictEqual(toggleItemSelection(['state:12', 'state:4'], 'state:12'), ['state:4'])
+    assert.deepStrictEqual(toggleItemSelection(['state:12'], 'state:12'), [])
+  })
+
+  it('never mutates its input', () => {
+    const selected = ['state:12']
+    const next = toggleItemSelection(selected, 'state:4')
+    assert.deepStrictEqual(selected, ['state:12'])
+    assert.notStrictEqual(next, selected)
+  })
+
+  it('picking All drops every task state and keeps Suggestions', () => {
+    assert.deepStrictEqual(toggleItemSelection(['state:12', 'state:4', 'suggestions'], 'all'), ['all', 'suggestions'])
+    assert.deepStrictEqual(toggleItemSelection([], 'all'), ['all'])
+    assert.deepStrictEqual(toggleItemSelection(['all', 'suggestions'], 'all'), ['suggestions'])
+  })
+
+  it('picking a task state drops All', () => {
+    assert.deepStrictEqual(toggleItemSelection(['all'], 'state:4'), ['state:4'])
+    assert.deepStrictEqual(toggleItemSelection(['all', 'suggestions'], 'state:4'), ['state:4', 'suggestions'])
+  })
+
+  it('picking Suggestions keeps the task ids', () => {
+    assert.deepStrictEqual(toggleItemSelection(['state:12', 'state:4'], 'suggestions'), [
+      'state:12',
+      'state:4',
+      'suggestions'
+    ])
+    assert.deepStrictEqual(toggleItemSelection(['all'], 'suggestions'), ['all', 'suggestions'])
+    assert.deepStrictEqual(toggleItemSelection(['suggestions'], 'suggestions'), [])
+  })
+
+  it('ignores an id that is not an item, returning a copy', () => {
+    const selected = ['state:12']
+    const next = toggleItemSelection(selected, 'nope')
+    assert.deepStrictEqual(next, ['state:12'])
+    assert.notStrictEqual(next, selected)
+    assert.deepStrictEqual(toggleItemSelection([], 'state:99'), [])
+  })
+})
+
+describe('combineItems', () => {
+  const all = resolveItem('All')
+  const suggestions = resolveItem('Suggestions')
+  const waiting = resolveItem('Waiting on You (12)')
+  const error = resolveItem('Error (4)')
+
+  it('returns neither slot for an empty list', () => {
+    assert.deepStrictEqual(combineItems([]), { tasks: null, suggestions: null })
+  })
+
+  it('keeps Suggestions on its own', () => {
+    const combined = combineItems([suggestions])
+    assert.strictEqual(combined.tasks, null)
+    assert.strictEqual(combined.suggestions, suggestions)
+  })
+
+  it('returns a lone task item as it is, repeats included', () => {
+    assert.strictEqual(combineItems([error]).tasks, error)
+    assert.strictEqual(combineItems([error, error]).tasks, error)
+  })
+
+  it('returns All for All on its own, repeats included', () => {
+    assert.strictEqual(combineItems([all]).tasks, all)
+    assert.strictEqual(combineItems([all, all]).tasks, all)
+  })
+
+  it('refuses All together with any task item', () => {
+    for (const item of [waiting, error, resolveItem('Completed')]) {
+      const message = 'All already covers every task state; pick All or states'
+      assert.throws(() => combineItems([all, item]), { message })
+      assert.throws(() => combineItems([item, all]), { message })
+      assert.throws(() => combineItems([all, item, suggestions]), { message })
+    }
+  })
+
+  it('keeps All with Suggestions, which is no task item', () => {
+    assert.deepStrictEqual(combineItems([all, suggestions]), { tasks: all, suggestions })
+  })
+
+  it('merges several task items in first-seen order, de-duplicated', () => {
+    const merged = combineItems([error, waiting, error])
+    assert.deepStrictEqual(merged.tasks, {
+      id: 'multi:state:4+state:12',
+      label: 'Error (4), Waiting on You (12)',
+      group: 'Tasks',
+      type: 'tasks',
+      codes: [4, 12]
+    })
+    assert.notStrictEqual(merged.tasks.id, ITEM_ALL, 'a merged item is never treated as All')
+    assert.strictEqual(merged.suggestions, null)
+  })
+
+  it('unions the codes of a shared name like Completed (3, 7) in first-seen order', () => {
+    const merged = combineItems([resolveItem('Completed'), error])
+    assert.deepStrictEqual(merged.tasks, {
+      id: 'multi:name:completed+state:4',
+      label: 'Completed, Error (4)',
+      group: 'Tasks',
+      type: 'tasks',
+      codes: [3, 7, 4]
+    })
+  })
+
+  it('keeps Suggestions beside the merged tasks', () => {
+    const combined = combineItems([waiting, error, suggestions])
+    assert.strictEqual(combined.suggestions, suggestions)
+    assert.strictEqual(combined.tasks.id, 'multi:state:12+state:4')
   })
 })
 
