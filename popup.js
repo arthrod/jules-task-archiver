@@ -132,9 +132,9 @@ let selectedItemIds = [ITEM_ALL]
 // meanwhile, because narrowing or widening a saved selection silently would
 // change the next run.
 let missingItemIds = null
-// True once the items of a running or finished run are shown; the saved
-// selection, read in parallel, then doesn't replace them.
-let runItemsShown = false
+// True once the user picks items, or the items of a running or finished run
+// are shown; the saved selection, read in parallel, then doesn't replace them.
+let keepShownItems = false
 let activeOptionIndex = -1
 let optionEls = []
 
@@ -229,6 +229,7 @@ function renderItemsMenu() {
 function toggleSelectedItem(id) {
   if (!ITEMS.some((i) => i.id === id)) return
   missingItemIds = null
+  keepShownItems = true
   selectedItemIds = toggleItemSelection(selectedItemIds, id, ITEMS)
   showSelection()
   chrome.storage.sync.set({ items: selectedItemIds })
@@ -711,7 +712,7 @@ chrome.storage.sync.get(
   ],
   (syncData) => {
     loadSettings(syncData)
-    if (!isRunning() && !runItemsShown) {
+    if (!isRunning() && !keepShownItems) {
       if (Array.isArray(syncData.items)) {
         restoreItems(syncData.items)
       } else if (typeof syncData.item === 'string') {
@@ -1045,8 +1046,9 @@ async function startRun(action) {
     activeTabId,
     repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim()
   }
-  // Export needs no items; everything else sends the chosen ids verbatim.
-  if (action !== 'export') options.items = [...selectedItemIds]
+  // Export needs no items; everything else sends the ids it confirmed, not a
+  // choice changed while the current tab was looked up.
+  if (action !== 'export') options.items = items.map((i) => i.id)
 
   // The worker can be replaced while the popup is open; ask right before.
   // The popup may have gone stale (an earlier check failing) while this one was out.
@@ -1624,7 +1626,7 @@ function rehydrateRunItems(options) {
   if (known.length === 0) return
   if (known.includes(ITEM_ALL) && known.some((id) => id !== ITEM_ALL && id !== ITEM_SUGGESTIONS)) return
   selectedItemIds = known
-  runItemsShown = true
+  keepShownItems = true
   showSelection()
 }
 

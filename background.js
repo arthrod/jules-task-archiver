@@ -2821,6 +2821,11 @@ function handleOperationError(e) {
   updateState({ status: 'error', error: msg })
 }
 
+// Raised by every run and every Reset. A Reset doesn't stop the phase in
+// flight, and a new run may start meanwhile, so the old run checks this
+// before each phase and before it ends, and never writes over the new one.
+let operationRun = 0
+
 async function startOperation(rawOptions) {
   let options
   try {
@@ -2830,6 +2835,8 @@ async function startOperation(rawOptions) {
     return
   }
   const isSuggestions = initOperationState(options)
+  const run = ++operationRun
+  const current = () => run === operationRun && state.status === 'running'
 
   try {
     // A run that may change Jules leaves no cached load behind; Export reads only.
@@ -2852,7 +2859,7 @@ async function startOperation(rawOptions) {
     const multiPhase = phases.length > 1
     let results = state.results
     for (const phase of phases) {
-      if (state.status !== 'running') break // a Reset between phases
+      if (!current()) break // a Reset, or a newer run, between phases
       const phaseOptions = { ...options, opMode: phase.opMode, item: phase.item }
       if (multiPhase) {
         addLog(
@@ -2861,6 +2868,7 @@ async function startOperation(rawOptions) {
         addLog(`=== ITEM: ${phaseOptions.item.label} ===`)
       }
       const phaseResults = await processAllTabs(tabs, phaseOptions, isSuggestions)
+      if (run !== operationRun) break // replaced meanwhile: its summary would land in another log
       if (multiPhase) {
         // The popup's summary keeps the phases apart, so each row says whose
         // phase it came from.
@@ -2874,11 +2882,12 @@ async function startOperation(rawOptions) {
       results = results.concat(phaseResults)
     }
     // A Reset during the run (status idle) is never overwritten with done.
-    if (state.status === 'running') updateState({ status: 'done', results })
+    if (current()) updateState({ status: 'done', results })
   } catch (e) {
-    handleOperationError(e)
+    if (run === operationRun) handleOperationError(e)
   } finally {
-    stopKeepAlive()
+    // A newer run keeps its own keep-alive.
+    if (run === operationRun) stopKeepAlive()
     applyPendingJulesApi()
   }
 }
@@ -3920,6 +3929,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       prCache.clear()
       stopKeepAlive()
+      operationRun++ // the run in flight, if any, stops at its next phase
       state = { ...DEFAULT_STATE }
       chrome.storage.session.set({ archiveState: state })
       sendResponse({ ok: true })
