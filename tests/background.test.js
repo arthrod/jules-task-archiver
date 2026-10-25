@@ -2679,6 +2679,20 @@ describe('suggestion per-tick cap', () => {
     assert.strictEqual(options._remainingStarts, 7)
   })
 
+  it('sets the budget when Suggestions is a later phase of the run', () => {
+    const { sandbox } = setupEnvironment()
+    const options = {
+      opMode: 'proceed',
+      maxSuggestions: 3,
+      phases: [
+        { opMode: 'proceed', item: { id: 'state:12', label: 'Waiting on You (12)', type: 'tasks', codes: [12] } },
+        { opMode: 'suggestions', item: { id: 'suggestions', label: 'Suggestions', type: 'suggestions', codes: null } }
+      ]
+    }
+    sandbox.test_initOperationState(options)
+    assert.strictEqual(options._remainingStarts, 3)
+  })
+
   it('leaves budget unset for manual runs without maxSuggestions', () => {
     const { sandbox } = setupEnvironment()
     const options = { opMode: 'suggestions' }

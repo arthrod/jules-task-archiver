@@ -607,6 +607,26 @@ describe('Items dropdown', () => {
     )
   })
 
+  it('keeps Space working when a shorter state table arrives under an open menu', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    const btn = env.elements['#itemsBtn']
+    const menu = env.elements['#itemsMenu']
+    btn.dispatchEvent('keydown', { key: 'ArrowDown' })
+    menu.dispatchEvent('keydown', { key: 'End' })
+    // A rediscovery brings a table of one state: All, that state, Suggestions.
+    env.sandbox.applyTaskStates([{ code: 12, name: 'Waiting on You', kind: 'feedback' }])
+    const ids = menu.children.flatMap((g) => g.children.map((c) => c.id)).filter(Boolean)
+    assert.ok(ids.includes(menu.attributes['aria-activedescendant']), 'the active option is one the menu still has')
+    assert.doesNotThrow(() => menu.dispatchEvent('keydown', { key: ' ' }))
+    assert.strictEqual(env.option('Suggestions').attributes['aria-selected'], 'true')
+  })
+
+  it('draws the check box border on a selected row', () => {
+    // A selected row is ink; an ink border on it would leave only the inner square.
+    assert.match(popupCss, /\.menu \.opt\.cur \.chk \{[^}]*border-color: var\(--bg\);/)
+  })
+
   it('closes when clicking elsewhere', () => {
     const env = setupPopupSandbox()
     env.load()
@@ -626,20 +646,39 @@ describe('Items dropdown', () => {
 
   it('migrates the old saved item to the new key, once', () => {
     const env = setupPopupSandbox({ sync: { item: 'state:12' } })
-    env.load()
-    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:12'])
-    assert.strictEqual(env.syncStorage.item, undefined, 'the old key is removed')
-    // A later change writes the new key only; the migration does not run again.
     const writes = []
-    const set = env.sandbox.chrome.storage.sync.set
+    const removes = []
+    const { set, remove } = env.sandbox.chrome.storage.sync
     env.sandbox.chrome.storage.sync.set = (obj, cb) => {
-      writes.push(obj)
+      if ('items' in obj) writes.push(JSON.parse(JSON.stringify(obj.items)))
       set(obj, cb)
     }
+    env.sandbox.chrome.storage.sync.remove = (keys, cb) => {
+      removes.push(...[].concat(keys))
+      remove(keys, cb)
+    }
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
+    assert.deepStrictEqual(writes, [['state:12']])
+    assert.deepStrictEqual(removes, ['item'])
+    assert.strictEqual(env.syncStorage.item, undefined, 'the old key is removed')
+    // A later change writes the new key only; the migration does not run again.
     env.option('Error (4)').dispatchEvent('click')
-    assert.ok(writes.every((w) => !('item' in w)))
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:12', 'state:4'])
+    assert.deepStrictEqual(writes, [['state:12'], ['state:12', 'state:4']])
+    assert.deepStrictEqual(removes, ['item'], 'the old key is removed once')
+  })
+
+  it('keeps the old saved item when the new key cannot be written', () => {
+    const env = setupPopupSandbox({ sync: { item: 'state:12' } })
+    const runtime = env.sandbox.chrome.runtime
+    env.sandbox.chrome.storage.sync.set = (_obj, cb) => {
+      runtime.lastError = { message: 'QUOTA_BYTES_PER_ITEM quota exceeded' }
+      cb?.()
+      runtime.lastError = undefined
+    }
+    env.load()
+    // Removing it anyway would leave nothing saved, and the next open would pick All.
+    assert.strictEqual(env.syncStorage.item, 'state:12')
   })
 
   it('writes only the chosen items to sync storage', () => {
@@ -1299,6 +1338,30 @@ describe('Popup open', () => {
     assert.notDeepStrictEqual(env.syncStorage.items, ['state:4', 'suggestions'], 'a rehydrated choice is not saved')
     assert.strictEqual(env.elements['#archiveBtn'].textContent, '⏳ Archiving…')
     assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+  })
+
+  it("keeps a finished run's items when the saved choice is read after GET_STATE", () => {
+    const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+    // In Chrome the two answers come in either order; here the sync read is last.
+    const pending = []
+    const get = env.sandbox.chrome.storage.sync.get
+    env.sandbox.chrome.storage.sync.get = (keys, cb) => pending.push(() => get(keys, cb))
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (!cb) return
+      if (msg.action === 'GET_STATE') {
+        cb({
+          status: 'done',
+          log: ['x'],
+          progress: { archived: 0, skipped: 0, total: 0 },
+          results: [],
+          options: { action: 'archive', dryRun: true, items: ['state:4', 'suggestions'] }
+        })
+      } else cb({ repos: [] })
+    }
+    env.load()
+    for (const answer of pending) answer()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4), Suggestions')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:12'], 'the saved choice is kept')
   })
 
   it('keeps the saved choice when the run carries no known item', () => {
