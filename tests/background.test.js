@@ -5211,6 +5211,15 @@ describe('Jules API rediscovery', () => {
 
 const archivedFilter = (filter) => String(filter).includes('is_archived=true')
 
+// A few macrotask turns: enough for the worker's own follow-ups (an archived
+// listing it started behind a reply, say) to land without waiting on time.
+const tick = async (times = 5) => {
+  for (let i = 0; i < times; i++) {
+    for (let j = 0; j < 20; j++) await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+}
+
 // More Actions uses the same VM Chrome fake as START; no request leaves the sandbox.
 function moreMessage(env, msg, sender = {}) {
   return new Promise((resolve) => {
@@ -5271,12 +5280,35 @@ function setupMoreEnvironment(sync = {}, storage = {}) {
   const freshness = (fresh) => (fresh === undefined ? {} : { fresh })
   env.load = (repo = '', category = 'all', fresh) =>
     moreMessage(env, { action: 'LOAD_ITEMS', protocol: RUN_PROTOCOL, repo, category, ...freshness(fresh) })
+  // The handler stays for an older popup's retry; a load that already listed
+  // its archived tasks keeps answering today's error.
   env.loadArchived = (loadId, fresh) =>
     moreMessage(env, { action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId, ...freshness(fresh) })
-  // Both parts, as the popup sends them: the archived tasks come second.
-  env.loadAll = async (repo = '') => {
-    const load = await env.load(repo)
-    return { load, archived: await env.loadArchived(load.loadId) }
+  // The worker lists the archived tasks of an Archived load by itself, once
+  // LOAD_ITEMS has answered (Spec B); `moreView` (session) is what a reopened
+  // popup shows of the load.
+  env.view = () => env.sessionSetData.findLast((data) => data.moreView)?.moreView
+  env.viewSettled = async (loadId = null) => {
+    for (let i = 0; i < 250; i++) {
+      const view = env.view()
+      if (view && view.loading === null && (loadId === null || view.loadId === loadId)) return view
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error('the view never settled')
+  }
+  env.archivedEnd = async (loadId) => {
+    for (let i = 0; i < 250; i++) {
+      const view = env.view()
+      if (view?.loadId === loadId && view.archived !== 'loading') return view
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error(`the archived listing of ${loadId} never ended`)
+  }
+  // A Load of the Archived category: the reply first, then the archived tasks
+  // the worker lists on its own; `view` is the record once they are in.
+  env.loadArchive = async (repo = '', fresh) => {
+    const load = await env.load(repo, 'archive', fresh)
+    return { load, view: await env.archivedEnd(load.loadId) }
   }
   env.apply = async (operation, items, dryRun = false, force = false) => {
     const response = await moreMessage(env, {
@@ -5335,7 +5367,7 @@ describe('More Actions background', () => {
 
   it('LOAD_ITEMS merges unique accounts, filters exact repos and parses schedules', async () => {
     const env = setupMoreEnvironment()
-    const { load: reply, archived } = await env.loadAll('org/repo')
+    const reply = await env.load('org/repo', 'all')
     assert.ok(reply.accounts, reply.error)
     assert.deepStrictEqual(
       Array.from(reply.accounts, (a) => a.account),
@@ -5343,7 +5375,6 @@ describe('More Actions background', () => {
     )
     const account = reply.accounts[0]
     assert.strictEqual(account.tasks.length, 3)
-    assert.strictEqual(archived.accounts[0].archived.length, 1)
     assert.strictEqual(account.schedules[0].title, 'First line')
     assert.strictEqual(account.schedules[1].title.length, 120)
     assert.strictEqual(account.schedules[0].cron, '0 9 * * *')
@@ -5352,51 +5383,62 @@ describe('More Actions background', () => {
     assert.ok(env.sessionSetData.some((data) => data.moreItems))
     // Jules matches a repo's source id by exact case, as ListSources spells it.
     assert.deepStrictEqual([...new Set(env.calls.filter((c) => c.rpc === 'p1Takd').map((c) => c.payload[0]))].sort(), [
-      'source_id=github/Org/Repo AND is_archived=false',
-      'source_id=github/Org/Repo AND is_archived=true'
+      'source_id=github/Org/Repo AND is_archived=false'
     ])
   })
 
-  it('LOAD_ITEMS keeps archived listing failures as per-account notes', async () => {
+  it('an Archived load keeps listing failures as notes in the view', async () => {
     const env = setupMoreEnvironment()
     const call = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && archivedFilter(payload[0]) && config.accountNum === '1') throw new Error('RPC error [4]')
       return call(rpc, payload, config)
     }
-    const { load, archived: reply } = await env.loadAll()
-    assert.strictEqual(load.accounts[0].tasks.length, 4)
-    assert.ok(reply.accounts, reply.error)
-    assert.strictEqual(reply.accounts[0].archived.length, 0)
-    assert.match(
-      reply.accounts[0].notes.join(' '),
-      /Jules could not list the archived tasks of 2 of 2 repos of u\/1: Org\/Repo \(RPC error \[4\]\)/
+    const { load, view } = await env.loadArchive()
+    assert.ok(load.accounts, load.error)
+    assert.deepStrictEqual(view.notes, [
+      'Jules could not list the archived tasks of 2 of 2 repos of u/1: Org/Repo (RPC error [4]), org/repo-docs (RPC error [4]).'
+    ])
+    assert.deepStrictEqual(
+      view.items.filter((item) => item.account === 'u/2').map((item) => item.id),
+      ['archived']
     )
-    assert.strictEqual(reply.accounts[1].archived.length, 1)
   })
 
-  it('LOAD_ITEMS answers without the archived tasks; LOAD_ARCHIVED adds them to that load', async () => {
+  it('an Archived load answers without the archived tasks, then adds them by itself', async () => {
     const env = setupMoreEnvironment()
-    const load = await env.load()
+    const original = env.sandbox.callBatchExecute
+    // One held listing per account.
+    const held = []
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && archivedFilter(payload[0])) {
+        return new Promise((resolve) => held.push(() => resolve(original(rpc, payload, config))))
+      }
+      return original(rpc, payload, config)
+    }
+    const load = await env.load('', 'archive')
     assert.strictEqual(typeof load.loadId, 'string')
-    assert.ok(load.accounts.every((account) => !('archived' in account)))
-    assert.ok(env.calls.every((call) => call.rpc !== 'p1Takd' || call.payload[0] === ''))
-    env.calls.length = 0
-    await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
-    assert.strictEqual(env.calls.length, 0, 'not in the load yet')
-    const archived = await env.loadArchived(load.loadId)
-    assert.strictEqual(archived.loadId, load.loadId)
+    assert.ok(load.accounts.every((account) => Object.keys(account).sort().join() === 'account,notes'))
+    for (let i = 0; i < 100; i++) await Promise.resolve()
     assert.ok(
       env.calls.some(
         (call) => call.rpc === 'p1Takd' && call.payload[0] === 'source_id=github/Org/Repo AND is_archived=true'
-      )
+      ),
+      'the listing starts without LOAD_ARCHIVED'
     )
+    env.calls.length = 0
+    await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
+    assert.strictEqual(env.calls.length, 0, 'not in the load yet')
+    for (const resume of held) resume()
+    const view = await env.archivedEnd(load.loadId)
+    assert.strictEqual(view.archived, 'done')
+    assert.ok(view.items.some((item) => item.account === 'u/1' && item.id === 'archived'))
     env.calls.length = 0
     await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
     assert.deepStrictEqual(env.calls[0], { rpc: 'Tjmm5c', payload: [['archived']], account: '1' })
   })
 
-  it("LOAD_ARCHIVED lists the archived tasks of the load's repo", async () => {
+  it("an Archived load lists only the load's repo's archived tasks", async () => {
     const env = setupMoreEnvironment()
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = async (rpc, payload, config) => {
@@ -5410,16 +5452,15 @@ describe('More Actions background', () => {
       }
       return original(rpc, payload, config)
     }
-    const { archived } = await env.loadAll('org/repo')
+    const { view } = await env.loadArchive('org/repo')
     assert.deepStrictEqual(
-      Array.from(archived.accounts[0].archived, (task) => task.id),
+      view.items.filter((item) => item.account === 'u/1').map((task) => task.id),
       ['mine']
     )
   })
 
-  it('LOAD_ARCHIVED of a replaced load adds nothing', async () => {
+  it('the archived tasks of a replaced load add nothing', async () => {
     const env = setupMoreEnvironment()
-    const first = await env.load()
     const original = env.sandbox.callBatchExecute
     // One held listing per account.
     const held = []
@@ -5432,14 +5473,21 @@ describe('More Actions background', () => {
       }
       return original(rpc, payload, config)
     }
-    const late = env.loadArchived(first.loadId)
+    const first = await env.load('', 'archive')
     for (let i = 0; i < 100; i++) await Promise.resolve()
     env.sandbox.callBatchExecute = original
-    const second = await env.load()
+    const second = await env.load('', 'scheduled')
     assert.notStrictEqual(second.loadId, first.loadId)
-    release()
-    assert.match((await late).error, /newer load/i)
     assert.match((await env.loadArchived(first.loadId)).error, /newer load/i)
+    release()
+    await tick()
+    const view = env.view()
+    assert.ok(view, 'the view keeps the newer load')
+    assert.strictEqual(view.loadId, second.loadId)
+    assert.ok(
+      view.items.every((item) => item.kind === 'schedule'),
+      'no archived task of the replaced load is kept'
+    )
     env.calls.length = 0
     await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
     assert.strictEqual(env.calls.length, 0)
@@ -5447,7 +5495,6 @@ describe('More Actions background', () => {
 
   it("a newer load stays the saved one when an older load's archived tasks arrive late", async () => {
     const env = setupMoreEnvironment()
-    const first = await env.load('org/repo')
     const original = env.sandbox.callBatchExecute
     const held = []
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
@@ -5456,31 +5503,35 @@ describe('More Actions background', () => {
       }
       return original(rpc, payload, config)
     }
-    const late = env.loadArchived(first.loadId)
+    await env.load('org/repo', 'archive')
     for (let i = 0; i < 100; i++) await Promise.resolve()
     // The newer load's save is still on its way when the older answer lands.
     const set = env.sandbox.chrome.storage.session.set
     let finishSave
     env.sandbox.chrome.storage.session.set = (data) => {
+      if (!data.moreItems) return set(data)
       env.sandbox.chrome.storage.session.set = set
       const saving = set(data)
       return new Promise((resolve) => (finishSave = () => resolve(saving)))
     }
-    const second = env.load('org/repo-docs')
+    const second = env.load('org/repo-docs', 'all')
     for (let i = 0; i < 100; i++) await Promise.resolve()
     for (const resume of held) resume()
-    assert.match((await late).error, /newer load/i)
+    await tick()
     finishSave()
     const newer = await second
     const saved = env.sessionSetData.findLast((data) => data.moreItems).moreItems
     assert.strictEqual(saved.id, newer.loadId)
     assert.strictEqual(saved.repo, 'org/repo-docs')
+    const view = env.view()
+    assert.ok(view, 'the view keeps the newer load too')
+    assert.strictEqual(view.loadId, newer.loadId)
   })
 
-  it("LOAD_ARCHIVED lists a load's archived tasks once", async () => {
+  it("lists a load's archived tasks once", async () => {
     const env = setupMoreEnvironment()
-    const { loadId } = await env.load()
-    assert.ok((await env.loadArchived(loadId)).accounts)
+    const { load } = await env.loadArchive()
+    const { loadId } = load
     assert.match((await env.loadArchived(loadId)).error, /already/i)
     const restarted = setupMoreEnvironment(
       {},
@@ -5489,14 +5540,23 @@ describe('More Actions background', () => {
     assert.match((await restarted.loadArchived(loadId)).error, /already/i, 'also after a worker restart')
   })
 
-  it('LOAD_ARCHIVED may run again for a load whose archived listing failed', async () => {
+  it("may list a load's archived tasks again when the listing failed", async () => {
     const env = setupMoreEnvironment()
-    const { loadId } = await env.load()
     const tabs = env.sandbox.getJulesTabs
-    env.sandbox.getJulesTabs = async () => []
-    assert.match((await env.loadArchived(loadId)).error, /No Jules tabs/)
+    let calls = 0
+    env.sandbox.getJulesTabs = async () => (++calls === 1 ? tabs() : [])
+    const load = await env.load('', 'archive')
+    const view = await env.archivedEnd(load.loadId)
+    assert.strictEqual(view.archived, 'failed')
+    assert.match(view.error, /No Jules tabs/)
     env.sandbox.getJulesTabs = tabs
-    assert.ok((await env.loadArchived(loadId)).accounts)
+    assert.ok((await env.loadArchived(load.loadId)).accounts)
+    for (let i = 0; i < 250; i++) {
+      if (env.view()?.archived === 'done') break
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    assert.strictEqual(env.view().archived, 'done')
+    assert.ok(env.view().items.some((item) => item.kind === 'archived'))
   })
 
   it('LOAD_ARCHIVED refuses content scripts, bad versions, unknown keys and a missing load id', async () => {
@@ -5519,9 +5579,8 @@ describe('More Actions background', () => {
     assert.strictEqual(env.calls.length, 0)
   })
 
-  it('lets an action run while the archived tasks are still listing, and keeps it alive', async () => {
+  it('lets a run go while the archived tasks list, and keeps the listing alive', async () => {
     const env = setupMoreEnvironment()
-    const { loadId } = await env.load()
     const original = env.sandbox.callBatchExecute
     // One held listing per account.
     const held = []
@@ -5534,17 +5593,22 @@ describe('More Actions background', () => {
       }
       return original(rpc, payload, config)
     }
-    const archived = env.loadArchived(loadId)
+    await env.load('', 'archive')
     for (let i = 0; i < 100; i++) await Promise.resolve()
-    let stopped = 0
-    env.sandbox.stopKeepAlive = () => stopped++
+    const alive = () =>
+      env.sandbox.test_activeTimers
+        .filter((timer) => !env.sandbox.test_clearedTimers.includes(timer.id))
+        .map((timer) => timer.id)
+    assert.deepStrictEqual(alive().length, 1, "only the archived listing's own keep-alive is left")
+    const [listing] = alive()
+    // A run may start meanwhile; an Archived load has nothing to act on yet.
     const reply = await env.apply('pauseTask', [{ account: 'u/1', kind: 'task', id: 'running' }])
     assert.ok(reply.ok, reply.error)
     assert.strictEqual(env.sandbox.test_state().status, 'done')
-    const stoppedByRun = stopped
+    assert.ok(alive().includes(listing), "the run's keep-alive is not the listing's")
     release()
-    assert.ok((await archived).accounts)
-    assert.strictEqual(stopped, stoppedByRun, 'the archived listing leaves the run keep-alive alone')
+    await tick()
+    assert.ok(!alive().includes(listing), 'the listing ends its own keep-alive')
   })
 
   for (const [action, kind, id, rpc, payload] of [
@@ -5559,7 +5623,10 @@ describe('More Actions background', () => {
   ]) {
     it(`APPLY_ACTION ${action} sends the exact RPC payload to the selected account`, async () => {
       const env = setupMoreEnvironment()
-      await env.loadAll()
+      // The Archived category holds only archived tasks; the rest need the
+      // tasks and schedules of an All load.
+      if (kind === 'archived') await env.loadArchive()
+      else await env.load()
       env.calls.length = 0
       const reply = await env.apply(action, [{ account: 'u/2', kind, id }])
       assert.ok(reply.ok, reply.error)
@@ -5615,7 +5682,7 @@ describe('More Actions background', () => {
 
   it('APPLY_ACTION unarchive checks once and resends only missing ids once', async () => {
     const env = setupMoreEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     env.calls.length = 0
     await env.apply('unarchive', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
     assert.deepStrictEqual(
@@ -5631,7 +5698,7 @@ describe('More Actions background', () => {
 
   it('APPLY_ACTION counts an unarchive only once Jules lists the task again', async () => {
     const env = setupMoreEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     env.calls.length = 0
     const item = { account: 'u/1', kind: 'archived', id: 'archived' }
     await env.apply('unarchive', [item])
@@ -5650,7 +5717,7 @@ describe('More Actions background', () => {
 
   it('APPLY_ACTION trusts the unarchive replies when the check itself fails', async () => {
     const env = setupMoreEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && payload[0] === '') throw new Error('RPC p1Takd error code [4]')
@@ -5665,7 +5732,7 @@ describe('More Actions background', () => {
   // Jules already skipped the retried ids once, so their replies are not proof.
   it('APPLY_ACTION does not count a retried unarchive when the second check fails', async () => {
     const env = setupMoreEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     const original = env.sandbox.callBatchExecute
     let checks = 0
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
@@ -5690,7 +5757,7 @@ describe('More Actions background', () => {
 
   it('APPLY_ACTION restores the last load after a worker restart', async () => {
     const first = setupMoreEnvironment()
-    await first.loadAll()
+    await first.load()
     const saved = first.sessionSetData.findLast((data) => data.moreItems)
     const env = setupMoreEnvironment({}, saved)
     await env.apply('pauseTask', [{ account: 'u/1', kind: 'task', id: 'running' }])
@@ -5715,6 +5782,188 @@ describe('More Actions background', () => {
       assert.match(reply.error, error)
     }
     assert.strictEqual(env.calls.length, 0)
+  })
+})
+
+describe('More Actions view', () => {
+  const plain = (value) => JSON.parse(JSON.stringify(value))
+  const itemIds = (view) => plain(view.items).map((item) => `${item.account}:${item.kind}:${item.id}`)
+
+  it('writes the whole view when a Load answers', async () => {
+    const env = setupMoreEnvironment()
+    const load = await env.load('', 'all')
+    const view = await env.viewSettled(load.loadId)
+    assert.ok(view, 'the worker keeps a view of the load')
+    assert.strictEqual(view.version, 1)
+    assert.strictEqual(view.loadId, load.loadId)
+    assert.strictEqual(view.category, 'all')
+    assert.strictEqual(view.repo, '')
+    assert.deepStrictEqual(itemIds(view), [
+      'u/1:task:running',
+      'u/1:task:paused',
+      'u/1:task:completed',
+      'u/1:task:other',
+      'u/1:schedule:active',
+      'u/1:schedule:inactive',
+      'u/2:task:running',
+      'u/2:task:paused',
+      'u/2:task:completed',
+      'u/2:task:other',
+      'u/2:schedule:active',
+      'u/2:schedule:inactive'
+    ])
+    assert.ok(view.items.every((item) => !('user' in item)))
+    assert.deepStrictEqual(view.notes, [])
+    assert.strictEqual(view.cachedAt, null)
+    assert.strictEqual(view.archived, 'none')
+    assert.strictEqual(view.loading, null)
+    assert.strictEqual(view.error, null)
+    assert.strictEqual(view.outdated, false)
+    assert.strictEqual(typeof view.rev, 'number')
+    assert.strictEqual(typeof view.updatedAt, 'number')
+  })
+
+  it('writes loading before it lists, keeping the shown items', async () => {
+    const env = setupMoreEnvironment()
+    const first = await env.load('', 'all')
+    const shown = itemIds(await env.viewSettled(first.loadId))
+    const rev = env.view().rev
+    // Hold the second Load on its first read.
+    const tabs = env.sandbox.getJulesTabs
+    let releaseTabs
+    env.sandbox.getJulesTabs = () =>
+      new Promise((resolve) => {
+        releaseTabs = () => resolve(tabs())
+      })
+    const second = env.load('org/repo', 'scheduled')
+    await tick(2)
+    const listing = env.view()
+    assert.ok(listing, 'the Load in progress is in the view')
+    assert.ok(listing.loading, 'with its own record')
+    assert.strictEqual(listing.loading.category, 'scheduled')
+    assert.strictEqual(listing.loading.repo, 'org/repo')
+    assert.strictEqual(typeof listing.loading.startedAt, 'number')
+    assert.strictEqual(listing.loadId, first.loadId, "the shown items are still the old load's")
+    assert.deepStrictEqual(itemIds(listing), shown)
+    assert.strictEqual(listing.rev, rev, 'nothing shown has changed yet')
+    releaseTabs()
+    const reply = await second
+    const answered = await env.viewSettled(reply.loadId)
+    assert.strictEqual(answered.loading, null)
+    assert.strictEqual(answered.loadId, reply.loadId)
+    assert.strictEqual(answered.loadId, listing.loading.id, 'the id minted before listing is the one answered')
+    assert.strictEqual(answered.category, 'scheduled')
+    assert.deepStrictEqual(itemIds(answered), [
+      'u/1:schedule:active',
+      'u/1:schedule:inactive',
+      'u/2:schedule:active',
+      'u/2:schedule:inactive'
+    ])
+    assert.strictEqual(answered.error, null)
+    assert.strictEqual(answered.archived, 'none')
+  })
+
+  it('keeps the old items and notes the error when a Load fails', async () => {
+    const env = setupMoreEnvironment()
+    const first = await env.load('', 'all')
+    const shown = itemIds(await env.viewSettled(first.loadId))
+    env.sandbox.getJulesTabs = async () => []
+    const reply = await env.load('', 'scheduled')
+    assert.match(reply.error, /No Jules tabs/)
+    for (let i = 0; i < 250; i++) {
+      const view = env.view()
+      if (view?.loading === null && view?.error) {
+        assert.strictEqual(view.loadId, first.loadId, 'the old load is still what actions act on')
+        assert.deepStrictEqual(itemIds(view), shown)
+        assert.match(view.error, /No Jules tabs/)
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    assert.fail('the failure never reached the view')
+  })
+
+  it('clears startPending before the archived listing starts', async () => {
+    const env = setupMoreEnvironment()
+    const original = env.sandbox.callBatchExecute
+    const held = []
+    env.sandbox.callBatchExecute = (rpc, payload, config) => {
+      if (rpc === 'p1Takd' && archivedFilter(payload[0])) {
+        return new Promise((resolve) => held.push(() => resolve(original(rpc, payload, config))))
+      }
+      return original(rpc, payload, config)
+    }
+    await env.load('', 'archive')
+    for (let i = 0; i < 100; i++) await Promise.resolve()
+    assert.ok(
+      env.calls.some((call) => call.rpc === 'YqkSHd'),
+      'the archived listing runs without LOAD_ARCHIVED'
+    )
+    const second = await env.load('', 'scheduled')
+    assert.ok(second.accounts, second.error)
+    for (const resume of held) resume()
+  })
+
+  it('an action drops its items from the view and bumps rev', async () => {
+    const env = setupMoreEnvironment()
+    await env.load('', 'all')
+    const rev = (await env.viewSettled()).rev
+    await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }], true)
+    assert.strictEqual(env.view().rev, rev, 'a dry run changes nothing')
+    assert.ok(itemIds(env.view()).includes('u/1:task:completed'))
+    await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }])
+    const view = env.view()
+    assert.ok(!itemIds(view).includes('u/1:task:completed'))
+    assert.ok(itemIds(view).includes('u/2:task:completed'))
+    assert.strictEqual(view.rev, rev + 1)
+  })
+
+  it('a run that changes Jules marks the view outdated; the next Load clears it', async () => {
+    const env = setupMoreEnvironment()
+    const first = await env.load('', 'all')
+    await env.viewSettled(first.loadId)
+    env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/1/' }]
+    env.sandbox.processAllTabs = async () => []
+    const run = (dryRun) =>
+      env.sandbox.startOperation({ action: 'archive', items: ['Completed'], dryRun, force: false, scope: 'all' })
+    await run(true)
+    assert.strictEqual(env.view().outdated, false, 'a dry run changes nothing in Jules')
+    await run(false)
+    for (let i = 0; i < 250 && env.view()?.outdated !== true; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    assert.strictEqual(env.view()?.outdated, true)
+    const second = await env.load('', 'all')
+    assert.strictEqual((await env.viewSettled(second.loadId)).outdated, false)
+  })
+
+  it('never keeps the Google user in the view', async () => {
+    const env = setupMoreEnvironment()
+    env.sandbox.prepareTab = async (tab) => ({
+      config: { accountNum: String(tab.id), bl: 'build', at: 'token', user: `g${tab.id}` },
+      label: `u/${tab.id}`
+    })
+    await env.load('', 'all')
+    const { view } = await env.loadArchive()
+    const text = JSON.stringify(view)
+    assert.ok(!view.items.some((item) => 'user' in item), 'no item carries the Google account')
+    assert.ok(!/"?g1"?|"?g2"?/.test(text), 'no Google account id anywhere in the view')
+  })
+
+  it('a view Chrome refuses becomes a small error view, and never fails the Load', async () => {
+    const env = setupMoreEnvironment()
+    const set = env.sandbox.chrome.storage.session.set
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreView?.items?.length) throw new Error('Session storage quota bytes exceeded.')
+      return set(data)
+    }
+    const load = await env.load('', 'all')
+    assert.ok(load.accounts, load.error)
+    const view = env.view()
+    assert.ok(view, 'a small view replaces the refused one')
+    assert.strictEqual(view.version, 1)
+    assert.ok(!view.items?.length, 'the small view carries no items')
+    assert.strictEqual(view.error, 'The list is too large to keep while the popup is closed. Load again.')
   })
 })
 
@@ -5754,12 +6003,14 @@ describe('More Actions load choices', () => {
     assert.strictEqual(env.calls.length, 0, 'a running task is not in a Completed load')
   })
 
-  it('Archived lists nothing until LOAD_ARCHIVED, which adds the archived tasks', async () => {
+  it('an Archived load answers nothing and then lists the archived tasks by itself', async () => {
     const env = setupMoreEnvironment()
+    const first = await env.load('', 'all')
+    const base = (await env.viewSettled(first.loadId)).rev
+    env.calls.length = 0
     const load = await env.load('', 'archive')
-    assert.deepStrictEqual(env.calls, [])
     assert.ok(load.accounts.every((account) => Object.keys(account).sort().join() === 'account,notes'))
-    const archived = await env.loadArchived(load.loadId)
+    const view = await env.archivedEnd(load.loadId)
     assert.deepStrictEqual(
       [...new Set(listed(env))],
       [
@@ -5768,7 +6019,11 @@ describe('More Actions load choices', () => {
         'p1Takd:source_id=github/org/repo-docs AND is_archived=true'
       ]
     )
-    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    assert.deepStrictEqual(
+      view.items.map((item) => `${item.account}:${item.id}`),
+      ['u/1:archived', 'u/2:archived']
+    )
+    assert.strictEqual(view.rev, base + 2, 'each write that changes the shown items bumps rev')
   })
 
   it('an All-repos load asks for every task with no repo lookup', async () => {
@@ -5778,9 +6033,9 @@ describe('More Actions load choices', () => {
     assert.ok(!env.calls.some((call) => call.rpc === 'YqkSHd'))
   })
 
-  it("an All-repos Archived lists each connected repo's archived tasks, never the whole archive at once", async () => {
+  it("an All-repos Archived load lists each connected repo's archived tasks, never the whole archive at once", async () => {
     const env = setupMoreEnvironment()
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { view } = await env.loadArchive()
     assert.ok(!env.calls.some((call) => call.rpc === 'p1Takd' && call.payload[0] === 'is_archived=true'))
     for (const account of ['1', '2']) {
       const calls = env.calls.filter((call) => call.account === account)
@@ -5791,12 +6046,10 @@ describe('More Actions load choices', () => {
       )
     }
     assert.deepStrictEqual(
-      Array.from(archived.accounts, (account) =>
-        Array.from(account.archived, (task) => `${task.id}:${task.repo}`).join()
-      ),
+      view.items.map((item) => `${item.id}:${item.repo}`),
       ['archived:Org/Repo', 'archived:Org/Repo']
     )
-    assert.ok(archived.accounts.every((account) => account.notes.length === 0))
+    assert.deepStrictEqual(view.notes, [])
   })
 
   it('lists at most Parallel per account repos at once', async () => {
@@ -5815,10 +6068,10 @@ describe('More Actions load choices', () => {
       listed++
       return [[[`t-${payload[0].slice(17, 21)}`, 'T', null, null, payload[0].split(' ')[0].slice(10), 3]]]
     }
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { view } = await env.loadArchive()
     assert.strictEqual(listed, 7)
     assert.strictEqual(peak, 2)
-    assert.strictEqual(archived.accounts[0].archived.length, 7)
+    assert.strictEqual(view.items.filter((item) => item.account === 'u/1').length, 7)
   })
 
   it('names the repos whose archived tasks Jules could not list, and keeps the rest', async () => {
@@ -5830,10 +6083,10 @@ describe('More Actions load choices', () => {
       }
       return original(rpc, payload, config)
     }
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
-    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    const { view } = await env.loadArchive()
+    assert.strictEqual(view.items.filter((item) => item.account === 'u/1').length, 1)
     assert.deepStrictEqual(
-      [...archived.accounts[0].notes],
+      [...view.notes],
       ['Jules could not list the archived tasks of 1 of 2 repos of u/1: org/repo-docs (RPC p1Takd error code [4]).']
     )
   })
@@ -5845,14 +6098,13 @@ describe('More Actions load choices', () => {
       if (rpc === 'p1Takd' && config.accountNum === '1') throw new Error('RPC error [4]')
       return [[]]
     }
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { view } = await env.loadArchive()
     assert.deepStrictEqual(
-      [...archived.accounts[0].notes],
+      [...view.notes],
       [
         'Jules could not list the archived tasks of 5 of 5 repos of u/1: org/r0 (RPC error [4]), org/r1 (RPC error [4]), org/r2 (RPC error [4]) and 2 more.'
       ]
     )
-    assert.deepStrictEqual([...archived.accounts[1].notes], [])
   })
 
   it("an account whose repos can't be read gets a note, and no archived list is asked", async () => {
@@ -5862,25 +6114,29 @@ describe('More Actions load choices', () => {
       if (rpc === 'YqkSHd' && config.accountNum === '2') throw new Error('RPC YqkSHd error code [13]')
       return original(rpc, payload, config)
     }
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { view } = await env.loadArchive()
     assert.ok(!env.calls.some((call) => call.rpc === 'p1Takd' && call.account === '2'))
     assert.deepStrictEqual(
-      [...archived.accounts[1].notes],
+      [...view.notes],
       ['Jules could not list the archived tasks of u/2: RPC YqkSHd error code [13].']
     )
-    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    assert.strictEqual(view.items.filter((item) => item.account === 'u/1').length, 1)
   })
 
   it('saves how many repos the All-repos archived listing has done, for the popup', async () => {
     const env = setupMoreEnvironment()
-    const { loadId } = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { load } = await env.loadArchive()
     const saved = env.sessionSetData
       .filter((data) => data.moreArchivedProgress)
       .map((data) => data.moreArchivedProgress)
     assert.ok(saved.length > 0)
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(saved.at(-1))), { loadId, done: 4, total: 4 })
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(saved.at(-1))), {
+      loadId: load.loadId,
+      done: 4,
+      total: 4
+    })
     env.sessionSetData.length = 0
-    await env.loadArchived((await env.load('org/repo', 'archive')).loadId)
+    await env.loadArchive('org/repo')
     assert.ok(
       !env.sessionSetData.some((data) => data.moreArchivedProgress),
       'one repo is one request: no progress to show'
@@ -5906,14 +6162,14 @@ describe('More Actions load choices', () => {
       asked.push(payload[0])
       return [[[`t-${asked.length}`, 'T', null, null, payload[0].split(' ')[0].slice(10), 3]]]
     }
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { view } = await env.loadArchive()
     assert.deepStrictEqual(asked, [
       'YqkSHd:null',
       'source_id=github/o/live AND is_archived=true',
       'source_id=github/o/gone AND is_archived=true'
     ])
     assert.deepStrictEqual(
-      Array.from(archived.accounts[0].archived, (task) => task.repo),
+      view.items.filter((item) => item.account === 'u/1').map((item) => item.repo),
       ['o/live', 'o/gone']
     )
   })
@@ -5925,7 +6181,7 @@ describe('More Actions load choices', () => {
       rpc === 'YqkSHd'
         ? [payload[1] === null ? [['github/o/Gone', null, null, null, 2]] : []]
         : original(rpc, payload, config)
-    await env.loadArchived((await env.load('o/gone', 'archive')).loadId)
+    await env.loadArchive('o/gone')
     assert.ok(env.calls.some((call) => call.payload[0] === 'source_id=github/o/Gone AND is_archived=true'))
   })
 
@@ -5939,10 +6195,10 @@ describe('More Actions load choices', () => {
       }
       return original(rpc, payload, config)
     }
-    const archived = await env.loadArchived((await env.load('', 'archive')).loadId)
+    const { view } = await env.loadArchive()
     assert.strictEqual(failures, 2)
-    assert.strictEqual(archived.accounts[0].archived.length, 1)
-    assert.deepStrictEqual([...archived.accounts[0].notes], [])
+    assert.strictEqual(view.items.filter((item) => item.account === 'u/1').length, 1)
+    assert.deepStrictEqual([...view.notes], [])
   })
 
   // Timers the test runs by hand; the worker's other timers are not used here.
@@ -5975,8 +6231,8 @@ describe('More Actions load choices', () => {
       return new Promise((resolve) => held.push(() => resolve([[]])))
     }
     const { loadId } = await env.load('', 'archive')
-    const listing = env.loadArchived(loadId)
     await settle()
+    assert.ok(held.length > 0, 'the archived listing starts on its own')
     held.shift()()
     await settle()
     assert.deepStrictEqual(
@@ -5990,8 +6246,35 @@ describe('More Actions load choices', () => {
       held.shift()()
       await settle()
     }
-    await listing
+    await env.archivedEnd(loadId)
     assert.deepStrictEqual(progressSaves(env).at(-1), { loadId, done: 3, total: 3 })
+  })
+
+  it('counts the archived progress outside the view, which is not rewritten per repo', async () => {
+    const env = setupMoreEnvironment({ settings: { perAccountParallel: 1 } })
+    const timers = fakeTimers(env)
+    const original = env.sandbox.callBatchExecute
+    const held = []
+    env.sandbox.callBatchExecute = (rpc, _payload, config) => {
+      if (config.accountNum !== '1') return [[]]
+      if (rpc === 'YqkSHd') return [[['github/o/r0'], ['github/o/r1'], ['github/o/r2']]]
+      return new Promise((resolve) => held.push(() => resolve(original(rpc, _payload, config))))
+    }
+    const { loadId } = await env.load('', 'archive')
+    await settle()
+    assert.ok(held.length > 0, 'the archived listing starts on its own')
+    const writes = () => env.sessionSetData.filter((data) => data.moreView).length
+    const before = writes()
+    held.shift()()
+    await settle()
+    timers.run()
+    assert.deepStrictEqual(progressSaves(env), [{ loadId, done: 1, total: 3 }])
+    held.shift()()
+    await settle()
+    assert.strictEqual(writes(), before, 'the item list is not rewritten while the repos list')
+    for (const resume of held) resume()
+    await env.archivedEnd(loadId)
+    assert.ok(writes() > before, 'the end does write the view once')
   })
 
   it('stops retrying a repo, and saving its count, once a newer Load replaced the load', async () => {
@@ -6005,8 +6288,7 @@ describe('More Actions load choices', () => {
       lists++
       throw new Error('HTTP 502')
     }
-    const first = await env.load('', 'archive')
-    const late = env.loadArchived(first.loadId)
+    await env.load('', 'archive')
     await settle()
     assert.strictEqual(lists, 1)
     await env.load('', 'scheduled')
@@ -6016,12 +6298,11 @@ describe('More Actions load choices', () => {
       timers.run()
       await settle()
     }
-    assert.match((await late).error, /newer load/i)
     assert.strictEqual(lists, 1, 'no request after the load was replaced')
     assert.deepStrictEqual(progressSaves(env), [])
   })
 
-  it('keeps and answers a listing that Chrome could not save, with a note', async () => {
+  it('keeps a listing that Chrome could not save, with a note', async () => {
     const env = setupMoreEnvironment()
     const set = env.sandbox.chrome.storage.session.set
     env.sandbox.chrome.storage.session.set = async (data) => {
@@ -6030,11 +6311,13 @@ describe('More Actions load choices', () => {
       }
       return set(data)
     }
-    const { loadId } = await env.load('', 'archive')
-    const archived = await env.loadArchived(loadId)
-    assert.strictEqual(archived.accounts[0].archived.length, 1)
+    const { view } = await env.loadArchive()
     assert.deepStrictEqual(
-      [...archived.notes],
+      view.items.filter((item) => item.kind === 'archived').map((item) => item.id),
+      ['archived', 'archived']
+    )
+    assert.deepStrictEqual(
+      [...view.notes],
       [
         'Chrome could not keep this list (Session storage quota bytes exceeded.): it is lost if the extension restarts, so act on it now or load again.'
       ]
@@ -6067,13 +6350,12 @@ describe('More Actions load choices', () => {
       if (++asked > 1) return [[]]
       return new Promise((resolve) => held.push(() => resolve([[]])))
     }
-    const first = await env.load('', 'archive')
-    const late = env.loadArchived(first.loadId)
+    await env.load('', 'archive')
     for (let i = 0; i < 100; i++) await Promise.resolve()
     assert.strictEqual(asked, 1)
     await env.load('', 'scheduled')
     held.shift()()
-    assert.match((await late).error, /newer load/i)
+    await tick()
     assert.strictEqual(asked, 1, 'no repo is asked for after the load was replaced')
   })
 
@@ -6117,18 +6399,18 @@ describe('More Actions load choices', () => {
     assert.match(reply.accounts[0].notes.join(' '), /Could not read the repos of u\/1.*as typed/)
   })
 
-  it("a one-repo archived listing that fails says so in the account's note", async () => {
+  it("a one-repo archived listing that fails says so in the view's notes", async () => {
     const env = setupMoreEnvironment()
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && archivedFilter(payload[0])) throw new Error('RPC p1Takd error code [4]')
       return original(rpc, payload, config)
     }
-    const one = await env.loadArchived((await env.load('org/repo', 'archive')).loadId)
-    assert.deepStrictEqual(
-      [...one.accounts[0].notes],
-      ['Jules could not list the archived tasks of u/1: RPC p1Takd error code [4].']
-    )
+    const { view } = await env.loadArchive('org/repo')
+    assert.deepStrictEqual(view.notes, [
+      'Jules could not list the archived tasks of u/1: RPC p1Takd error code [4].',
+      'Jules could not list the archived tasks of u/2: RPC p1Takd error code [4].'
+    ])
   })
 
   it('carries the ready-for-review flag and the prompt title of a task', async () => {
@@ -6193,7 +6475,7 @@ describe('More Actions Delete schedule and Copy session URL', () => {
       }
       return original(rpc, payload, config)
     }
-    await env.loadArchived((await env.load('', 'archive')).loadId)
+    await env.loadArchive()
     env.calls.length = 0
     const pick = ['a1', 'a2'].map((id) => ({ account: 'u/1', kind: 'archived', id }))
     await env.apply('deleteTask', pick)
@@ -6220,18 +6502,30 @@ describe('More Actions Delete schedule and Copy session URL', () => {
 
   it('sends nothing for the methods a rediscovery put in doubt', async () => {
     const env = setupMoreEnvironment()
-    await env.loadAll()
+    await env.load()
     // The bundle gave Tjmm5c to DeleteTasks while ArchiveTasks kept it (settings.js applyDiscovery).
     for (const listener of env.storageChangeListeners) {
       listener({ julesApi: { newValue: { inDoubt: ['ArchiveTasks', 'DeleteTasks'] } } }, 'local')
     }
-    for (const [action, kind, id] of [
-      ['deleteTask', 'archived', 'archived'],
-      ['unarchive', 'archived', 'archived'],
-      ['archive', 'task', 'completed']
-    ]) {
+    env.calls.length = 0
+    await env.apply('archive', [{ account: 'u/2', kind: 'task', id: 'completed' }], false, true)
+    assert.deepStrictEqual(
+      env.calls.filter((call) => call.rpc !== 'p1Takd'),
+      [],
+      'archive sends nothing'
+    )
+    assert.match(env.sandbox.test_state().log.join('\n'), /ArchiveTasks id is in doubt/)
+    env.calls.length = 0
+    await env.apply('pauseSchedule', [{ account: 'u/2', kind: 'schedule', id: 'active' }])
+    assert.ok(
+      env.calls.some((call) => call.rpc === 'gBUOb'),
+      'the other methods still work'
+    )
+    // The archived actions need a load that holds the archived tasks.
+    await env.loadArchive()
+    for (const action of ['deleteTask', 'unarchive']) {
       env.calls.length = 0
-      await env.apply(action, [{ account: 'u/2', kind, id }], false, true)
+      await env.apply(action, [{ account: 'u/2', kind: 'archived', id: 'archived' }], false, true)
       assert.deepStrictEqual(
         env.calls.filter((call) => call.rpc !== 'p1Takd'),
         [],
@@ -6239,12 +6533,6 @@ describe('More Actions Delete schedule and Copy session URL', () => {
       )
       assert.match(env.sandbox.test_state().log.join('\n'), /(ArchiveTasks|DeleteTasks) id is in doubt/)
     }
-    env.calls.length = 0
-    await env.apply('pauseSchedule', [{ account: 'u/2', kind: 'schedule', id: 'active' }])
-    assert.ok(
-      env.calls.some((call) => call.rpc === 'gBUOb'),
-      'the other methods still work'
-    )
   })
 
   it('refuses Copy session URL: it runs in the popup', async () => {
@@ -6368,7 +6656,10 @@ describe('More Actions edge cases', () => {
         }
         return original(rpc, payload, config)
       }
-      await env.loadAll()
+      // Archive acts on an All load's tasks; unarchive on an Archived load's
+      // archived tasks.
+      if (action === 'archive') await env.load()
+      else await env.loadArchive()
       env.calls.length = 0
       checking = true
       await env.apply(
@@ -6537,19 +6828,25 @@ describe('More Actions cache', () => {
 
   it('answers a second Load within 30 minutes from the cache, and says how old it is', async () => {
     const env = setupCacheEnvironment()
-    const first = await env.loadAll()
-    assert.strictEqual(first.load.cachedAt, null)
-    assert.strictEqual(first.archived.cachedAt, null)
+    const first = await env.load('', 'all')
+    assert.strictEqual(first.cachedAt, null)
+    const firstArchived = await env.loadArchive()
+    assert.strictEqual(firstArchived.view.cachedAt, null)
     assert.ok(env.reads().length > 0)
     env.calls.length = 0
     const before = Date.now()
-    const second = await env.loadAll()
+    const second = await env.load('', 'all')
+    const secondArchived = await env.loadArchive()
     assert.deepStrictEqual(env.reads(), [], 'nothing is listed again')
-    assert.ok(second.load.cachedAt <= before && second.load.cachedAt > before - 60000, String(second.load.cachedAt))
-    assert.ok(second.archived.cachedAt <= before && second.archived.cachedAt > before - 60000)
-    assert.notStrictEqual(second.load.loadId, first.load.loadId)
-    assert.deepStrictEqual(plain(second.load.accounts), plain(first.load.accounts))
-    assert.deepStrictEqual(plain(second.archived.accounts), plain(first.archived.accounts))
+    assert.ok(second.cachedAt <= before && second.cachedAt > before - 60000, String(second.cachedAt))
+    assert.ok(secondArchived.view.cachedAt <= before && secondArchived.view.cachedAt > before - 60000)
+    assert.notStrictEqual(second.loadId, first.loadId)
+    assert.deepStrictEqual(plain(second.accounts), plain(first.accounts))
+    assert.deepStrictEqual(
+      plain(secondArchived.view.items),
+      plain(firstArchived.view.items),
+      'the same archived tasks, from the cache'
+    )
     env.calls.length = 0
     await env.apply('unarchive', [{ account: 'u/2', kind: 'archived', id: 'archived' }])
     assert.ok(
@@ -6560,17 +6857,15 @@ describe('More Actions cache', () => {
 
   it('Refresh lists live again and keeps what it listed', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     env.calls.length = 0
-    const load = await env.load('', 'archive', true)
-    const archived = await env.loadArchived(load.loadId, true)
-    assert.strictEqual(load.cachedAt, null)
-    assert.strictEqual(archived.cachedAt, null)
+    const fresh = await env.loadArchive('', true)
+    assert.strictEqual(fresh.load.cachedAt, null)
+    assert.strictEqual(fresh.view.cachedAt, null)
     assert.ok(env.calls.some((call) => call.rpc === 'YqkSHd'))
     assert.ok(env.calls.some((call) => call.rpc === 'p1Takd' && archivedFilter(call.payload[0])))
     env.calls.length = 0
-    const again = await env.load('', 'archive')
-    await env.loadArchived(again.loadId)
+    await env.loadArchive()
     assert.deepStrictEqual(env.reads(), [])
   })
 
@@ -6608,24 +6903,38 @@ describe('More Actions cache', () => {
 
   it('caches nothing for an account without a Google id', async () => {
     const env = setupCacheEnvironment({}, { users: false })
-    await env.loadAll()
+    await env.loadArchive()
     env.calls.length = 0
-    const again = await env.loadAll()
+    const again = await env.loadArchive()
     assert.ok(env.reads().length > 0)
     assert.strictEqual(again.load.cachedAt, null)
+    assert.strictEqual(again.view.cachedAt, null)
     assert.strictEqual(env.local.moreCache?.entries?.length ?? 0, 0)
+  })
+
+  it('ends an Archived load in the view with the age of the oldest part it used', async () => {
+    const now = Date.now()
+    const env = setupCacheEnvironment({
+      moreCache: { version: 1, entries: [task('archived', now - 120000, 'g1', 'archived', 'github/Org/Repo')] }
+    })
+    const { load, view } = await env.loadArchive('org/repo')
+    assert.strictEqual(load.cachedAt, null, 'the Load part of an Archived load lists nothing')
+    assert.strictEqual(view.cachedAt, now - 120000, 'the view carries the age of the archived part')
+    env.calls.length = 0
+    const fresh = await env.loadArchive('org/repo', true)
+    assert.strictEqual(fresh.view.cachedAt, null, 'a Refresh is live')
+    assert.ok(env.calls.some((call) => call.rpc === 'p1Takd' && archivedFilter(call.payload[0])))
   })
 
   it("listing every repo's archived tasks fills the entries a one-repo Load uses", async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     env.calls.length = 0
-    const load = await env.load('org/repo', 'archive')
-    const archived = await env.loadArchived(load.loadId)
+    const { view } = await env.loadArchive('org/repo')
     assert.deepStrictEqual(env.reads(), [], 'the repo list and its archived tasks come from the cache')
     assert.deepStrictEqual(
-      archived.accounts.map((account) => account.archived.map((item) => item.id)),
-      [['archived'], ['archived']]
+      view.items.map((item) => `${item.account}:${item.id}`),
+      ['u/1:archived', 'u/2:archived']
     )
   })
 
@@ -6668,10 +6977,12 @@ describe('More Actions cache', () => {
 
   it('an action drops the lists it changed, for its repo and for all repos, of its account only', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }])
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     assert.deepStrictEqual(env.listed().sort(), [
       ['1', ''],
       ['1', 'source_id=github/Org/Repo AND is_archived=true']
@@ -6681,10 +6992,10 @@ describe('More Actions cache', () => {
 
   it("a schedule action drops that account's schedules", async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.load('', 'all')
     await env.apply('pauseSchedule', [{ account: 'u/2', kind: 'schedule', id: 'active' }])
     env.calls.length = 0
-    await env.loadAll()
+    await env.load('', 'all')
     assert.deepStrictEqual(
       env.reads().map((call) => [call.rpc, call.account]),
       [['hvmRxc', '2']]
@@ -6693,28 +7004,32 @@ describe('More Actions cache', () => {
 
   it('a dry run keeps the cache', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }], true)
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     assert.deepStrictEqual(env.reads(), [])
   })
 
   it('a START that acts clears the whole cache; a dry START keeps it', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     env.sandbox.discoverTabs = async () => [{ id: 1, url: 'https://jules.google.com/u/1/' }]
     env.sandbox.processAllTabs = async () => []
     const start = (dryRun) =>
       env.sandbox.startOperation({ action: 'archive', items: ['Completed'], dryRun, force: false, scope: 'all' })
     await start(true)
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     assert.deepStrictEqual(env.reads(), [], 'a dry run changes nothing in Jules')
     await start(false)
     assert.strictEqual(env.local.moreCache, undefined)
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
     assert.ok(env.listed().length >= 4)
   })
 
@@ -6746,7 +7061,8 @@ describe('More Actions cache', () => {
 
   it('an action also drops what a Load still listing read while it ran', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = async (rpc, payload, config) => {
       if (rpc === 'Tjmm5c') {
@@ -6759,7 +7075,7 @@ describe('More Actions cache', () => {
     }
     await env.apply('archive', [{ account: 'u/1', kind: 'task', id: 'completed' }])
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
     assert.ok(env.listed().some(([account, filter]) => account === '1' && filter.endsWith('is_archived=true')))
   })
 
@@ -6788,23 +7104,23 @@ describe('More Actions cache', () => {
       if (fail && key === 'moreCache') throw new Error('IO error')
       return get(key)
     }
-    await env.loadAll()
+    await env.loadArchive()
     assert.deepStrictEqual(
       env.local.moreCache.entries.map((entry) => entry.user),
       ['gZ'],
       "another account's entries stay"
     )
     fail = false
-    await env.loadAll()
+    await env.loadArchive()
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
     assert.deepStrictEqual(env.reads(), [], 'once it can be read, the cache works again')
     assert.ok(env.local.moreCache.entries.some((entry) => entry.user === 'gZ'))
   })
 
   it('an action that cannot read the cache clears it', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.load()
     vm.runInContext('moreCachePromise = null', env.sandbox)
     const get = env.sandbox.chrome.storage.local.get
     env.sandbox.chrome.storage.local.get = async (key) => {
@@ -6823,7 +7139,7 @@ describe('More Actions cache', () => {
       { version: 1, entries: [null, { ...task('a', at), user: '' }, { ...task('b', at), items: 'x' }, 'x'] }
     ]) {
       const env = setupCacheEnvironment({ moreCache })
-      const { load } = await env.loadAll()
+      const load = await env.load('', 'all')
       assert.ok(
         env.listed().some(([account, filter]) => account === '1' && filter === ''),
         JSON.stringify(moreCache)
@@ -6849,20 +7165,22 @@ describe('More Actions cache', () => {
     env.sandbox.chrome.storage.local.set = async () => {
       throw new Error('QUOTA_BYTES quota exceeded')
     }
-    await env.loadAll()
+    await env.loadArchive()
     assert.strictEqual(env.local.moreCache, undefined)
     env.calls.length = 0
-    const again = await env.loadAll()
+    const again = await env.loadArchive()
     assert.ok(env.reads().length > 0)
     assert.strictEqual(again.load.cachedAt, null)
+    assert.strictEqual(again.view.cachedAt, null)
   })
 
   it("Delete permanently drops the repo's cached archived tasks, and only them", async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     await env.apply('deleteTask', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
     env.calls.length = 0
-    await env.loadAll()
+    await env.loadArchive()
+    await env.load('', 'all')
     assert.deepStrictEqual(env.listed(), [['1', 'source_id=github/Org/Repo AND is_archived=true']])
   })
 
@@ -6882,7 +7200,7 @@ describe('More Actions cache', () => {
 
   it('acts on no item of a u/N that is another Google account than when it was loaded', async () => {
     const env = setupCacheEnvironment()
-    const { load } = await env.loadAll()
+    const load = await env.load('', 'all')
     assert.ok(
       load.accounts.every((account) => !('user' in account)),
       'the popup gets no Google account id'
@@ -6906,7 +7224,7 @@ describe('More Actions cache', () => {
 
   it('acts on no item loaded for a Google account when u/N no longer names one', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.load()
     const prepare = env.sandbox.prepareTab
     env.sandbox.prepareTab = async (tab) => {
       const prepared = await prepare(tab)
@@ -6934,8 +7252,8 @@ describe('More Actions cache', () => {
       }
       return original(rpc, payload, config)
     }
-    await env.loadAll()
-    // a1 was unarchived in Jules after the (cached) load.
+    await env.loadArchive()
+    // a1 was unarchived in Jules after the load.
     archivedNow = ['a2']
     env.calls.length = 0
     const pick = ['a1', 'a2'].map((id) => ({ account: 'u/1', kind: 'archived', id }))
@@ -6951,7 +7269,7 @@ describe('More Actions cache', () => {
 
   it('Delete permanently deletes nothing of a repo whose archived tasks it cannot list', async () => {
     const env = setupCacheEnvironment()
-    await env.loadAll()
+    await env.loadArchive()
     const original = env.sandbox.callBatchExecute
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && archivedFilter(payload[0])) throw new Error('RPC error [4]')
