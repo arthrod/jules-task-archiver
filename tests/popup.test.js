@@ -1012,6 +1012,24 @@ describe('Proceed, Archive and Export', () => {
     )
   })
 
+  it('sends the items it confirmed, even when the choice changes while the current tab is looked up', async () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.radioStates.scope = 'current'
+    env.option('Error (4)').dispatchEvent('click')
+    let answer
+    env.sandbox.chrome.tabs.query = () =>
+      new Promise((resolve) => {
+        answer = () => resolve([{ id: 7 }])
+      })
+    const run = env.elements['#archiveBtn'].dispatchEvent('click')
+    // All would have needed its own confirmation; it was never confirmed.
+    env.option('All').dispatchEvent('click')
+    answer()
+    await run
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.starts()[0].items)), ['state:4'])
+  })
+
   it('re-enables the buttons and shows the error when the background rejects the run', async () => {
     const env = setupPopupSandbox()
     env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
@@ -1338,6 +1356,27 @@ describe('Popup open', () => {
     assert.notDeepStrictEqual(env.syncStorage.items, ['state:4', 'suggestions'], 'a rehydrated choice is not saved')
     assert.strictEqual(env.elements['#archiveBtn'].textContent, '⏳ Archiving…')
     assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+  })
+
+  it('keeps a choice made before the saved one is read', () => {
+    const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+    const pending = []
+    const get = env.sandbox.chrome.storage.sync.get
+    env.sandbox.chrome.storage.sync.get = (keys, cb) => {
+      // Chrome reads in order: a get sent before the click's write answers
+      // with the value from before it, however late the answer comes.
+      let found
+      get(keys, (res) => {
+        found = res
+      })
+      pending.push(() => cb(found))
+    }
+    env.load()
+    env.option('Error (4)').dispatchEvent('click')
+    for (const answer of pending) answer()
+    // Before the read, All is shown; the click swaps it for Error (4).
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4)')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:4'])
   })
 
   it("keeps a finished run's items when the saved choice is read after GET_STATE", () => {

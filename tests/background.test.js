@@ -4326,6 +4326,42 @@ describe('proceed', () => {
       assert.ok(!state.log.some((l) => l.includes('suggestions started')))
     })
 
+    it('stops a run that a Reset and a newer run replaced, leaving the newer one alone', async () => {
+      const env = setupRun()
+      const calls = []
+      let newRun
+      let releaseNew
+      const newHeld = new Promise((resolve) => {
+        releaseNew = resolve
+      })
+      env.sandbox.processAllTabs = async (_tabs, options) => {
+        calls.push(options.opMode)
+        if (calls.length === 1) {
+          // While the first phase runs: a Reset, then a new run starts.
+          await new Promise((resolve) => {
+            for (const listener of env.messageListeners) listener({ action: 'RESET' }, {}, resolve)
+          })
+          newRun = env.sandbox.test_startOperation({ action: 'archive', items: ['state:4'], dryRun: true })
+          for (let i = 0; i < 100 && calls.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 0))
+          return [{ label: 'old', count: 2 }]
+        }
+        if (options.opMode === 'archive') {
+          await newHeld
+          return [{ label: 'new', count: 1 }]
+        }
+        return [{ label: 'old', count: 5 }]
+      }
+      await env.sandbox.test_startOperation({ action: 'proceed', items: ['state:12', 'suggestions'], dryRun: true })
+      assert.deepStrictEqual(calls, ['proceed', 'archive'], 'the old run starts no further phase')
+      assert.strictEqual(env.sandbox.test_state().status, 'running', 'the newer run is not marked done')
+      assert.ok(env.sandbox.test_getKeepAliveInterval(), "the newer run's keep-alive is left running")
+      releaseNew()
+      await newRun
+      const state = env.sandbox.test_state()
+      assert.strictEqual(state.status, 'done')
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(state.results)), [{ label: 'new', count: 1 }])
+    })
+
     it('logs a single-phase run exactly as before', async () => {
       const env = setupRun()
       env.sandbox.processAllTabs = async () => [{ label: 'u/1', count: 2 }]
