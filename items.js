@@ -86,6 +86,61 @@ function resolveItem(input, states = activeTaskStates) {
   }
 }
 
+// Multi-select: the new selection after `id` is toggled, in listItems order.
+// All swallows every task state (it already covers them) but leaves Suggestions;
+// a task state takes All's place. An id that is not an item changes nothing.
+function toggleItemSelection(selectedIds, id, items = listItems()) {
+  const known = new Set(items.map((i) => i.id))
+  if (!known.has(id)) return [...selectedIds]
+  const selected = new Set(selectedIds.filter((sid) => known.has(sid)))
+  const isTask = items.find((i) => i.id === id)?.type === 'tasks'
+  if (selected.has(id)) selected.delete(id)
+  else if (id === ITEM_ALL) {
+    for (const item of items) if (item.type === 'tasks' && item.id !== ITEM_ALL) selected.delete(item.id)
+    selected.add(id)
+  } else if (isTask) {
+    selected.delete(ITEM_ALL)
+    selected.add(id)
+  } else selected.add(id)
+  return items.filter((i) => selected.has(i.id)).map((i) => i.id)
+}
+
+// What a multi-item run is made of: the tasks phase's item (the All item, one
+// state, or several states merged) and the Suggestions item. All beside any
+// other task item is refused instead of silently widened or narrowed.
+function combineItems(items) {
+  let suggestions = null
+  const tasks = []
+  for (const item of items) {
+    if (!item) continue
+    if (item.type === 'suggestions') suggestions = item
+    else tasks.push(item)
+  }
+  const distinct = []
+  const seen = new Set()
+  for (const item of tasks) {
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    distinct.push(item)
+  }
+  if (distinct.length > 1 && distinct.some((i) => i.id === ITEM_ALL)) {
+    throw new Error('All already covers every task state; pick All or states')
+  }
+  if (distinct.length <= 1) return { tasks: distinct[0] ?? null, suggestions }
+  const codes = []
+  for (const item of distinct) for (const code of item.codes || []) if (!codes.includes(code)) codes.push(code)
+  return {
+    tasks: {
+      id: `multi:${distinct.map((i) => i.id).join('+')}`,
+      label: distinct.map((i) => i.label).join(', '),
+      group: 'Tasks',
+      type: 'tasks',
+      codes
+    },
+    suggestions
+  }
+}
+
 function taskStateCode(task, states = activeTaskStates) {
   if (task?.state != null) return task.state
   if (states.some((s) => s.code === NO_STATE_CODE && s.kind === 'completed')) return NO_STATE_CODE
@@ -171,6 +226,8 @@ if (typeof module !== 'undefined') {
     setTaskStates,
     getTaskStates,
     listItems,
+    toggleItemSelection,
+    combineItems,
     resolveItem,
     taskStateCode,
     isCompletedTask,

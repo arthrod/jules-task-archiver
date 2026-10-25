@@ -510,12 +510,12 @@ describe('Items dropdown', () => {
       env.option('Error (4)').id,
       'the clicked option becomes the active one'
     )
-    assert.deepStrictEqual(env.syncStorage.items, ['state:4'])
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:4'])
     assert.strictEqual(env.syncStorage.item, undefined, 'the old single-item key is gone')
     // The same option again takes it back out.
     env.option('Error (4)').dispatchEvent('click')
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
-    assert.deepStrictEqual(env.syncStorage.items, [])
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), [])
     // The Items button closes the menu again.
     env.elements['#itemsBtn'].dispatchEvent('click')
     assert.strictEqual(env.elements['#itemsBtn'].attributes['aria-expanded'], 'false')
@@ -628,7 +628,7 @@ describe('Items dropdown', () => {
     const env = setupPopupSandbox({ sync: { item: 'state:12' } })
     env.load()
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
-    assert.deepStrictEqual(env.syncStorage.items, ['state:12'])
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:12'])
     assert.strictEqual(env.syncStorage.item, undefined, 'the old key is removed')
     // A later change writes the new key only; the migration does not run again.
     const writes = []
@@ -639,7 +639,7 @@ describe('Items dropdown', () => {
     }
     env.option('Error (4)').dispatchEvent('click')
     assert.ok(writes.every((w) => !('item' in w)))
-    assert.deepStrictEqual(env.syncStorage.items, ['state:12', 'state:4'])
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:12', 'state:4'])
   })
 
   it('writes only the chosen items to sync storage', () => {

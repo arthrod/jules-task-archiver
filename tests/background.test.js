@@ -4253,7 +4253,7 @@ describe('proceed', () => {
       const state = env.sandbox.test_state()
       assert.strictEqual(state.status, 'done')
       assert.deepStrictEqual(state.options.items, ['state:12', 'state:4', 'suggestions'], 'the strings stay verbatim')
-      assert.deepStrictEqual(state.results, [
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(state.results)), [
         { label: 'u/1 · Tasks', count: 2, phase: 'Tasks' },
         { label: 'u/1 · Suggestions', count: 5, phase: 'Suggestions' }
       ])
@@ -4307,7 +4307,7 @@ describe('proceed', () => {
       const state = env.sandbox.test_state()
       assert.deepStrictEqual(calls, ['proceed'])
       assert.strictEqual(state.status, 'idle', 'a Reset is never overwritten with done')
-      assert.deepStrictEqual(state.results, [])
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(state.results)), [])
       assert.strictEqual(state.log.filter((l) => l === 'SUMMARY').length, 1, 'only the phase that ran is summed up')
       assert.ok(!state.log.some((l) => l.includes('suggestions started')))
     })
@@ -4318,7 +4318,7 @@ describe('proceed', () => {
       await env.sandbox.test_startOperation({ action: 'proceed', items: ['state:12'], dryRun: true })
       const state = env.sandbox.test_state()
       assert.strictEqual(state.status, 'done')
-      assert.deepStrictEqual(state.results, [{ label: 'u/1', count: 2 }])
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(state.results)), [{ label: 'u/1', count: 2 }])
       const log = state.log
       assert.strictEqual(log.filter((l) => l === '=== DRY RUN MODE ===').length, 1)
       assert.strictEqual(log.filter((l) => l === '=== ITEM: Waiting on You (12) ===').length, 1)

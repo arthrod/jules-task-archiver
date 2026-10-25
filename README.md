@@ -66,7 +66,7 @@ All the data in these pictures is made up.
 
 ### Items, Proceed and Archive
 
-Pick an **Item** -- All, one Jules task state (each listed with its state code, e.g. *Waiting on You (12)*, *Error (4)*, *Completed (3)*), or Suggestions -- then press **Proceed** or **Archive**.
+Pick one or more **Items** -- All, one or more Jules task states (each listed with its state code, e.g. *Waiting on You (12)*, *Error (4)*, *Completed (3)*), and Suggestions -- then press **Proceed** or **Archive**. The dropdown takes several picks at once: All covers every task state on its own, several states run together, and Suggestions joins either. A run with tasks and Suggestions works through the tasks first, then the Suggestions.
 
 - **Proceed** moves each task forward according to its state:
   - *Waiting on You* -- sends the default reply, with your message appended
@@ -76,9 +76,9 @@ Pick an **Item** -- All, one Jules task state (each listed with its state code, 
   - *In Progress, Planning, Queued* -- sends your message (nothing without one)
   - *Completed* -- sends your message as a follow-up (nothing without one). Under **All**, Completed tasks are skipped unless **Force** is on
   - Tasks are handled in that order. Retries and follow-ups start a new run, so they are capped to the daily sessions you have left
-- **Archive** archives the chosen item's tasks, skipping tasks with a matching open GitHub PR. **Force** skips that check
+- **Archive** archives the chosen items' tasks, skipping tasks with a matching open GitHub PR. **Force** skips that check
 - **Dry-run** (on by default) lists what would happen without changing anything
-- **Add a message** appends your text (up to 2000 characters) to whatever the extension sends: the default reply, the retry prompt, each suggestion prompt. Running and Completed tasks get it on its own. Plan approvals and resumes take no message. The **?** next to Force and Add a message explains what they do for the chosen item
+- **Add a message** appends your text (up to 2000 characters) to whatever the extension sends: the default reply, the retry prompt, each suggestion prompt. Running and Completed tasks get it on its own. Plan approvals and resumes take no message. The **?** next to Force and Add a message explains what they do for the chosen items
 - The popup asks before risky live runs: Archive on All, any Force archive, and a Force Proceed that messages Completed tasks
 
 ### Suggestions
@@ -132,7 +132,7 @@ After you update the files of an unpacked extension, click **Reload** (↻) on i
 1. Open one or more `jules.google.com` tabs (supports multiple accounts)
 2. Click the extension icon in the toolbar
 3. Choose:
-   - **Items** -- All, one task state, or Suggestions. The popup remembers your choice; if that state no longer exists (Jules renumbered it), it shows **Choose an item** instead of falling back to All
+   - **Items** -- one or more of: All, the task states, Suggestions. The popup remembers your choice; if a remembered state no longer exists (Jules renumbered it), it shows **Choose an item** instead of falling back to All
    - **Dry-run** -- on: preview only; off: make the changes
    - **Force** -- Archive skips the open-PR check; Proceed on All also messages Completed tasks. Without Force, a repo whose open PRs can't be read from GitHub (a 404 is tried once more) keeps its tasks: they are skipped, not archived
    - **Add a message** -- text appended to what Proceed sends

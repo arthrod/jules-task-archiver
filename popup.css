@@ -230,6 +230,13 @@ a:hover {
   text-align: left;
 }
 
+.sel-btn #itemsBtnText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 .sel-btn .tri {
   width: 0;
   height: 0;
@@ -310,8 +317,8 @@ select.sel-btn {
 
 .menu .opt {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 8px;
   padding: 6px 10px;
   font-size: 12.5px;
   color: var(--ink);
@@ -331,6 +338,32 @@ select.sel-btn {
 .menu .opt.cur.active {
   outline: 2px solid var(--mark);
   outline-offset: -2px;
+}
+
+.menu .opt .lbl {
+  flex: 1;
+}
+
+/* The multi-select check mark: the checkbox's box without the input, so it
+   holds no text; aria-selected says the same thing to screen readers. */
+.menu .opt .chk {
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  flex: none;
+  position: relative;
+}
+
+.menu .opt[aria-selected="true"] .chk {
+  background: var(--ink);
+}
+
+.menu .opt[aria-selected="true"] .chk::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  background: var(--mark);
 }
 
 .menu .opt .n {

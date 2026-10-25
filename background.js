@@ -220,7 +220,7 @@ async function runScheduledTick() {
   resetRunLimits()
   await startOperation({
     action: 'archive',
-    item: 'Completed',
+    items: ['Completed'],
     dryRun: false,
     force: false,
     scope: 'all',
@@ -231,7 +231,7 @@ async function runScheduledTick() {
   if (cfg.schedStartSuggestions && state.status !== 'running' && !startPending) {
     await startOperation({
       action: 'proceed',
-      item: ITEM_SUGGESTIONS,
+      items: [ITEM_SUGGESTIONS],
       dryRun: false,
       force: false,
       scope: 'all',
@@ -2591,9 +2591,6 @@ const OP_MODE_HEADERS = {
 
 const RUN_ACTIONS = new Set(['proceed', 'archive', 'export'])
 
-// The popup and the CLI send { action, item }; this turns them into the opMode
-// that picks the per-tab orchestrator. Throws on a missing or unknown action
-// or item.
 // Set while a START waits for the settings, so a second START (or a
 // scheduled tick) can't slip in before the first run marks itself running.
 let startPending = false
@@ -2610,6 +2607,11 @@ function startMessageProblem(msg) {
   return null
 }
 
+// The popup and the CLI send { action, items }; this resolves the ids into the
+// phases the run works through, tasks first then Suggestions, and keeps
+// opMode/item mirroring the first phase so single-phase callers see the shape
+// they always did. `items` stays the verbatim strings the popup sent. Throws on
+// a missing or unknown action or item; nothing ever silently becomes All.
 function resolveRunOptions(options) {
   if (!RUN_ACTIONS.has(options.action)) throw new Error(`Unknown action "${options.action}"`)
   const resolved = { ...options, message: normalizeMessage(options.message) }
@@ -2617,16 +2619,30 @@ function resolveRunOptions(options) {
     resolved.opMode = 'export_suggestions'
     return resolved
   }
-  // No default: a missing item must never turn into "All" for an archive run.
-  const item = resolveItem(options.item)
-  if (!item) throw new Error(`Unknown item "${options.item}"`)
-  resolved.item = item
-  if (item.type === 'suggestions') {
-    if (options.action === 'archive') resolved.opMode = 'remove_suggestions'
-    else resolved.opMode = options.oneSession ? 'agent_batch' : 'suggestions'
-  } else {
-    resolved.opMode = options.action === 'archive' ? 'archive' : 'proceed'
+  if (!Array.isArray(options.items) || options.items.length === 0) throw new Error('Choose at least one item')
+  const maxItems = listItems().length // a rediscovered table can hold up to 40 states
+  if (options.items.length > maxItems) throw new Error(`Too many items (at most ${maxItems})`)
+  const itemObjects = []
+  for (const entry of options.items) {
+    if (typeof entry !== 'string') throw new Error('Every item must be a string')
+    const item = resolveItem(entry)
+    if (!item) throw new Error(`Unknown item "${entry}"`)
+    itemObjects.push(item)
   }
+  const combined = combineItems(itemObjects) // refuses All beside a task state
+  const phases = []
+  if (combined.tasks) {
+    phases.push({ opMode: options.action === 'archive' ? 'archive' : 'proceed', item: combined.tasks })
+  }
+  if (combined.suggestions) {
+    phases.push({
+      opMode: options.action === 'archive' ? 'remove_suggestions' : options.oneSession ? 'agent_batch' : 'suggestions',
+      item: combined.suggestions
+    })
+  }
+  resolved.phases = phases
+  resolved.opMode = phases[0].opMode
+  resolved.item = phases[0].item
   return resolved
 }
 
@@ -2652,8 +2668,13 @@ function initOperationState(options) {
   })
 
   const isSuggestions = options.opMode === 'suggestions'
-  addLog(options.dryRun ? '=== DRY RUN MODE ===' : OP_MODE_HEADERS[options.opMode] || '=== ARCHIVE MODE ===')
-  if (options.item?.label) addLog(`=== ITEM: ${options.item.label} ===`)
+  // A run with several phases logs each phase's own headers in startOperation,
+  // so they are not printed twice here.
+  const singlePhase = !Array.isArray(options.phases) || options.phases.length <= 1
+  if (singlePhase) {
+    addLog(options.dryRun ? '=== DRY RUN MODE ===' : OP_MODE_HEADERS[options.opMode] || '=== ARCHIVE MODE ===')
+    if (options.item?.label) addLog(`=== ITEM: ${options.item.label} ===`)
+  }
   if (options.action === 'archive' && options.message) addLog("Archive doesn't use the message; it is ignored.")
   if (options.scheduled) addLog('=== SCHEDULED (chrome.alarms) ===')
   if (options.force) addLog('=== FORCE MODE (skip PR check) ===')
@@ -2754,7 +2775,9 @@ const OP_MODE_SUMMARY = {
 }
 
 // Accepts the run's options (opMode) or the legacy isSuggestions boolean.
-function finalizeOperation(results, optionsOrIsSuggestions) {
+// Only the SUMMARY block; the run's single terminal updateState lives in
+// startOperation, so a several-phase run is not flipped to done after phase 1.
+function logSummary(results, optionsOrIsSuggestions) {
   let verb = 'archived'
   let itemLabel = 'tasks'
   if (typeof optionsOrIsSuggestions === 'object' && optionsOrIsSuggestions !== null) {
@@ -2772,7 +2795,10 @@ function finalizeOperation(results, optionsOrIsSuggestions) {
     addLog(`  ${r.label}: ${r.err ? `ERROR: ${r.err}` : `${r.count} ${verb}`}`)
   })
   addLog(`\n  GRAND TOTAL: ${grand} ${itemLabel} ${verb}`)
+}
 
+function finalizeOperation(results, optionsOrIsSuggestions) {
+  logSummary(results, optionsOrIsSuggestions)
   updateState({ status: 'done', results })
 }
 
@@ -2815,8 +2841,36 @@ async function startOperation(rawOptions) {
     const tabs = await discoverTabs(options)
     if (!tabs) return
 
-    const results = await processAllTabs(tabs, options, isSuggestions)
-    finalizeOperation(results, options)
+    // One run, several phases: tasks first, then Suggestions (resolveRunOptions).
+    // The per-phase options are built once per phase so per-run counters such
+    // as _remainingStarts stay object state shared by the phase's accounts.
+    const phases = options.phases || [{ opMode: options.opMode, item: options.item }]
+    const multiPhase = phases.length > 1
+    let results = state.results
+    for (const phase of phases) {
+      if (state.status !== 'running') break // a Reset between phases
+      const phaseOptions = { ...options, opMode: phase.opMode, item: phase.item }
+      if (multiPhase) {
+        addLog(
+          phaseOptions.dryRun ? '=== DRY RUN MODE ===' : OP_MODE_HEADERS[phaseOptions.opMode] || '=== ARCHIVE MODE ==='
+        )
+        addLog(`=== ITEM: ${phaseOptions.item.label} ===`)
+      }
+      const phaseResults = await processAllTabs(tabs, phaseOptions, isSuggestions)
+      if (multiPhase) {
+        // The popup's summary keeps the phases apart, so each row says whose
+        // phase it came from.
+        const phaseName = phaseOptions.item.type === 'suggestions' ? 'Suggestions' : 'Tasks'
+        for (const r of phaseResults) {
+          r.label = `${r.label} · ${phaseName}`
+          r.phase = phaseName
+        }
+      }
+      logSummary(phaseResults, phaseOptions)
+      results = results.concat(phaseResults)
+    }
+    // A Reset during the run (status idle) is never overwritten with done.
+    if (state.status === 'running') updateState({ status: 'done', results })
   } catch (e) {
     handleOperationError(e)
   } finally {
