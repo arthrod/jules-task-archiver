@@ -366,6 +366,11 @@ select.sel-btn {
   background: var(--mark);
 }
 
+/* A selected row is ink, so its box keeps a paper-coloured edge. */
+.menu .opt.cur .chk {
+  border-color: var(--bg);
+}
+
 .menu .opt .n {
   font-family: var(--mono);
   font-weight: 500;

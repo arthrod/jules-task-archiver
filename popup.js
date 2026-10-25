@@ -132,6 +132,9 @@ let selectedItemIds = [ITEM_ALL]
 // meanwhile, because narrowing or widening a saved selection silently would
 // change the next run.
 let missingItemIds = null
+// True once the items of a running or finished run are shown; the saved
+// selection, read in parallel, then doesn't replace them.
+let runItemsShown = false
 let activeOptionIndex = -1
 let optionEls = []
 
@@ -216,6 +219,9 @@ function renderItemsMenu() {
     groupEl.appendChild(opt)
     optionEls.push(opt)
   }
+  // A new state table can be shorter than the old one under an open menu.
+  activeOptionIndex = Math.min(activeOptionIndex, optionEls.length - 1)
+  if (isItemsMenuOpen()) setActiveOption(activeOptionIndex)
 }
 
 // Toggles one item (items.js keeps All and the task states apart) and saves
@@ -705,14 +711,17 @@ chrome.storage.sync.get(
   ],
   (syncData) => {
     loadSettings(syncData)
-    if (!isRunning()) {
+    if (!isRunning() && !runItemsShown) {
       if (Array.isArray(syncData.items)) {
         restoreItems(syncData.items)
       } else if (typeof syncData.item === 'string') {
         // The old popup's single choice moves to the new key once, so the
         // migration never runs on every toggle (sync storage limits writes).
+        // The old key goes only once the new one is written.
         restoreItems([syncData.item])
-        chrome.storage.sync.set({ items: [syncData.item] }, () => chrome.storage.sync.remove('item'))
+        chrome.storage.sync.set({ items: [syncData.item] }, () => {
+          if (!chrome.runtime.lastError) chrome.storage.sync.remove('item')
+        })
       } else if (syncData.items === undefined) {
         // Nothing saved yet: All, the every-task default.
         restoreItems([ITEM_ALL])
@@ -1615,6 +1624,7 @@ function rehydrateRunItems(options) {
   if (known.length === 0) return
   if (known.includes(ITEM_ALL) && known.some((id) => id !== ITEM_ALL && id !== ITEM_SUGGESTIONS)) return
   selectedItemIds = known
+  runItemsShown = true
   showSelection()
 }
 

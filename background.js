@@ -2684,7 +2684,11 @@ function initOperationState(options) {
   // run in parallel — a plain integer snapshot per tab would let every tab
   // spend the full cap. Decremented once per suggestion before the RPC; even
   // failed starts consume budget (the API call still happened).
-  if (isSuggestions && Number.isFinite(options.maxSuggestions)) {
+  // A run's Suggestions phase can follow its tasks phase.
+  const startsSuggestions = Array.isArray(options.phases)
+    ? options.phases.some((p) => p.opMode === 'suggestions')
+    : isSuggestions
+  if (startsSuggestions && Number.isFinite(options.maxSuggestions)) {
     options._remainingStarts = Math.max(0, Math.floor(options.maxSuggestions))
   }
   return isSuggestions
