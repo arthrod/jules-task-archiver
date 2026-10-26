@@ -6328,10 +6328,15 @@ describe('More Actions load choices', () => {
   const settle = async () => {
     for (let i = 0; i < 200; i++) await Promise.resolve()
   }
+  // The counts saved, each dated (the date itself is checked, then left out).
   const progressSaves = (env) =>
     env.sessionSetData
       .filter((data) => data.moreArchivedProgress)
-      .map((data) => JSON.parse(JSON.stringify(data.moreArchivedProgress)))
+      .map((data) => {
+        const { updatedAt, ...counts } = JSON.parse(JSON.stringify(data.moreArchivedProgress))
+        assert.ok(Number.isFinite(updatedAt), 'every count is dated')
+        return counts
+      })
 
   it('saves the count while it lists, at most every 500 ms', async () => {
     const env = setupMoreEnvironment({ settings: { perAccountParallel: 1 } })

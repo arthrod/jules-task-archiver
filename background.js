@@ -2971,7 +2971,10 @@ function validMoreView(view) {
   return view?.version === MORE_VIEW_VERSION && Array.isArray(view.items) && Array.isArray(view.notes)
 }
 
-// The view as it is now, as a copy to change.
+// The view as it is now, as a copy to change. A writer takes it once the
+// saved view is read (`moreViewReadyPromise`), so a woken worker changes the
+// saved view, never an empty one; and nothing waits between the copy and its
+// write, so no change made meanwhile is lost.
 function moreViewNow() {
   return moreView ? { ...moreView } : emptyMoreView()
 }
@@ -3006,7 +3009,6 @@ function moreViewRev(view, items, notes) {
 // Writes the view the popup reads. A write Chrome refuses (its quota) leaves
 // a small view without the items: the load itself still answers.
 async function writeMoreView(view) {
-  await moreViewReadyPromise
   moreView = { ...view, version: MORE_VIEW_VERSION, updatedAt: Date.now() }
   try {
     await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView })
@@ -3022,13 +3024,18 @@ async function writeMoreView(view) {
 // A Load starts: its id is minted before the listing, and the items shown
 // stay until the answer.
 async function moreViewLoading(id, category, repo) {
+  await moreViewReadyPromise
   const view = moreViewNow()
   view.loading = { id, category, repo, startedAt: Date.now() }
+  // This Load is the one that brings the list up to date.
+  view.error = null
+  view.outdated = false
   return writeMoreView(view)
 }
 
 // The Load answered: its items, notes and age are the ones shown.
 async function moreViewAnswered(id, category, repo, items, notes, cachedAt) {
+  await moreViewReadyPromise
   const view = moreViewNow()
   // An older Load's answer never overwrites a newer one's view.
   if (view.loading?.id !== id) return null
@@ -3048,6 +3055,7 @@ async function moreViewAnswered(id, category, repo, items, notes, cachedAt) {
 
 // The Load failed: the items shown stay, and the reason is shown with them.
 async function moreViewFailed(id, message) {
+  await moreViewReadyPromise
   const view = moreViewNow()
   if (view.loading?.id !== id) return null
   view.loading = null
@@ -3057,6 +3065,7 @@ async function moreViewFailed(id, message) {
 
 // The archived listing ended: its tasks join the items shown.
 async function moreViewArchived(loadId, items, notes, cachedAt) {
+  await moreViewReadyPromise
   const view = moreViewNow()
   // A newer Load replaced this one: its tasks are not shown.
   if (view.loadId !== loadId) return null
@@ -3072,6 +3081,7 @@ async function moreViewArchived(loadId, items, notes, cachedAt) {
 
 // The archived listing failed: the items shown stay, with the reason.
 async function moreViewArchivedFailed(loadId, message) {
+  await moreViewReadyPromise
   const view = moreViewNow()
   if (view.loadId !== loadId) return null
   const notes = [...view.notes, `Could not list the archived tasks: ${message}`]
@@ -3084,6 +3094,7 @@ async function moreViewArchivedFailed(loadId, message) {
 
 // An action that changed an item takes it out of the view too.
 async function moreViewDropped(keys) {
+  await moreViewReadyPromise
   const view = moreViewNow()
   const items = view.items.filter((item) => !keys.has(moreItemKey(item)))
   if (items.length === view.items.length) return null
@@ -3094,6 +3105,7 @@ async function moreViewDropped(keys) {
 
 // A run that may change Jules leaves the list shown out of date.
 async function moreViewOutdated() {
+  await moreViewReadyPromise
   const view = moreViewNow()
   if (view.outdated) return null
   view.outdated = true
@@ -3445,7 +3457,10 @@ function moreArchivedProgress(loadId) {
     clearTimeout(timer)
     timer = null
     // A newer load's count is the one to keep.
-    if (moreLoadId === loadId) chrome.storage.session.set({ moreArchivedProgress: { ...counts } })
+    // Dated, so a reopened popup tells a listing that goes on from one that stopped.
+    if (moreLoadId === loadId) {
+      chrome.storage.session.set({ moreArchivedProgress: { ...counts, updatedAt: Date.now() } })
+    }
   }
   const soon = () => {
     timer ??= setTimeout(save, 500)
@@ -3813,7 +3828,10 @@ async function startMoreOperation(msg) {
       })
     )
     if (!msg.dryRun) {
-      await saveMoreLoad()
+      // The actions are done: a load Chrome can't keep doesn't make them fail.
+      const notes = []
+      await saveMoreLoadOrNote(notes)
+      for (const note of notes) addLog(`WARNING: ${note}`)
       await moreViewDropped(dropped)
     }
     finalizeOperation(results, options)

@@ -2789,7 +2789,8 @@ describe('More Actions options', () => {
       'https://jules.google.com/task/done\nhttps://jules.google.com/task/review'
     ])
     assert.ok(!env.sent.some((msg) => msg.action === 'APPLY_ACTION'))
-    assert.strictEqual(el['#moreStatus'].textContent, 'Copied 2 session URLs.')
+    // The message joins the status line, after the counts.
+    assert.match(el['#moreStatus'].textContent, / · Copied 2 session URLs\.$/)
     assert.strictEqual(el['#moreList'].children[0].children[0].checked, true, 'the selection stays')
   })
 
@@ -2799,7 +2800,7 @@ describe('More Actions options', () => {
     await choose(env, 'copyUrl')
     await env.elements['#moreConfirm'].dispatchEvent('click')
     await env.tick()
-    assert.strictEqual(env.elements['#moreStatus'].textContent, 'Could not copy the URLs: Document is not focused.')
+    assert.match(env.elements['#moreStatus'].textContent, / · Could not copy the URLs: Document is not focused\.$/)
   })
 
   it('Delete schedule needs a second click on Confirm', async () => {

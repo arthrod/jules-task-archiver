@@ -97,6 +97,10 @@ let moreCategory = 'all'
 let moreArchivedRepos = null
 // When the listing's count last came in.
 let moreProgressAt = null
+// Set once a view or a count comes through onChanged: the read of the session
+// storage when the popup opens is older, and never replaces it.
+let moreViewChanged = false
+let moreProgressChanged = false
 // When the oldest cached list of the shown load was read; null when all of it is live.
 let moreCachedAt = null
 // The version of the worker's view of the load (background.js `moreView`).
@@ -1307,7 +1311,11 @@ for (const input of [moreAll, moreRepoScope]) {
   })
 }
 moreRepo.addEventListener('input', () => {
-  if (moreRepo.value.trim()) moreRepoScope.checked = true
+  // Typing a repo scopes the Load to it: a late restore leaves both alone.
+  if (moreRepo.value.trim()) {
+    moreRepoScope.checked = true
+    touch('more.repoScope')
+  }
   touch('more.repo')
   savePopupView()
   updateMoreControls()
@@ -1355,13 +1363,29 @@ function renderMoreStatus() {
     complete: `${count('task')} completed tasks`,
     archive: archived
   }[moreLoadedCategory()]
-  const parts = [counts, moreCacheAge(), ...moreViewNotes()]
+  const parts = [counts, moreCacheAge(), ...moreViewNotes(), moreNoteText()]
   // A listing that stopped must not lock the panel: Load stays free.
   if (stale) parts.push('The listing stopped. Load again.')
   if (moreView?.error) parts.push(moreView.error)
   if (moreView?.outdated) parts.push('Loaded before the last run; Load again to see it as it is now.')
   moreStatus.textContent = parts.filter(Boolean).join(' · ')
   updateMoreBusy()
+}
+
+// A message of the popup's own (a Load it could not send, a copy, an action
+// started) stays on the status line for 30 s, past the renders meanwhile.
+const MORE_NOTE_MS = 30000
+let moreNote = null
+
+function noteMore(text) {
+  moreNote = { text, at: Date.now() }
+  renderMoreStatus()
+}
+
+function moreNoteText() {
+  if (moreNote && Date.now() - moreNote.at < MORE_NOTE_MS) return moreNote.text
+  moreNote = null
+  return ''
 }
 
 // The list is busy while the worker lists.
@@ -1468,7 +1492,7 @@ async function loadMore(fresh) {
     })
     if (response?.error) throw new Error(response.error)
   } catch (e) {
-    moreStatus.textContent = e.message
+    noteMore(e.message)
   } finally {
     moreLoading = false
     moreLoad.textContent = 'Load'
@@ -1485,9 +1509,9 @@ async function copyMoreSessionUrls() {
   const urls = fittingMoreItems('copyUrl').map(moreSessionUrl)
   try {
     await navigator.clipboard.writeText(urls.join('\n'))
-    moreStatus.textContent = `Copied ${urls.length} session ${urls.length === 1 ? 'URL' : 'URLs'}.`
+    noteMore(`Copied ${urls.length} session ${urls.length === 1 ? 'URL' : 'URLs'}.`)
   } catch (e) {
-    moreStatus.textContent = `Could not copy the URLs: ${e.message}`
+    noteMore(`Could not copy the URLs: ${e.message}`)
   }
 }
 
@@ -1547,7 +1571,7 @@ moreConfirm.addEventListener('click', async (event) => {
       } else if (!dryRun) {
         for (const item of items) selectedMoreItems.delete(moreItemKey(item))
         renderMoreItems()
-        moreStatus.textContent = 'Load again to refresh item states after this action.'
+        noteMore('Load again to refresh item states after this action.')
       }
     }
   )
@@ -1703,11 +1727,15 @@ function restoreMoreAction(action) {
 // The worker's view of the last load and the popup's own place, read when
 // the popup opens.
 chrome.storage.session.get(['moreView', 'moreArchivedProgress', 'popupView'], (data) => {
+  // A view or a count that came through onChanged meanwhile is newer than
+  // this read: it stays.
   const view = data?.moreView
-  if (validMoreView(view)) setMoreView(view)
+  if (!moreViewChanged && validMoreView(view)) setMoreView(view)
   const progress = data?.moreArchivedProgress
-  if (progress && progress.loadId === moreView?.loadId && moreArchivedState() === 'loading') {
+  if (!moreProgressChanged && progress && progress.loadId === moreView?.loadId && moreArchivedState() === 'loading') {
     moreArchivedRepos = { done: progress.done, total: progress.total }
+    // The listing is alive while its count moves, also before this popup.
+    if (Number.isFinite(progress.updatedAt)) moreProgressAt = progress.updatedAt
   }
   const saved = data?.popupView
   restorePopupView(saved)
@@ -1772,9 +1800,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'session') return
   const view = changes.moreView?.newValue
   // A view of another version is ignored.
-  if (view && validMoreView(view)) applyMoreView(view)
+  if (view && validMoreView(view)) {
+    moreViewChanged = true
+    applyMoreView(view)
+  }
   const progress = changes.moreArchivedProgress?.newValue
   if (!progress) return
+  moreProgressChanged = true
   moreProgressAt = Date.now()
   if (progress.loadId !== moreView?.loadId || moreArchivedState() !== 'loading') return
   moreArchivedRepos = { done: progress.done, total: progress.total }
