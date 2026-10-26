@@ -3090,7 +3090,8 @@ describe('More Actions view', () => {
 
   it("never takes the worker's answer over a newer view", async () => {
     const full = moreView({ items })
-    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    // One date for both, however slow the clock between them.
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items, updatedAt: full.updatedAt }) } })
     let late
     answerViews(
       env,

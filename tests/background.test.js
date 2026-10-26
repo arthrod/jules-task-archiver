@@ -6076,6 +6076,19 @@ describe('More Actions view', () => {
     }
   })
 
+  it('a Load whose view Chrome refuses whole and small says its failure in its answer', async () => {
+    const env = setupMoreEnvironment()
+    const set = env.sandbox.chrome.storage.session.set
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreView) throw new Error('Session storage quota bytes exceeded.')
+      return set(data)
+    }
+    env.sandbox.getJulesTabs = async () => []
+    const reply = await env.load('', 'all')
+    assert.match(reply.error, /No Jules tabs found/)
+    assert.strictEqual(reply.inView, undefined, 'no saved view shows it')
+  })
+
   it('a write a newer one replaced, which Chrome refused, saved nothing', async () => {
     const env = setupMoreEnvironment()
     const load = await env.load('', 'all')
