@@ -4,7 +4,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const vm = require('node:vm')
 const path = require('node:path')
-const { RUN_PROTOCOL } = require('../settings.js')
+const { RUN_PROTOCOL, MORE_VIEW_TOO_LARGE } = require('../settings.js')
 
 const bgScriptPath = path.join(__dirname, '..', 'background.js')
 const utilsScriptPath = path.join(__dirname, '..', 'utils.js')
@@ -5960,7 +5960,7 @@ describe('More Actions view', () => {
     assert.ok(!/"?g1"?|"?g2"?/.test(text), 'no Google account id anywhere in the view')
   })
 
-  it('a view Chrome refuses becomes a small error view, and never fails the Load', async () => {
+  it('a view Chrome refuses is saved small, and never fails the Load', async () => {
     const env = setupMoreEnvironment()
     const set = env.sandbox.chrome.storage.session.set
     env.sandbox.chrome.storage.session.set = async (data) => {
@@ -5974,7 +5974,21 @@ describe('More Actions view', () => {
     assert.strictEqual(view.version, 1)
     assert.ok(!view.items?.length, 'the small view carries no items')
     assert.strictEqual(view.partial, true, 'the small view says its items are not in it')
-    assert.strictEqual(view.error, 'The list is too large to keep while the popup is closed. Load again.')
+    assert.strictEqual(view.error, null, 'the load had no error, and the small view adds none')
+  })
+
+  it('a view Chrome refuses keeps the error of the load', async () => {
+    const env = setupMoreEnvironment()
+    const set = env.sandbox.chrome.storage.session.set
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreView?.items?.length) throw new Error('Session storage quota bytes exceeded.')
+      return set(data)
+    }
+    const load = await env.load('', 'all')
+    await env.sandbox.moreViewArchivedFailed(load.loadId, 'no')
+    const view = env.view()
+    assert.strictEqual(view.partial, true)
+    assert.strictEqual(view.error, 'Could not list the archived tasks: no')
   })
 
   it('a full view whose items changed has a new rev, also after views Chrome refused', async () => {
@@ -6024,7 +6038,7 @@ describe('More Actions view', () => {
     assert.strictEqual(view.loadId, load.loadId)
     assert.ok(!view.partial, 'the answer holds the items')
     assert.ok(view.items.length > 0, 'the worker still holds the items')
-    assert.strictEqual(view.unsaved, true, 'the popup can say Chrome does not keep them')
+    assert.ok(!('unsaved' in view), 'a woken worker gives the items back too: nothing to warn of')
     assert.strictEqual(view.rev, saved.rev, 'one rev for both copies of the view')
     assert.strictEqual(view.updatedAt, saved.updatedAt, 'one write for both copies of the view')
     assert.ok(!view.items.some((item) => 'user' in item), 'no item carries the Google account')
@@ -6044,13 +6058,14 @@ describe('More Actions view', () => {
     const view = env.view()
     assert.ok(view.items.length > 0, 'the saved view holds the items again')
     assert.ok(!view.partial)
-    assert.ok(!view.unsaved)
-    assert.strictEqual(view.error, null, 'the too-large error was the saved copy only')
+    assert.ok(!('unsaved' in view))
+    assert.strictEqual(view.error, null)
   })
 
-  it('dates every write of the view after the one before', async () => {
+  it('dates every write of the view after the one before, on a clock that stands still', async () => {
     const env = setupMoreEnvironment()
     await env.load('', 'all')
+    env.sandbox.Date.now = () => 1000
     for (let i = 0; i < 5; i++) {
       await env.sandbox.moreViewLoading(`L${i}`, 'all', '')
       await env.sandbox.moreViewFailed(`L${i}`, 'no')
@@ -6058,6 +6073,92 @@ describe('More Actions view', () => {
     const times = env.sessionSetData.filter((data) => data.moreView).map((data) => data.moreView.updatedAt)
     for (let i = 1; i < times.length; i++) {
       assert.ok(times[i] > times[i - 1], `write ${i} is not dated after write ${i - 1}`)
+    }
+  })
+
+  it('a write a newer one replaced, which Chrome refused, saved nothing', async () => {
+    const env = setupMoreEnvironment()
+    const load = await env.load('', 'all')
+    const set = env.sandbox.chrome.storage.session.set
+    let release = null
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreView?.outdated && !release) {
+        await new Promise((resolve) => {
+          release = resolve
+        })
+        throw new Error('Session storage quota bytes exceeded.')
+      }
+      return set(data)
+    }
+    const outdated = env.sandbox.moreViewOutdated()
+    while (!release) await new Promise((resolve) => setTimeout(resolve, 0))
+    const failed = env.sandbox.moreViewArchivedFailed(load.loadId, 'no')
+    release()
+    assert.strictEqual(await outdated, null, 'it says it saved nothing')
+    assert.ok(await failed)
+    assert.strictEqual(env.view().error, 'Could not list the archived tasks: no', 'the newer view is the one saved')
+  })
+
+  it('a woken worker takes the items of a view Chrome could not keep from the load it kept', async () => {
+    const item = { kind: 'task', account: 'u/1', id: 'run', title: 'Run', state: 2, repo: 'Org/Repo' }
+    const other = { ...item, id: 'other' }
+    const saved = {
+      version: 1,
+      loadId: 'L1',
+      category: 'all',
+      repo: '',
+      items: [],
+      partial: true,
+      notes: ['A note'],
+      cachedAt: null,
+      archived: 'failed',
+      loading: null,
+      error: 'Could not list the archived tasks: no',
+      outdated: false,
+      rev: 3,
+      updatedAt: 1
+    }
+    const kept = { id: 'L1', repo: '', archived: false, items: [item, other].map((i) => ({ ...i, user: 'g1' })) }
+    const env = setupMoreEnvironment({}, { moreView: saved, moreItems: kept })
+    const reply = await moreMessage(env, { action: 'GET_MORE_VIEW', protocol: RUN_PROTOCOL })
+    const view = JSON.parse(JSON.stringify(reply.view))
+    assert.deepStrictEqual(view.items, [item, other], 'the kept items, without the Google account')
+    assert.ok(!view.partial)
+    assert.strictEqual(view.rev, 4, 'the rev rises: an open popup rebuilds its list')
+    assert.strictEqual(view.error, 'Could not list the archived tasks: no', 'the error of the load stays')
+    assert.deepStrictEqual(view.notes, ['A note'])
+  })
+
+  it('a woken worker without the load of a view Chrome could not keep says it is gone, under a new rev', async () => {
+    const saved = {
+      version: 1,
+      loadId: 'L1',
+      category: 'all',
+      repo: '',
+      items: [],
+      partial: true,
+      notes: [],
+      cachedAt: null,
+      archived: 'none',
+      loading: null,
+      error: null,
+      outdated: false,
+      rev: 3,
+      updatedAt: 1
+    }
+    // The load kept is another one (or none: Chrome could not keep it either).
+    for (const kept of [{ id: 'L0', repo: '', archived: false, items: [] }, null]) {
+      const env = setupMoreEnvironment({}, { moreView: saved, moreItems: kept })
+      const reply = await moreMessage(env, { action: 'GET_MORE_VIEW', protocol: RUN_PROTOCOL })
+      const view = JSON.parse(JSON.stringify(reply.view))
+      assert.deepStrictEqual(view.items, [])
+      assert.ok(!view.partial)
+      assert.strictEqual(view.rev, 4)
+      assert.strictEqual(view.error, MORE_VIEW_TOO_LARGE)
+      // The next write says it too, under the new rev.
+      await env.sandbox.moreViewOutdated()
+      assert.strictEqual(env.view().rev, 4)
+      assert.strictEqual(env.view().error, MORE_VIEW_TOO_LARGE)
     }
   })
 
@@ -6137,6 +6238,18 @@ describe('More Actions view', () => {
     const refused = await env.load('', 'everything')
     assert.match(refused.error, /category/i)
     assert.strictEqual(refused.inView, undefined)
+  })
+
+  it('a Load that a newer one replaced says its failure in its answer', async () => {
+    const env = setupMoreEnvironment()
+    env.sandbox.getJulesTabs = async () => {
+      // A newer Load starts while this one lists: the view is that one's.
+      await env.sandbox.moreViewLoading('L-newer', 'all', '')
+      return []
+    }
+    const reply = await env.load('', 'all')
+    assert.match(reply.error, /No Jules tabs found/)
+    assert.strictEqual(reply.inView, undefined)
   })
 
   it('a new Load clears the error and the out-of-date note of the last one', async () => {

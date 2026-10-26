@@ -13,7 +13,7 @@ const settingsJsPath = path.join(__dirname, '../settings.js')
 const settingsJs = fs.readFileSync(settingsJsPath, 'utf8')
 const popupHtml = fs.readFileSync(path.join(__dirname, '../popup.html'), 'utf8')
 const popupCss = fs.readFileSync(path.join(__dirname, '../popup.css'), 'utf8')
-const { RUN_PROTOCOL, START_OPTION_KEYS } = require('../settings.js')
+const { RUN_PROTOCOL, START_OPTION_KEYS, MORE_VIEW_TOO_LARGE } = require('../settings.js')
 
 /**
  * Creates a mock DOM element with basic functionality.
@@ -3003,8 +3003,7 @@ describe('More Actions view', () => {
 
   // A list too large for Chrome to keep: the saved view has no items, and the
   // worker, which still holds them, answers them to the open popup.
-  const tooLarge = 'The list is too large to keep while the popup is closed. Load again.'
-  const partialOf = (view) => ({ ...view, items: [], partial: true, error: tooLarge })
+  const partialOf = (view) => ({ ...view, items: [], partial: true })
   // The worker's answers to GET_MORE_VIEW: `answer()` gives the view, or a
   // promise of it for an answer that comes late.
   const answerViews = (env, answer) => {
@@ -3017,7 +3016,7 @@ describe('More Actions view', () => {
   }
 
   it('shows a list too large for Chrome to keep, from the worker, while the popup is open', async () => {
-    const full = moreView({ items, unsaved: true })
+    const full = moreView({ items })
     const env = setupPopupSandbox({ session: { moreView: partialOf(full) } })
     answerViews(env, () => full)
     env.load()
@@ -3025,15 +3024,12 @@ describe('More Actions view', () => {
     const el = env.elements
     assert.ok(env.sent.some((msg) => msg.action === 'GET_MORE_VIEW' && msg.protocol === RUN_PROTOCOL))
     assert.strictEqual(el['#moreList'].children.length, 3, "the worker's items are listed")
-    assert.doesNotMatch(el['#moreStatus'].textContent, /Load again\./)
-    assert.match(
-      el['#moreStatus'].textContent,
-      /Chrome can't keep a list this large: act on it before the popup closes\./
-    )
+    // A woken worker gives the items back too: there is nothing to warn of.
+    assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules')
   })
 
   it('keeps the selection of a list too large to keep through the next write', async () => {
-    let full = moreView({ items, unsaved: true })
+    let full = moreView({ items })
     const env = setupPopupSandbox({ session: { moreView: partialOf(full) } })
     answerViews(env, () => full)
     env.load()
@@ -3053,7 +3049,7 @@ describe('More Actions view', () => {
   })
 
   it('says the list is gone when the worker no longer holds it', async () => {
-    const full = moreView({ items, unsaved: true })
+    const full = moreView({ items })
     const env = setupPopupSandbox({ session: { moreView: partialOf(full) } })
     let answer = full
     answerViews(env, () => answer)
@@ -3061,20 +3057,39 @@ describe('More Actions view', () => {
     await env.tick()
     const el = env.elements
     assert.strictEqual(el['#moreList'].children.length, 3)
-    // The worker restarted: it has only the saved view, without the items.
-    answer = partialOf({ ...full, outdated: true, updatedAt: full.updatedAt + 1 })
-    env.sessionChange({ moreView: { newValue: answer } })
+    // The worker restarted without the load: its view has no items, under a new rev.
+    const later = { ...full, outdated: true, updatedAt: full.updatedAt + 1 }
+    answer = { ...later, items: [], error: MORE_VIEW_TOO_LARGE, rev: full.rev + 1 }
+    env.sessionChange({ moreView: { newValue: partialOf(later) } })
     await env.tick()
     assert.strictEqual(el['#moreList'].children.length, 0, 'no item of a list the worker lost stays')
-    assert.match(
-      el['#moreStatus'].textContent,
-      /The list is too large to keep while the popup is closed\. Load again\./
-    )
+    assert.ok(el['#moreStatus'].textContent.includes(MORE_VIEW_TOO_LARGE))
     assert.strictEqual(el['#moreSelectAll'].disabled, true)
   })
 
+  it('says Chrome could not keep the list when the worker does not answer', async () => {
+    const saved = partialOf(moreView({ items, error: 'Could not list the archived tasks: no' }))
+    const env = setupPopupSandbox({ session: { moreView: saved } })
+    const send = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) =>
+      msg.action === 'GET_MORE_VIEW' ? cb?.({ error: 'Could not establish connection.' }) : send(msg, cb)
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#moreList'].children.length, 0)
+    assert.ok(el['#moreStatus'].textContent.includes(MORE_VIEW_TOO_LARGE), 'it says the list is not here')
+    assert.match(el['#moreStatus'].textContent, /Could not list the archived tasks: no/, 'and the error of the load')
+  })
+
+  it('ignores a view without a date, which no worker writes', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items, updatedAt: undefined }) } })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children.length, 0)
+  })
+
   it("never takes the worker's answer over a newer view", async () => {
-    const full = moreView({ items, unsaved: true })
+    const full = moreView({ items })
     const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
     let late
     answerViews(
@@ -3834,7 +3849,7 @@ describe('The popup keeps its place', () => {
   })
 
   it("restores the selection of a list too large to keep, from the worker's items", async () => {
-    const full = moreView({ items: [task, schedule], unsaved: true })
+    const full = moreView({ items: [task, schedule] })
     const env = setupPopupSandbox({
       session: {
         moreView: { ...full, items: [], partial: true, error: 'too large' },
