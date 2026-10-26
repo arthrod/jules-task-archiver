@@ -1620,7 +1620,7 @@ function savePopupView() {
 // A saved repository filter goes to the dropdown when it is among its options,
 // and to the custom box when it is not: the typed repo wins over the dropdown.
 function applyRepoFilter(value) {
-  const options = repoFilterInput.options.map((option) => option.value)
+  const options = Array.from(repoFilterInput.options, (option) => option.value)
   if (!value) {
     repoFilterInput.value = ''
     customRepoInput.value = ''
@@ -1681,7 +1681,7 @@ function restorePopupView(view) {
 // actions are offered.
 function restoreMoreAction(action) {
   if (touched.has('more.action') || typeof action !== 'string') return
-  if (!moreAction.children.some((option) => option.value === action)) return
+  if (![...moreAction.children].some((option) => option.value === action)) return
   moreAction.value = action
   updateMoreControls()
 }
