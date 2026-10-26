@@ -3034,7 +3034,12 @@ async function writeMoreView(view) {
     // A newer write is on its way and saves its own view: this one saved nothing.
     if (moreView !== written) return null
     const small = { ...written, items: [], partial: true }
-    await chrome.storage.session.set({ [MORE_VIEW_KEY]: small }).catch(() => {})
+    // Refused too: no saved view shows this one.
+    const kept = await chrome.storage.session.set({ [MORE_VIEW_KEY]: small }).then(
+      () => true,
+      () => false
+    )
+    if (!kept) return null
   }
   return written
 }
