@@ -105,6 +105,18 @@ function createMockElement(tag = 'div', attrs = {}) {
   return element
 }
 
+// The static markup of popup.html (the listbox's role, its aria-multiselectable,
+// a title that must not be there) is copied onto the mock elements: the popup
+// reads and writes those attributes, so a test has to see them.
+const htmlAttributes = {}
+for (const tag of popupHtml.match(/<[a-zA-Z][^>]*>/g) || []) {
+  const id = tag.match(/\sid="([^"]+)"/)
+  if (!id) continue
+  const attrs = {}
+  for (const attr of tag.matchAll(/\s([a-zA-Z-]+)="([^"]*)"/g)) attrs[attr[1]] = attr[2]
+  htmlAttributes[id[1]] = attrs
+}
+
 /**
  * Creates a mock Chrome extension API.
  */
@@ -315,7 +327,7 @@ function setupPopupSandbox({
   const radioStates = { scope: 'all' }
 
   const elements = {}
-  for (const id of ELEMENT_IDS) elements[`#${id}`] = createMockElement('div')
+  for (const id of ELEMENT_IDS) elements[`#${id}`] = createMockElement('div', htmlAttributes[id] || {})
   elements['#repoFilter'] = createMockSelect()
   elements['#dryRun'].checked = true
   elements['#moreAll'].checked = true
@@ -392,6 +404,8 @@ function setupPopupSandbox({
   const options = () =>
     elements['#itemsMenu'].children.flatMap((g) => g.children.filter((c) => c.attributes.role === 'option'))
   const option = (label) => options().find((o) => o.attributes['aria-label'] === label)
+  // The check mark of an option: a .chk span, drawn in CSS, with no text.
+  const checkMark = (opt) => opt.children.find((c) => c.className === 'chk' || c.classList?.contains('chk'))
   const tick = () => new Promise((r) => setTimeout(r, 0))
 
   return {
@@ -410,6 +424,7 @@ function setupPopupSandbox({
     starts,
     options,
     option,
+    checkMark,
     tick,
     helloState
   }
@@ -448,9 +463,29 @@ describe('Items dropdown', () => {
     const env = setupPopupSandbox()
     env.load()
     const opt = env.option('Waiting on You (12)')
-    assert.strictEqual(opt.children[0].textContent, 'Waiting on You')
-    assert.strictEqual(opt.children[1].className, 'n')
-    assert.strictEqual(opt.children[1].textContent, '12')
+    const badge = opt.children.find((c) => c.className === 'n')
+    assert.strictEqual(badge.textContent, '12')
+    const names = opt.children.filter((c) => c !== badge).map((c) => c.textContent)
+    assert.ok(names.includes('Waiting on You'), names.join(', '))
+  })
+
+  it('is a multi-select listbox: every option says whether it is chosen', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    assert.strictEqual(String(env.elements['#itemsMenu'].getAttribute('aria-multiselectable')), 'true')
+    assert.strictEqual(env.option('All').attributes['aria-selected'], 'true')
+    for (const opt of env.options().filter((o) => o !== env.option('All'))) {
+      assert.strictEqual(opt.attributes['aria-selected'], 'false', opt.attributes['aria-label'])
+      const chk = env.checkMark(opt)
+      assert.ok(chk, `${opt.attributes['aria-label']} has a check mark`)
+      assert.strictEqual(String(chk.getAttribute('aria-hidden')), 'true')
+      assert.strictEqual(chk.textContent, '', 'the mark is drawn in CSS, it holds no text')
+    }
+    env.option('Error (4)').dispatchEvent('click')
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    assert.strictEqual(env.option('Error (4)').attributes['aria-selected'], 'true')
+    assert.strictEqual(env.option('Waiting on You (12)').attributes['aria-selected'], 'true')
+    assert.strictEqual(env.option('All').attributes['aria-selected'], 'false')
   })
 
   it('starts on All', () => {
@@ -460,7 +495,7 @@ describe('Items dropdown', () => {
     assert.strictEqual(env.option('All').attributes['aria-selected'], 'true')
   })
 
-  it('selects an option on click, closes the menu and remembers the choice', () => {
+  it('toggles an option on click, keeps the menu open and remembers the choice', () => {
     const env = setupPopupSandbox()
     env.load()
     env.elements['#itemsBtn'].dispatchEvent('click')
@@ -469,8 +504,71 @@ describe('Items dropdown', () => {
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4)')
     assert.strictEqual(env.option('Error (4)').attributes['aria-selected'], 'true')
     assert.strictEqual(env.option('All').attributes['aria-selected'], 'false')
+    assert.strictEqual(env.elements['#itemsBtn'].attributes['aria-expanded'], 'true', 'the menu stays open')
+    assert.strictEqual(
+      env.elements['#itemsMenu'].attributes['aria-activedescendant'],
+      env.option('Error (4)').id,
+      'the clicked option becomes the active one'
+    )
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:4'])
+    assert.strictEqual(env.syncStorage.item, undefined, 'the old single-item key is gone')
+    // The same option again takes it back out.
+    env.option('Error (4)').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), [])
+    // The Items button closes the menu again.
+    env.elements['#itemsBtn'].dispatchEvent('click')
     assert.strictEqual(env.elements['#itemsBtn'].attributes['aria-expanded'], 'false')
-    assert.strictEqual(env.syncStorage.item, 'state:4')
+  })
+
+  it('keeps All and the task states apart, and lets Suggestions join', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All')
+    // A task state replaces All.
+    env.option('Error (4)').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4)')
+    // All takes the task states back.
+    env.option('All').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All')
+    // Two task states live together.
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    env.option('Error (4)').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12), Error (4)')
+    // All swallows the task states again.
+    env.option('All').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All')
+    assert.strictEqual(env.option('Waiting on You (12)').attributes['aria-selected'], 'false')
+    assert.strictEqual(env.option('Error (4)').attributes['aria-selected'], 'false')
+    // Suggestions joins whatever is chosen.
+    env.option('Suggestions').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All, Suggestions')
+  })
+
+  it('opens on the first chosen item', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.option('Error (4)').dispatchEvent('click')
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    env.elements['#itemsBtn'].dispatchEvent('click')
+    assert.strictEqual(
+      env.elements['#itemsMenu'].attributes['aria-activedescendant'],
+      env.option('Waiting on You (12)').id
+    )
+  })
+
+  it('names the chosen items on the button', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All')
+    env.option('Error (4)').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4)')
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12), Error (4)')
+    env.option('Error (4)').dispatchEvent('click')
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
+    assert.strictEqual(env.elements['#itemsBtn'].getAttribute('title'), undefined, 'the button carries no tooltip')
   })
 
   it('works from the keyboard', () => {
@@ -484,21 +582,49 @@ describe('Items dropdown', () => {
     menu.dispatchEvent('keydown', { key: 'ArrowDown' })
     menu.dispatchEvent('keydown', { key: 'ArrowDown' })
     assert.strictEqual(menu.attributes['aria-activedescendant'], env.option('Awaiting Plan Approval (10)').id)
-    menu.dispatchEvent('keydown', { key: 'Enter' })
+    // Space toggles the active option and keeps the menu open.
+    menu.dispatchEvent('keydown', { key: ' ' })
+    assert.strictEqual(btn.attributes['aria-expanded'], 'true')
+    assert.strictEqual(env.option('Awaiting Plan Approval (10)').attributes['aria-selected'], 'true')
+    assert.strictEqual(env.option('All').attributes['aria-selected'], 'false')
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Awaiting Plan Approval (10)')
+    // Enter closes the menu and leaves the choice alone.
+    menu.dispatchEvent('keydown', { key: 'Enter' })
     assert.strictEqual(btn.attributes['aria-expanded'], 'false')
     assert.strictEqual(btn.focused, true)
-
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Awaiting Plan Approval (10)')
+    // Escape closes it too.
     btn.dispatchEvent('keydown', { key: 'Enter' })
     menu.dispatchEvent('keydown', { key: 'End' })
     assert.strictEqual(menu.attributes['aria-activedescendant'], env.option('Suggestions').id)
     menu.dispatchEvent('keydown', { key: 'Escape' })
     assert.strictEqual(btn.attributes['aria-expanded'], 'false')
+    assert.strictEqual(btn.focused, true)
     assert.strictEqual(
       env.elements['#itemsBtnText'].textContent,
       'Awaiting Plan Approval (10)',
       'Escape keeps the choice'
     )
+  })
+
+  it('keeps Space working when a shorter state table arrives under an open menu', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    const btn = env.elements['#itemsBtn']
+    const menu = env.elements['#itemsMenu']
+    btn.dispatchEvent('keydown', { key: 'ArrowDown' })
+    menu.dispatchEvent('keydown', { key: 'End' })
+    // A rediscovery brings a table of one state: All, that state, Suggestions.
+    env.sandbox.applyTaskStates([{ code: 12, name: 'Waiting on You', kind: 'feedback' }])
+    const ids = menu.children.flatMap((g) => g.children.map((c) => c.id)).filter(Boolean)
+    assert.ok(ids.includes(menu.attributes['aria-activedescendant']), 'the active option is one the menu still has')
+    assert.doesNotThrow(() => menu.dispatchEvent('keydown', { key: ' ' }))
+    assert.strictEqual(env.option('Suggestions').attributes['aria-selected'], 'true')
+  })
+
+  it('draws the check box border on a selected row', () => {
+    // A selected row is ink; an ink border on it would leave only the inner square.
+    assert.match(popupCss, /\.menu \.opt\.cur \.chk \{[^}]*border-color: var\(--bg\);/)
   })
 
   it('closes when clicking elsewhere', () => {
@@ -509,20 +635,99 @@ describe('Items dropdown', () => {
     assert.strictEqual(env.elements['#itemsBtn'].attributes['aria-expanded'], 'false')
   })
 
-  it('restores the remembered item', () => {
-    const env = setupPopupSandbox({ sync: { item: 'state:12' } })
+  it('restores the remembered items', () => {
+    const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
     env.load()
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
+    const several = setupPopupSandbox({ sync: { items: ['state:12', 'suggestions'] } })
+    several.load()
+    assert.strictEqual(several.elements['#itemsBtnText'].textContent, 'Waiting on You (12), Suggestions')
+  })
+
+  it('migrates the old saved item to the new key, once', () => {
+    const env = setupPopupSandbox({ sync: { item: 'state:12' } })
+    const writes = []
+    const removes = []
+    const { set, remove } = env.sandbox.chrome.storage.sync
+    env.sandbox.chrome.storage.sync.set = (obj, cb) => {
+      if ('items' in obj) writes.push(JSON.parse(JSON.stringify(obj.items)))
+      set(obj, cb)
+    }
+    env.sandbox.chrome.storage.sync.remove = (keys, cb) => {
+      removes.push(...[].concat(keys))
+      remove(keys, cb)
+    }
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
+    assert.deepStrictEqual(writes, [['state:12']])
+    assert.deepStrictEqual(removes, ['item'])
+    assert.strictEqual(env.syncStorage.item, undefined, 'the old key is removed')
+    // A later change writes the new key only; the migration does not run again.
+    env.option('Error (4)').dispatchEvent('click')
+    assert.deepStrictEqual(writes, [['state:12'], ['state:12', 'state:4']])
+    assert.deepStrictEqual(removes, ['item'], 'the old key is removed once')
+  })
+
+  it('keeps the old saved item when the new key cannot be written', () => {
+    const env = setupPopupSandbox({ sync: { item: 'state:12' } })
+    const runtime = env.sandbox.chrome.runtime
+    env.sandbox.chrome.storage.sync.set = (_obj, cb) => {
+      runtime.lastError = { message: 'QUOTA_BYTES_PER_ITEM quota exceeded' }
+      cb?.()
+      runtime.lastError = undefined
+    }
+    env.load()
+    // Removing it anyway would leave nothing saved, and the next open would pick All.
+    assert.strictEqual(env.syncStorage.item, 'state:12')
+  })
+
+  it('writes only the chosen items to sync storage', () => {
+    const env = setupPopupSandbox()
+    const writes = []
+    const set = env.sandbox.chrome.storage.sync.set
+    env.sandbox.chrome.storage.sync.set = (obj, cb) => {
+      writes.push(obj)
+      set(obj, cb)
+    }
+    env.load()
+    const afterLoad = writes.length
+    env.option('Error (4)').dispatchEvent('click')
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    const changes = writes.slice(afterLoad)
+    assert.strictEqual(changes.length, 2, 'one write per change')
+    for (const write of changes) assert.deepStrictEqual(Object.keys(write), ['items'], 'only the items are written')
+    assert.ok(Array.isArray(changes[1].items))
+    assert.deepStrictEqual([...changes[1].items].sort(), ['state:12', 'state:4'])
+  })
+
+  it('ignores a saved selection that breaks the rules', () => {
+    for (const saved of [['all', 'state:12'], 'state:12']) {
+      const env = setupPopupSandbox({ sync: { items: saved } })
+      env.load()
+      assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item', JSON.stringify(saved))
+      assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+      assert.strictEqual(env.elements['#archiveBtn'].disabled, true)
+    }
   })
 
   it('selects nothing, rather than All, for a remembered item that no longer exists', () => {
-    const env = setupPopupSandbox({ sync: { item: 'state:99' } })
+    const env = setupPopupSandbox({ sync: { items: ['state:99'] } })
     env.load()
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
     assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
     env.option('All').dispatchEvent('click')
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'All')
     assert.strictEqual(env.elements['#proceedBtn'].disabled, false)
+  })
+
+  it('disables Proceed and Archive when nothing is chosen', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.option('All').dispatchEvent('click')
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Choose an item')
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+    assert.strictEqual(env.elements['#archiveBtn'].disabled, true)
+    assert.strictEqual(env.elements['#exportBtn'].disabled, false, 'Export needs no item')
   })
 
   it('shows "One session for all" only for Suggestions', () => {
@@ -533,6 +738,8 @@ describe('Items dropdown', () => {
     env.option('Suggestions').dispatchEvent('click')
     assert.strictEqual(row.classList.contains('hidden'), false)
     env.option('Error (4)').dispatchEvent('click')
+    assert.strictEqual(row.classList.contains('hidden'), false, 'Suggestions stays chosen')
+    env.option('Suggestions').dispatchEvent('click')
     assert.strictEqual(row.classList.contains('hidden'), true)
   })
 
@@ -542,12 +749,35 @@ describe('Items dropdown', () => {
     const hint = env.elements['#messageHint']
     env.option('Waiting on You (12)').dispatchEvent('click')
     assert.match(hint.textContent, /Added after the default reply/)
+    env.option('Waiting on You (12)').dispatchEvent('click')
     env.option('Completed (3)').dispatchEvent('click')
     assert.match(hint.textContent, /follow-up/)
+    env.option('Completed (3)').dispatchEvent('click')
     env.option('Error (4)').dispatchEvent('click')
     assert.match(hint.textContent, /retry/)
+    env.option('Error (4)').dispatchEvent('click')
     env.option('Suggestions').dispatchEvent('click')
     assert.match(hint.textContent, /prompt/)
+  })
+
+  it('explains the message for several chosen items, one line per hint', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    const hint = env.elements['#messageHint']
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    env.option('Error (4)').dispatchEvent('click')
+    assert.match(hint.textContent, /Waiting on You: Added after the default reply\./)
+    assert.match(hint.textContent, /Error: Added after the default retry prompt\./)
+  })
+
+  it('joins the chosen items that share a hint under one line', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    const hint = env.elements['#messageHint']
+    env.option('In Progress (2)').dispatchEvent('click')
+    env.option('Planning (9)').dispatchEvent('click')
+    assert.match(hint.textContent, /In Progress, Planning: Sent to each running session\./)
+    assert.strictEqual(hint.textContent.match(/Sent to each running session/g).length, 1, 'one line for both')
   })
 })
 
@@ -635,7 +865,7 @@ describe('Message box', () => {
 })
 
 describe('Proceed, Archive and Export', () => {
-  it('Proceed sends a dry run of the chosen item by default', async () => {
+  it('Proceed sends a dry run of the chosen items by default', async () => {
     const env = setupPopupSandbox()
     env.load()
     env.option('Waiting on You (12)').dispatchEvent('click')
@@ -643,7 +873,7 @@ describe('Proceed, Archive and Export', () => {
     assert.deepStrictEqual(env.starts(), [
       {
         action: 'proceed',
-        item: 'state:12',
+        items: ['state:12'],
         dryRun: true,
         force: false,
         message: '',
@@ -663,7 +893,17 @@ describe('Proceed, Archive and Export', () => {
     await env.elements['#archiveBtn'].dispatchEvent('click')
     const [start] = env.starts()
     assert.strictEqual(start.action, 'archive')
-    assert.strictEqual(start.item, 'state:3')
+    assert.deepStrictEqual(start.items, ['state:3'])
+    assert.strictEqual('item' in start, false, 'the old single-item option is gone')
+  })
+
+  it('sends every chosen item', async () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.option('Waiting on You (12)').dispatchEvent('click')
+    env.option('Error (4)').dispatchEvent('click')
+    await env.elements['#proceedBtn'].dispatchEvent('click')
+    assert.deepStrictEqual(env.starts()[0].items, ['state:12', 'state:4'])
   })
 
   it('sends the message only when "Add a message" is checked', async () => {
@@ -698,10 +938,10 @@ describe('Proceed, Archive and Export', () => {
     env.option('Suggestions').dispatchEvent('click')
     await env.elements['#proceedBtn'].dispatchEvent('click')
     assert.deepStrictEqual(
-      env.starts().map((s) => [s.item, s.oneSession]),
+      env.starts().map((s) => [s.items, s.oneSession]),
       [
-        ['all', false],
-        ['suggestions', true]
+        [['all'], false],
+        [['all', 'suggestions'], true]
       ]
     )
   })
@@ -735,6 +975,8 @@ describe('Proceed, Archive and Export', () => {
     const [start] = env.starts()
     assert.strictEqual(start.action, 'export')
     assert.strictEqual(start.dryRun, false)
+    assert.strictEqual('items' in start, false, 'Export needs no items')
+    assert.strictEqual('item' in start, false)
   })
 
   it('disables every run button while a run is going and labels the one that started it', async () => {
@@ -768,6 +1010,24 @@ describe('Proceed, Archive and Export', () => {
       env.starts().map((s) => [s.action, s.activeTabId]),
       [['proceed', 7]]
     )
+  })
+
+  it('sends the items it confirmed, even when the choice changes while the current tab is looked up', async () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.radioStates.scope = 'current'
+    env.option('Error (4)').dispatchEvent('click')
+    let answer
+    env.sandbox.chrome.tabs.query = () =>
+      new Promise((resolve) => {
+        answer = () => resolve([{ id: 7 }])
+      })
+    const run = env.elements['#archiveBtn'].dispatchEvent('click')
+    // All would have needed its own confirmation; it was never confirmed.
+    env.option('All').dispatchEvent('click')
+    answer()
+    await run
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.starts()[0].items)), ['state:4'])
   })
 
   it('re-enables the buttons and shows the error when the background rejects the run', async () => {
@@ -938,13 +1198,27 @@ describe('Live-run confirmations', () => {
       env.elements['#addMessage'].checked = true
       env.elements['#message'].value = message
     }
-    env.option(label).dispatchEvent('click')
+    // The dropdown is a multi-select: a click takes the item out again, so
+    // only an item that is not chosen yet is clicked.
+    const opt = env.option(label)
+    if (opt.attributes['aria-selected'] !== 'true') opt.dispatchEvent('click')
     await env.elements[button].dispatchEvent('click')
   }
 
   it('asks before archiving every task, and stops when cancelled', async () => {
     const env = setupPopupSandbox({ confirm: () => false })
     await liveClick(env, 'All', '#archiveBtn')
+    assert.strictEqual(env.confirms.length, 1)
+    assert.match(env.confirms[0], /Archive every task/)
+    assert.deepStrictEqual(env.starts(), [])
+  })
+
+  it('asks before archiving every task when All is among the chosen items', async () => {
+    const env = setupPopupSandbox({ confirm: () => false })
+    env.load()
+    env.elements['#dryRun'].checked = false
+    env.option('Suggestions').dispatchEvent('click')
+    await env.elements['#archiveBtn'].dispatchEvent('click')
     assert.strictEqual(env.confirms.length, 1)
     assert.match(env.confirms[0], /Archive every task/)
     assert.deepStrictEqual(env.starts(), [])
@@ -1048,10 +1322,123 @@ describe('renderSummary', () => {
     const lines = env.elements['#summary'].children.map((c) => c.textContent)
     assert.deepStrictEqual(lines, ['u/0: 2 processed', 'u/1: ERROR - boom', 'TOTAL: 2 processed'])
   })
+
+  it('shows one total per phase when the rows carry a phase', () => {
+    const env = setupPopupSandbox()
+    env.load()
+    env.sandbox.renderSummary([
+      { label: 'u/0', count: 2, phase: 'Tasks' },
+      { label: 'u/1', count: 1, phase: 'Suggestions' }
+    ])
+    const lines = env.elements['#summary'].children.map((c) => c.textContent)
+    assert.ok(lines.includes('TOTAL Tasks: 2 processed'), lines.join(' | '))
+    assert.ok(lines.includes('TOTAL Suggestions: 1 processed'), lines.join(' | '))
+    assert.ok(!lines.includes('TOTAL: 3 processed'), 'no mixed total')
+  })
 })
 
 describe('Popup open', () => {
-  it('rehydrates a running operation started earlier', () => {
+  it('rehydrates the items a run was started with, without saving them', () => {
+    const env = setupPopupSandbox()
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (!cb) return
+      if (msg.action === 'GET_STATE') {
+        cb({
+          status: 'running',
+          log: ['x'],
+          progress: { archived: 0, skipped: 0, total: 0 },
+          options: { action: 'archive', dryRun: false, items: ['state:4', 'suggestions'] }
+        })
+      } else cb({ repos: ['a/b'] })
+    }
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4), Suggestions')
+    assert.notDeepStrictEqual(env.syncStorage.items, ['state:4', 'suggestions'], 'a rehydrated choice is not saved')
+    assert.strictEqual(env.elements['#archiveBtn'].textContent, '⏳ Archiving…')
+    assert.strictEqual(env.elements['#proceedBtn'].disabled, true)
+  })
+
+  it('keeps a choice made before the saved one is read', () => {
+    const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+    const pending = []
+    const get = env.sandbox.chrome.storage.sync.get
+    env.sandbox.chrome.storage.sync.get = (keys, cb) => {
+      // Chrome reads in order: a get sent before the click's write answers
+      // with the value from before it, however late the answer comes.
+      let found
+      get(keys, (res) => {
+        found = res
+      })
+      pending.push(() => cb(found))
+    }
+    env.load()
+    env.option('Error (4)').dispatchEvent('click')
+    for (const answer of pending) answer()
+    // Before the read, All is shown; the click swaps it for Error (4).
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4)')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:4'])
+  })
+
+  it("keeps a finished run's items when the saved choice is read after GET_STATE", () => {
+    const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+    // In Chrome the two answers come in either order; here the sync read is last.
+    const pending = []
+    const get = env.sandbox.chrome.storage.sync.get
+    env.sandbox.chrome.storage.sync.get = (keys, cb) => pending.push(() => get(keys, cb))
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (!cb) return
+      if (msg.action === 'GET_STATE') {
+        cb({
+          status: 'done',
+          log: ['x'],
+          progress: { archived: 0, skipped: 0, total: 0 },
+          results: [],
+          options: { action: 'archive', dryRun: true, items: ['state:4', 'suggestions'] }
+        })
+      } else cb({ repos: [] })
+    }
+    env.load()
+    for (const answer of pending) answer()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Error (4), Suggestions')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:12'], 'the saved choice is kept')
+  })
+
+  it('keeps the saved choice when the run carries no known item', () => {
+    const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (!cb) return
+      if (msg.action === 'GET_STATE') {
+        // A scheduled run sends a name, not an id.
+        cb({ status: 'running', log: [], progress: {}, options: { action: 'archive', items: ['Completed'] } })
+      } else cb({ repos: [] })
+    }
+    env.load()
+    assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
+  })
+
+  // A run with no items to show leaves the picker to the saved choice, in
+  // either order of the two answers: never the All it starts with.
+  for (const [name, options] of [
+    ['an Export', { action: 'export' }],
+    ['a scheduled run', { action: 'archive', items: ['Completed'] }]
+  ]) {
+    it(`restores the saved choice read after GET_STATE while ${name} runs`, () => {
+      const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+      const pending = []
+      const get = env.sandbox.chrome.storage.sync.get
+      env.sandbox.chrome.storage.sync.get = (keys, cb) => pending.push(() => get(keys, cb))
+      env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+        if (!cb) return
+        if (msg.action === 'GET_STATE') cb({ status: 'running', log: [], progress: {}, options })
+        else cb({ repos: [] })
+      }
+      env.load()
+      for (const answer of pending) answer()
+      assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
+    })
+  }
+
+  it('rehydrates a running operation started earlier (the old single item)', () => {
     const env = setupPopupSandbox()
     env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
       if (!cb) return
@@ -1405,7 +1792,7 @@ describe('Settings panel', () => {
       { code: 13, name: 'Waiting on You', kind: 'feedback' },
       { code: 3, name: 'Completed', kind: 'completed' }
     ]
-    const env = setupPopupSandbox({ sync: { item: 'state:13' }, local: { julesApi: { states } } })
+    const env = setupPopupSandbox({ sync: { items: ['state:13'] }, local: { julesApi: { states } } })
     const localGet = env.sandbox.chrome.storage.local.get
     env.sandbox.chrome.storage.local.get = (keys, cb) => setTimeout(() => localGet(keys, cb), 0)
     env.load()
@@ -1419,8 +1806,8 @@ describe('Settings panel', () => {
     assert.strictEqual(env.elements['#proceedBtn'].disabled, false)
     await env.elements['#proceedBtn'].dispatchEvent('click')
     assert.deepStrictEqual(
-      env.starts().map((s) => s.item),
-      ['state:13']
+      env.starts().map((s) => s.items),
+      [['state:13']]
     )
   })
 

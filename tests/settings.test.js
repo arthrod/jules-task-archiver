@@ -2,6 +2,7 @@ const { describe, it } = require('node:test')
 const assert = require('node:assert')
 const {
   RUN_PROTOCOL,
+  START_OPTION_KEYS,
   DEFAULT_SETTINGS,
   JULES_RPC_DEFAULTS,
   normalizeSettings,
@@ -318,9 +319,12 @@ describe('applyDiscovery', () => {
 })
 
 describe('More Actions protocol', () => {
-  it('requires protocol 6 and exposes rediscoverable action methods', () => {
-    // 6: LOAD_ITEMS and LOAD_ARCHIVED take `fresh` (Refresh, past the cache).
-    assert.strictEqual(RUN_PROTOCOL, 6)
+  it('requires protocol 7 and exposes rediscoverable action methods', () => {
+    // 7: START carries `items` (one or more Items) instead of a single `item`,
+    // so an old worker refuses the popup's runs instead of guessing one.
+    assert.strictEqual(RUN_PROTOCOL, 7)
+    assert.ok(START_OPTION_KEYS.includes('items'))
+    assert.ok(!START_OPTION_KEYS.includes('item'), 'item was replaced by items')
     for (const [method, id] of Object.entries({
       ListScheduledTasks: 'hvmRxc',
       PauseScheduledTask: 'gBUOb',

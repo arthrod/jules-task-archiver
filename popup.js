@@ -124,16 +124,22 @@ function readClampedNumber(input, min, max, fallback) {
 // =============================================================================
 
 let ITEMS = listItems()
-let selectedItemId = ITEM_ALL
-// A saved item the current task states don't have: a rediscovered state
-// whose table hasn't loaded yet, or one Jules dropped. Nothing is selected
-// meanwhile, because falling back to All would widen the next run.
-let missingItemId = null
+// The dropdown is multi-select: one or more of listItems()'s ids, in its
+// order. An empty selection is allowed; Proceed and Archive are disabled then.
+let selectedItemIds = [ITEM_ALL]
+// Saved ids the current task states don't have: a rediscovered state whose
+// table hasn't loaded yet, or one Jules dropped. Nothing is selected
+// meanwhile, because narrowing or widening a saved selection silently would
+// change the next run.
+let missingItemIds = null
+// True once the user picks items, or the items of a running or finished run
+// are shown; the saved selection, read in parallel, then doesn't replace them.
+let keepShownItems = false
 let activeOptionIndex = -1
 let optionEls = []
 
-function getSelectedItem() {
-  return ITEMS.find((i) => i.id === selectedItemId) || null
+function getSelectedItems() {
+  return ITEMS.filter((i) => selectedItemIds.includes(i.id))
 }
 
 function itemKind(item) {
@@ -185,9 +191,16 @@ function renderItemsMenu() {
     opt.id = optionDomId(item)
     opt.setAttribute('role', 'option')
     opt.setAttribute('aria-label', item.label)
-    opt.setAttribute('aria-selected', String(item.id === selectedItemId))
+    opt.setAttribute('aria-selected', String(selectedItemIds.includes(item.id)))
     opt.dataset.id = item.id
+    // The check mark is drawn in CSS and holds no text, so screen readers
+    // announce only the name and aria-selected.
+    const chk = document.createElement('span')
+    chk.className = 'chk'
+    chk.setAttribute('aria-hidden', 'true')
+    opt.appendChild(chk)
     const name = document.createElement('span')
+    name.className = 'lbl'
     name.textContent = item.name || item.label
     opt.appendChild(name)
     if (item.code !== undefined) {
@@ -197,39 +210,64 @@ function renderItemsMenu() {
       code.textContent = String(item.code)
       opt.appendChild(code)
     }
+    const index = optionEls.length
     opt.addEventListener('click', () => {
-      selectItem(item.id)
-      closeItemsMenu(true)
+      // The menu stays open, so several items can be picked in one go.
+      toggleSelectedItem(item.id)
+      setActiveOption(index)
     })
     groupEl.appendChild(opt)
     optionEls.push(opt)
   }
+  // A new state table can be shorter than the old one under an open menu.
+  activeOptionIndex = Math.min(activeOptionIndex, optionEls.length - 1)
+  if (isItemsMenuOpen()) setActiveOption(activeOptionIndex)
 }
 
-function selectItem(id, { save = true } = {}) {
+// Toggles one item (items.js keeps All and the task states apart) and saves
+// the new selection. Only the chosen ids are written, never anything else.
+function toggleSelectedItem(id) {
   if (!ITEMS.some((i) => i.id === id)) return
-  missingItemId = null
-  selectedItemId = id
-  showSelectedItem()
-  if (save) chrome.storage.sync.set({ item: id })
+  missingItemIds = null
+  keepShownItems = true
+  selectedItemIds = toggleItemSelection(selectedItemIds, id, ITEMS)
+  showSelection()
+  chrome.storage.sync.set({ items: selectedItemIds })
 }
 
-// Selects a saved item, or nothing while the task states lack it.
-function restoreItem(id) {
-  if (ITEMS.some((i) => i.id === id)) {
-    selectItem(id, { save: false })
+// A saved selection the rules can't hold (All beside a task state, a
+// duplicate, a non-string, not an array) is ignored, never guessed at.
+function validSavedItems(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return false
+  if (ids.some((id) => typeof id !== 'string')) return false
+  if (new Set(ids).size !== ids.length) return false
+  return !(ids.includes(ITEM_ALL) && ids.some((id) => id !== ITEM_ALL && id !== ITEM_SUGGESTIONS))
+}
+
+// Selects a saved selection, or nothing while the current task states lack
+// one of its ids; the full selection returns once they list it again.
+function restoreItems(ids) {
+  if (!validSavedItems(ids)) {
+    missingItemIds = null
+    selectedItemIds = []
+    showSelection()
     return
   }
-  missingItemId = id
-  selectedItemId = null
-  showSelectedItem()
+  if (ids.some((id) => !ITEMS.some((i) => i.id === id))) {
+    missingItemIds = [...ids]
+    selectedItemIds = []
+  } else {
+    missingItemIds = null
+    selectedItemIds = ITEMS.filter((i) => ids.includes(i.id)).map((i) => i.id)
+  }
+  showSelection()
 }
 
-function showSelectedItem() {
-  const item = getSelectedItem()
-  itemsBtnText.textContent = item ? item.label : 'Choose an item'
+function showSelection() {
+  const items = getSelectedItems()
+  itemsBtnText.textContent = items.length > 0 ? items.map((i) => i.label).join(', ') : 'Choose an item'
   for (const opt of optionEls) {
-    const selected = opt.dataset.id === selectedItemId
+    const selected = selectedItemIds.includes(opt.dataset.id)
     opt.setAttribute('aria-selected', String(selected))
     opt.classList.toggle('cur', selected)
   }
@@ -238,9 +276,20 @@ function showSelectedItem() {
 }
 
 function updateItemUI() {
-  const item = getSelectedItem()
-  oneSessionRow.classList.toggle('hidden', item?.type !== 'suggestions')
-  messageHint.textContent = item ? MESSAGE_HINTS[itemKind(item)] : ''
+  const items = getSelectedItems()
+  oneSessionRow.classList.toggle('hidden', !items.some((i) => i.type === 'suggestions'))
+  if (items.length <= 1) {
+    messageHint.textContent = items.length === 1 ? MESSAGE_HINTS[itemKind(items[0])] : ''
+    return
+  }
+  // One line per distinct hint, named by every chosen item that has it, so
+  // items sharing a hint (the running states, say) share a line too.
+  const namesByHint = new Map()
+  for (const item of items) {
+    const hint = MESSAGE_HINTS[itemKind(item)]
+    namesByHint.set(hint, [...(namesByHint.get(hint) || []), item.name || item.label])
+  }
+  messageHint.textContent = [...namesByHint].map(([hint, names]) => `${names.join(', ')}: ${hint}`).join(' ')
 }
 
 function setActiveOption(index) {
@@ -268,12 +317,9 @@ function openItemsMenu() {
   itemsBtn.setAttribute('aria-expanded', 'true')
   itemsBtn.classList.add('open')
   itemsMenu.classList.add('open')
-  setActiveOption(
-    Math.max(
-      0,
-      ITEMS.findIndex((i) => i.id === selectedItemId)
-    )
-  )
+  // The first chosen option, else the first one.
+  const first = selectedItemIds.map((id) => ITEMS.findIndex((i) => i.id === id)).filter((at) => at >= 0)
+  setActiveOption(first.length ? Math.min(...first) : 0)
   itemsMenu.focus()
 }
 
@@ -320,10 +366,14 @@ itemsMenu.addEventListener('keydown', (e) => {
       setActiveOption(optionEls.length - 1)
       break
     case 'Enter':
+      // Enter only closes the menu; Space is the key that toggles.
+      e.preventDefault()
+      closeItemsMenu(true)
+      break
     case ' ':
       e.preventDefault()
-      selectItem(optionEls[activeOptionIndex].dataset.id)
-      closeItemsMenu(true)
+      toggleSelectedItem(optionEls[activeOptionIndex].dataset.id)
+      setActiveOption(activeOptionIndex)
       break
     case 'Escape':
       e.preventDefault()
@@ -348,9 +398,9 @@ function applyTaskStates(states) {
   setTaskStates(states)
   ITEMS = listItems()
   renderItemsMenu()
-  restoreItem(missingItemId ?? selectedItemId)
+  restoreItems(missingItemIds ?? selectedItemIds)
 }
-selectItem(ITEM_ALL, { save: false })
+showSelection()
 
 // =============================================================================
 // Message box
@@ -650,6 +700,7 @@ chrome.storage.onChanged?.addListener((changes, area) => {
 chrome.storage.sync.get(
   [
     'ghOwner',
+    'items',
     'item',
     'message',
     'ghToken',
@@ -661,7 +712,26 @@ chrome.storage.sync.get(
   ],
   (syncData) => {
     loadSettings(syncData)
-    if (typeof syncData.item === 'string' && !isRunning()) restoreItem(syncData.item)
+    // A run with no items to show (Export, a scheduled run) leaves the picker
+    // to the saved choice, never to the All it starts with.
+    if (!keepShownItems) {
+      if (Array.isArray(syncData.items)) {
+        restoreItems(syncData.items)
+      } else if (typeof syncData.item === 'string') {
+        // The old popup's single choice moves to the new key once, so the
+        // migration never runs on every toggle (sync storage limits writes).
+        // The old key goes only once the new one is written.
+        restoreItems([syncData.item])
+        chrome.storage.sync.set({ items: [syncData.item] }, () => {
+          if (!chrome.runtime.lastError) chrome.storage.sync.remove('item')
+        })
+      } else if (syncData.items === undefined) {
+        // Nothing saved yet: All, the every-task default.
+        restoreItems([ITEM_ALL])
+      } else {
+        restoreItems(syncData.items) // not an array: ignored, nothing selected
+      }
+    }
     if (typeof syncData.message === 'string') messageInput.value = syncData.message
     schedEnabledInput.checked = syncData.schedEnabled === true
     if (syncData.schedIntervalMin !== undefined) schedIntervalInput.value = String(syncData.schedIntervalMin)
@@ -862,13 +932,13 @@ function setIdle() {
   updateRunButtons()
 }
 
-// Proceed and Archive need an item; nothing runs on a stale worker.
+// Proceed and Archive need at least one item; nothing runs on a stale worker.
 function updateRunButtons() {
   updateMoreControls()
   if (isRunning()) return
-  const noItem = !getSelectedItem()
-  proceedBtn.disabled = backgroundStale || noItem
-  archiveBtn.disabled = backgroundStale || noItem
+  const noItems = getSelectedItems().length === 0
+  proceedBtn.disabled = backgroundStale || noItems
+  archiveBtn.disabled = backgroundStale || noItems
   exportBtn.disabled = backgroundStale
 }
 
@@ -898,9 +968,11 @@ function showStaleBackground() {
   staleBanner.classList.remove('hidden')
 }
 
-// Live runs that can't be undone from the popup ask first.
-function confirmLiveRun(action, item, force, message) {
-  if (action === 'archive' && item.id === ITEM_ALL) {
+// Live runs that can't be undone from the popup ask first. All is checked
+// among the whole selection, since it covers every task state on its own.
+function confirmLiveRun(action, items, force, message) {
+  const allSelected = items.some((item) => item.id === ITEM_ALL)
+  if (action === 'archive' && allSelected) {
     return window.confirm(
       '⚠️ Archive every task?\n\nThis includes running sessions and sessions waiting on you.' +
         (force ? '\n\nForce is on: tasks with a matching open pull request are archived too.' : '')
@@ -911,7 +983,7 @@ function confirmLiveRun(action, item, force, message) {
       '⚠️ Force archive?\n\nTasks with a matching open pull request will be archived too.\n\nContinue?'
     )
   }
-  if (action === 'proceed' && force && item.id === ITEM_ALL && message) {
+  if (action === 'proceed' && force && allSelected && message) {
     return window.confirm(
       '⚠️ Force is on.\n\nCompleted tasks get your message as a follow-up, and each one starts a new run.\n\nContinue?'
     )
@@ -921,15 +993,15 @@ function confirmLiveRun(action, item, force, message) {
 
 async function startRun(action) {
   if (isRunning()) return
-  const item = getSelectedItem()
-  if (!item && action !== 'export') {
+  const items = getSelectedItems()
+  if (items.length === 0 && action !== 'export') {
     currentInfo.textContent = 'Choose an item first.'
     return
   }
   const dryRun = action === 'export' ? false : dryRunInput.checked
   const force = forceInput.checked
   const message = addMessageInput.checked ? (messageInput.value || '').trim().slice(0, MAX_MESSAGE_LEN) : ''
-  if (!dryRun && action !== 'export' && !confirmLiveRun(action, item, force, message)) return
+  if (!dryRun && action !== 'export' && !confirmLiveRun(action, items, force, message)) return
 
   // Lock the buttons before the first await so a second click can't start a
   // second run while the current tab is looked up.
@@ -968,15 +1040,17 @@ async function startRun(action) {
 
   const options = {
     action,
-    item: item?.id ?? null,
     dryRun,
     force,
     message,
-    oneSession: item?.type === 'suggestions' && oneSessionInput.checked,
+    oneSession: items.some((i) => i.type === 'suggestions') && oneSessionInput.checked,
     scope,
     activeTabId,
     repoFilter: (customRepoInput.value.trim() || repoFilterInput.value).trim()
   }
+  // Export needs no items; everything else sends the ids it confirmed, not a
+  // choice changed while the current tab was looked up.
+  if (action !== 'export') options.items = items.map((i) => i.id)
 
   // The worker can be replaced while the popup is open; ask right before.
   // The popup may have gone stale (an earlier check failing) while this one was out.
@@ -1511,10 +1585,22 @@ function renderSummary(results) {
     fragment.appendChild(div)
   }
 
-  const totalDiv = document.createElement('div')
-  totalDiv.className = 'total'
-  totalDiv.textContent = `TOTAL: ${grand} processed`
-  fragment.appendChild(totalDiv)
+  // A run of several phases keeps its totals apart; one mixed total would
+  // read as if one phase's work were the other's.
+  const phases = [...new Set(results.map((r) => r.phase).filter(Boolean))]
+  for (const phase of phases) {
+    const phaseTotal = results.filter((r) => r.phase === phase).reduce((sum, r) => sum + r.count, 0)
+    const phaseDiv = document.createElement('div')
+    phaseDiv.className = 'total'
+    phaseDiv.textContent = `TOTAL ${phase}: ${phaseTotal} processed`
+    fragment.appendChild(phaseDiv)
+  }
+  if (phases.length === 0) {
+    const totalDiv = document.createElement('div')
+    totalDiv.className = 'total'
+    totalDiv.textContent = `TOTAL: ${grand} processed`
+    fragment.appendChild(totalDiv)
+  }
 
   summaryDiv.appendChild(fragment)
 }
@@ -1528,10 +1614,28 @@ checkBackground().then((ok) => {
   updateMoreControls()
   lockSchedule(false)
 })
+// Shows the items a running or finished run was started with, best-effort
+// and without saving them: only ids the dropdown knows, never a name a
+// scheduled run sends, and never a selection the All rule refuses.
+function rehydrateRunItems(options) {
+  const ids = Array.isArray(options?.items)
+    ? options.items
+    : typeof options?.item?.id === 'string'
+      ? [options.item.id]
+      : null
+  if (!ids) return
+  const known = ITEMS.filter((i) => ids.includes(i.id)).map((i) => i.id)
+  if (known.length === 0) return
+  if (known.includes(ITEM_ALL) && known.some((id) => id !== ITEM_ALL && id !== ITEM_SUGGESTIONS)) return
+  selectedItemIds = known
+  keepShownItems = true
+  showSelection()
+}
+
 chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
   if (state && state.status !== 'idle') {
-    // Rehydrate the item the run was started with.
-    if (state.options?.item?.id) selectItem(state.options.item.id, { save: false })
+    // Rehydrate the items the run was started with.
+    rehydrateRunItems(state.options)
     if (state.status === 'running') setRunning(state.options?.action || 'proceed', state.options?.dryRun === true)
     renderState(state)
     if (state.status !== 'running') resetBtn.classList.remove('hidden')
