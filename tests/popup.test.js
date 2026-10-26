@@ -3114,6 +3114,76 @@ describe('More Actions view', () => {
     assert.match(env.elements['#moreStatus'].textContent, /The listing stopped\. Load again\./)
   })
 
+  // A popup that drives its own clock and the intervals it starts.
+  function clockedPopup(session) {
+    const timers = []
+    const env = setupPopupSandbox({ session })
+    env.sandbox.setInterval = (fn, ms) => timers.push({ fn, ms, on: true })
+    env.sandbox.clearInterval = (id) => {
+      if (timers[id - 1]) timers[id - 1].on = false
+    }
+    env.sandbox.__now = Date.now()
+    vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
+    env.timers = timers
+    env.wait = (ms) => {
+      env.sandbox.__now += ms
+      for (const timer of timers.filter((t) => t.on)) timer.fn()
+    }
+    return env
+  }
+
+  it('a reopened popup dates a long listing by its last count, not by the view', async () => {
+    const now = Date.now()
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ category: 'archive', archived: 'loading', updatedAt: now - 20 * 60000 }),
+        moreArchivedProgress: { loadId: 'L1', done: 5, total: 10, updatedAt: now - 60000 }
+      }
+    })
+    env.load()
+    await env.tick()
+    const status = env.elements['#moreStatus'].textContent
+    assert.match(status, /5 of 10 repos/)
+    assert.doesNotMatch(status, /The listing stopped/, 'the count moved a minute ago')
+  })
+
+  it("keeps the popup's own message on the status line for 30 seconds", async () => {
+    const env = clockedPopup({ moreView: moreView({ items, cachedAt: Date.now() }) })
+    const send = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (msg.action === 'LOAD_ITEMS') return cb?.({ error: 'Jules said no.' })
+      return send(msg, cb)
+    }
+    env.load()
+    await env.tick()
+    await env.elements['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.match(env.elements['#moreStatus'].textContent, /Jules said no\./)
+    env.wait(20000)
+    assert.match(
+      env.elements['#moreStatus'].textContent,
+      /Jules said no\./,
+      'the cache age ticks on, the message stays'
+    )
+    env.wait(11000)
+    assert.doesNotMatch(env.elements['#moreStatus'].textContent, /Jules said no\./, 'and goes after 30 s')
+  })
+
+  it('runs one status timer at a time, and stops it once the view is neither cached nor listing', async () => {
+    const env = clockedPopup({ moreView: moreView({ items, cachedAt: Date.now() }) })
+    env.load()
+    await env.tick()
+    for (const rev of [2, 3, 4]) {
+      env.sessionChange({ moreView: { newValue: moreView({ items, cachedAt: Date.now(), rev }) } })
+      await env.tick()
+    }
+    assert.strictEqual(env.timers.filter((t) => t.ms === 30000).length, 1, 'one timer for every view that moves')
+    env.sessionChange({ moreView: { newValue: moreView({ items, rev: 5 }) } })
+    await env.tick()
+    env.wait(30000)
+    assert.strictEqual(env.timers.filter((t) => t.on).length, 0, 'the timer stops with nothing to move')
+  })
+
   it('marks the list busy while the worker lists', async () => {
     const env = setupPopupSandbox({
       session: {
@@ -3552,6 +3622,31 @@ describe('The popup keeps its place', () => {
     // A run takes the custom box first: a saved repo there would retarget it.
     assert.strictEqual(env.elements['#customRepoInput'].value, '', 'the custom box stays empty')
     assert.strictEqual(env.elements['#repoFilter'].value, 'owner/scraped')
+  })
+
+  it('a More Actions repo typed before the restore answers keeps its repo scope', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ more: { ...saved().more, repoScope: false } }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    env.elements['#moreRepo'].value = 'org/typed'
+    await env.elements['#moreRepo'].dispatchEvent('input')
+    assert.strictEqual(env.elements['#moreRepoScope'].checked, true, 'typing a repo scopes the Load to it')
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreRepoScope'].checked, true, 'the next Load lists that repo, not all of them')
+    assert.strictEqual(env.elements['#moreRepo'].value, 'org/typed')
+  })
+
+  it('a view the worker wrote while the popup opened is not replaced by the older one read', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items: [task] }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    await env.tick()
+    env.sessionChange({ moreView: { newValue: moreView({ items: [task, schedule], loadId: 'L2', rev: 2 }) } })
+    await env.tick()
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children.length, 2, 'the newer view stays')
   })
 
   it('a repo typed before the repo list comes in keeps its place', async () => {

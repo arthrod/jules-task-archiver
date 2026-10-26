@@ -5228,8 +5228,8 @@ function moreMessage(env, msg, sender = {}) {
   })
 }
 
-function setupMoreEnvironment(sync = {}, storage = {}) {
-  const env = setupEnvironment(storage, sync)
+function setupMoreEnvironment(sync = {}, storage = {}, options = {}) {
+  const env = setupEnvironment(storage, sync, options)
   env.calls = []
   env.sandbox.getJulesTabs = async () => [
     { id: 1, url: 'https://jules.google.com/u/1/' },
@@ -5999,6 +5999,79 @@ describe('More Actions view', () => {
       assert.notStrictEqual(after.rev, before.rev, `write ${i} changed the items under the same rev`)
     }
   })
+
+  it('a woken worker changes the saved view, never an empty one, and loses no change', async () => {
+    let ready
+    const sessionReady = new Promise((resolve) => {
+      ready = resolve
+    })
+    const item = { kind: 'task', account: 'u/1', id: 'run', title: 'Run', state: 2, repo: 'Org/Repo' }
+    const other = { ...item, id: 'other' }
+    const saved = {
+      version: 1,
+      loadId: 'L1',
+      category: 'all',
+      repo: '',
+      items: [item, other],
+      notes: [],
+      cachedAt: null,
+      archived: 'none',
+      loading: null,
+      error: null,
+      outdated: false,
+      rev: 3,
+      updatedAt: 1
+    }
+    const env = setupMoreEnvironment({}, { moreView: saved }, { sessionReady })
+    // A scheduled run, and an action, change the view before the saved one is read.
+    const outdated = env.sandbox.moreViewOutdated()
+    const dropped = env.sandbox.moreViewDropped(new Set([env.sandbox.moreItemKey(item)]))
+    ready()
+    await Promise.all([outdated, dropped])
+    const view = env.view()
+    assert.strictEqual(view.loadId, 'L1', 'the saved load is the one changed')
+    assert.deepStrictEqual(
+      view.items.map((i) => i.id),
+      ['other'],
+      'the saved items stay, less the dropped one'
+    )
+    assert.strictEqual(view.outdated, true, 'neither change is lost')
+  })
+
+  it('a new Load clears the error and the out-of-date note of the last one', async () => {
+    const env = setupMoreEnvironment()
+    const load = await env.load('', 'all')
+    await env.sandbox.moreViewOutdated()
+    await env.sandbox.moreViewArchivedFailed(load.loadId, 'no')
+    assert.strictEqual(env.view().error, 'no', 'the last load carries an error')
+    const view = await env.sandbox.moreViewLoading('L9', 'all', '')
+    assert.strictEqual(view.outdated, false, 'the Load in progress is the one that brings the list up to date')
+    assert.strictEqual(view.error, null)
+  })
+
+  it('an action whose load Chrome cannot keep still ends done, and still drops its items', async () => {
+    const env = setupMoreEnvironment()
+    await env.load('', 'all')
+    const set = env.sandbox.chrome.storage.session.set
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (data.moreItems) throw new Error('Session storage quota bytes exceeded.')
+      return set(data)
+    }
+    await env.apply('pauseTask', [{ account: 'u/1', kind: 'task', id: 'running' }])
+    for (let i = 0; i < 250 && env.sandbox.test_state().status === 'running'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const state = env.sandbox.test_state()
+    assert.strictEqual(state.status, 'done', 'the paused task is not reported as a failure')
+    assert.ok(
+      !env.view().items.some((i) => i.account === 'u/1' && i.id === 'running'),
+      'the paused task leaves the view'
+    )
+    assert.ok(
+      state.log.some((line) => /could not keep/i.test(line)),
+      'the log says the list is not kept'
+    )
+  })
 })
 
 describe('More Actions load choices', () => {
@@ -6168,11 +6241,12 @@ describe('More Actions load choices', () => {
       .filter((data) => data.moreArchivedProgress)
       .map((data) => data.moreArchivedProgress)
     assert.ok(saved.length > 0)
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(saved.at(-1))), {
-      loadId: load.loadId,
-      done: 4,
-      total: 4
-    })
+    const last = JSON.parse(JSON.stringify(saved.at(-1)))
+    // The popup tells a listing that goes on from one that stopped by when
+    // the count last moved, also after it reopens.
+    assert.ok(Number.isFinite(last.updatedAt) && Date.now() - last.updatedAt < 60000, 'the count is dated')
+    delete last.updatedAt
+    assert.deepStrictEqual(last, { loadId: load.loadId, done: 4, total: 4 })
     env.sessionSetData.length = 0
     await env.loadArchive('org/repo')
     assert.ok(
