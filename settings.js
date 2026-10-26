@@ -16,6 +16,9 @@
 // another protocol or an option it doesn't know. Bump RUN_PROTOCOL whenever a
 // message between the two changes meaning.
 const RUN_PROTOCOL = 8
+// What the popup says when a More Actions list Chrome could not keep in its
+// session storage (background.js `moreView`, `partial`) can't be given back.
+const MORE_VIEW_TOO_LARGE = 'Chrome could not keep a list this large. Load again.'
 // Every option the popup may put in a START message.
 const START_OPTION_KEYS = [
   'action',
@@ -397,6 +400,7 @@ function applyDiscovery(current, found, builtInStates) {
 if (typeof module !== 'undefined') {
   module.exports = {
     RUN_PROTOCOL,
+    MORE_VIEW_TOO_LARGE,
     START_OPTION_KEYS,
     SETTINGS_KEY,
     SETTINGS_TEXT_FIELDS,

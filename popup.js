@@ -108,8 +108,6 @@ const MORE_VIEW_VERSION = 1
 // The newest view the popup has had (its `updatedAt`): an older one, or the
 // worker's answer about an older one, is not shown over it.
 let moreViewSeenAt = Number.NEGATIVE_INFINITY
-// What the popup says of a list Chrome can't keep (background.js `unsaved`).
-const MORE_VIEW_UNSAVED = "Chrome can't keep a list this large: act on it before the popup closes."
 // The scope of a run: every Jules tab, or the one that is open.
 let scopeValue = 'all'
 // A saved repository filter, applied when the dropdown knows its options.
@@ -1139,10 +1137,12 @@ function moreArchivedState() {
   return moreView?.archived ?? 'none'
 }
 
-// A view of another version, or one without items, is not used.
+// A view of another version, or one without items or a date, is not used.
 function validMoreView(view) {
   if (!view) return false
   if (view.version !== MORE_VIEW_VERSION) return false
+  // Every view the worker writes is dated: the popup orders views by it.
+  if (!Number.isFinite(view.updatedAt)) return false
   return Array.isArray(view.items) && Array.isArray(view.notes)
 }
 
@@ -1371,8 +1371,9 @@ function renderMoreStatus() {
   const parts = [counts, moreCacheAge(), ...moreViewNotes(), moreNoteText()]
   // A listing that stopped must not lock the panel: Load stays free.
   if (stale) parts.push('The listing stopped. Load again.')
+  // A list Chrome could not keep, which the worker did not give back.
+  if (moreView?.partial) parts.push(MORE_VIEW_TOO_LARGE)
   if (moreView?.error) parts.push(moreView.error)
-  if (moreView?.unsaved && !moreView.partial) parts.push(MORE_VIEW_UNSAVED)
   if (moreView?.outdated) parts.push('Loaded before the last run; Load again to see it as it is now.')
   moreStatus.textContent = parts.filter(Boolean).join(' · ')
   updateMoreBusy()

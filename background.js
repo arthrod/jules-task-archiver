@@ -2953,18 +2953,30 @@ async function saveMoreLoadOrNote(notes) {
 // again. It never holds the Google account of an item.
 const MORE_VIEW_KEY = 'moreView'
 const MORE_VIEW_VERSION = 1
-// What the popup says when Chrome could not keep the view.
-const MORE_VIEW_TOO_LARGE = 'The list is too large to keep while the popup is closed. Load again.'
 
 let moreView = null
-const moreViewReadyPromise = chrome.storage.session
-  .get(MORE_VIEW_KEY)
-  .then((data) => {
-    moreView = validMoreView(data?.[MORE_VIEW_KEY]) ? data[MORE_VIEW_KEY] : null
+const moreViewReadyPromise = Promise.all([chrome.storage.session.get(MORE_VIEW_KEY), moreItemsReadyPromise])
+  .then(([data]) => {
+    const saved = data?.[MORE_VIEW_KEY]
+    moreView = validMoreView(saved) ? wokenMoreView(saved) : null
   })
   .catch(() => {
     moreView = null
   })
+
+// A woken worker's view of a load Chrome could not keep (`partial`) takes its
+// items back from the load the worker kept (`moreItems`), which is saved
+// before every write of the view; without that load, the list is gone. The
+// rev rises either way, so an open popup rebuilds its list.
+function wokenMoreView(view) {
+  if (!view.partial) return view
+  const { partial: _partial, ...rest } = view
+  const rev = (view.rev ?? 0) + 1
+  if (view.loadId !== null && view.loadId === moreLoadId) {
+    return { ...rest, items: morePopupItems([...moreItems.values()]), rev }
+  }
+  return { ...rest, items: [], error: MORE_VIEW_TOO_LARGE, rev }
+}
 
 // A view of another version, or one without items, is not used.
 function validMoreView(view) {
@@ -3007,11 +3019,11 @@ function moreViewRev(view, items, notes) {
 }
 
 // Writes the view the popup reads. A write Chrome refuses (its quota) saves a
-// small view without the items (`partial`) and the error: the worker still
-// holds them (`unsaved`) and answers them to an open popup (GET_MORE_VIEW); a
-// worker that restarted holds the small view only.
+// small view without the items (`partial`): the worker still holds them and
+// answers them to the popup (GET_MORE_VIEW), and a woken worker takes them
+// back from the load it kept (wokenMoreView).
 async function writeMoreView(view) {
-  const { partial: _partial, unsaved: _unsaved, ...rest } = view
+  const { partial: _partial, ...rest } = view
   // Dated after the last write, so the popup can tell the newer of two views.
   const updatedAt = Math.max(Date.now(), (moreView?.updatedAt ?? 0) + 1)
   const written = { ...rest, version: MORE_VIEW_VERSION, updatedAt }
@@ -3019,13 +3031,17 @@ async function writeMoreView(view) {
   try {
     await chrome.storage.session.set({ [MORE_VIEW_KEY]: written })
   } catch {
-    // A newer write is on its way and saves its own view.
-    if (moreView !== written) return written
-    moreView = { ...written, unsaved: true }
-    const small = { ...written, items: [], partial: true, error: MORE_VIEW_TOO_LARGE }
-    await chrome.storage.session.set({ [MORE_VIEW_KEY]: small }).catch(() => {})
+    // A newer write is on its way and saves its own view: this one saved nothing.
+    if (moreView !== written) return null
+    const small = { ...written, items: [], partial: true }
+    // Refused too: no saved view shows this one.
+    const kept = await chrome.storage.session.set({ [MORE_VIEW_KEY]: small }).then(
+      () => true,
+      () => false
+    )
+    if (!kept) return null
   }
-  return moreView
+  return written
 }
 
 // A Load starts: its id is minted before the listing, and the items shown
