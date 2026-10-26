@@ -272,9 +272,15 @@ function createMockChrome(syncStorage, localStorage, sessionStorage, listeners, 
 function createMockSelect() {
   const select = createMockElement('select')
   select.value = ''
-  select.options = [{ value: '', textContent: 'All Repositories' }]
-  select.remove = (i) => select.options.splice(i, 1)
-  select.appendChild = (opt) => select.options.push(opt)
+  const list = [{ value: '', textContent: 'All Repositories' }]
+  // Like Chrome's HTMLOptionsCollection: indexed, with a length, iterable,
+  // but without array methods (no map or filter).
+  select.options = new Proxy(list, {
+    get: (target, key) =>
+      typeof key === 'string' && key !== 'length' && key in Array.prototype ? undefined : target[key]
+  })
+  select.remove = (i) => list.splice(i, 1)
+  select.appendChild = (opt) => list.push(opt)
   return select
 }
 
@@ -1590,7 +1596,7 @@ describe('Repository picker', () => {
     }
     env.load()
     assert.deepStrictEqual(
-      env.elements['#repoFilter'].options.map((o) => o.value),
+      Array.from(env.elements['#repoFilter'].options).map((o) => o.value),
       ['', 'a/one', 'b/two']
     )
   })
@@ -1600,7 +1606,7 @@ describe('Repository picker', () => {
     env.load()
     await env.tick()
     assert.deepStrictEqual(
-      env.elements['#repoFilter'].options.map((o) => o.value),
+      Array.from(env.elements['#repoFilter'].options).map((o) => o.value),
       ['', 'owner/scraped']
     )
   })
@@ -3164,6 +3170,16 @@ describe('More Actions view', () => {
 // The popup keeps its place (SPEC-B): the panel, the controls and the choice
 // of the More Actions list survive the popup closing.
 describe('The popup keeps its place', () => {
+  it('never calls array methods on DOM collections, which have none in Chrome', () => {
+    // The mock DOM hands out plain arrays; Chrome's HTMLCollection and
+    // HTMLOptionsCollection have no map, some or filter, so a restore that
+    // uses one throws in the browser and stops halfway.
+    const misuse = popupJs.match(
+      /\.(children|options|childNodes)\.(map|filter|some|every|find|findIndex|flatMap|reduce|includes|indexOf|forEach)\(/g
+    )
+    assert.strictEqual(misuse, null)
+  })
+
   const accounts = [
     {
       account: 'u/1',
@@ -3457,7 +3473,7 @@ describe('The popup keeps its place', () => {
     env.load()
     await env.tick()
     assert.deepStrictEqual(
-      env.elements['#repoFilter'].options.map((option) => option.value),
+      Array.from(env.elements['#repoFilter'].options).map((option) => option.value),
       ['', 'owner/scraped']
     )
     assert.strictEqual(env.elements['#customRepoInput'].value, 'org/other')
