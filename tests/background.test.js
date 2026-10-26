@@ -6159,9 +6159,14 @@ describe('More Actions view', () => {
       rev: 3,
       updatedAt: 1
     }
-    // The load kept is another one (or none: Chrome could not keep it either).
-    for (const kept of [{ id: 'L0', repo: '', archived: false, items: [] }, null]) {
-      const env = setupMoreEnvironment({}, { moreView: saved, moreItems: kept })
+    // The load kept is another one, or none (Chrome could not keep it either),
+    // and a view of no load never matches the worker having none.
+    for (const [stored, kept] of [
+      [saved, { id: 'L0', repo: '', archived: false, items: [] }],
+      [saved, null],
+      [{ ...saved, loadId: null }, null]
+    ]) {
+      const env = setupMoreEnvironment({}, { moreView: stored, moreItems: kept })
       const reply = await moreMessage(env, { action: 'GET_MORE_VIEW', protocol: RUN_PROTOCOL })
       const view = JSON.parse(JSON.stringify(reply.view))
       assert.deepStrictEqual(view.items, [])
