@@ -25,6 +25,8 @@ env:
 # Release lane: dispatch-only (release_type=beta|stable); push never releases.
   RELEASE_TYPE: ${{ inputs.release_type }}
 
+# The fork has no GitHub App: the built-in token releases, and main is not
+# protected, so it can push the release commit and tag.
 permissions:
   contents: write
 
@@ -46,22 +48,14 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_KEY }}
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - uses: n24q02m/better-semantic-release@4bab853128d17c7d8d0173c79883624e77a3ead6 # v1.12.0
         id: release
         with:
-          github_token: ${{ steps.app-token.outputs.token }}
+          github_token: ${{ github.token }}
           config_file: semantic-release.toml
           prerelease: ${{ env.RELEASE_TYPE == 'beta' }}
           prerelease_token: beta
@@ -70,7 +64,7 @@ jobs:
       - uses: python-semantic-release/publish-action@99d4062dd393b5a7a62c5fe9ed78fb364b5674f2 # v10.7.0
         if: steps.release.outputs.released == 'true'
         with:
-          github_token: ${{ steps.app-token.outputs.token }}
+          github_token: ${{ github.token }}
           tag: ${{ steps.release.outputs.tag }}
 
   package:
@@ -83,13 +77,6 @@ jobs:
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_KEY }}
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -117,11 +104,14 @@ jobs:
             popup.js \
             popup.css \
             utils.js \
+            license.html \
+            license.css \
+            LICENSE \
             icons/
 
       - name: Upload to GitHub Release
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
         run: |
           gh release upload "$TAG" jules-task-archiver.zip --clobber

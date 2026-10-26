@@ -410,7 +410,7 @@ describe('Orchestrator Privilege Escalation Security', () => {
 
     assert.ok(listener, 'Background message listener should be registered')
 
-    const privilegedActions = ['START', 'RESET', 'GET_STATE']
+    const privilegedActions = ['START', 'RESET', 'GET_STATE', 'GET_ALL_SOURCES']
 
     for (const action of privilegedActions) {
       let responseData = null

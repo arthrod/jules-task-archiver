@@ -23,9 +23,14 @@ popup.js (UI) <-> background.js (batchexecute client) <-> content.js (token extr
                 chrome.storage.sync (settings)
 ```
 
-Two operation modes:
+Five operation modes:
 1. **Archive Tasks** -- ListTasks (p1Takd) -> check GitHub PRs -> ArchiveTask (Tjmm5c)
-2. **Start Suggestions** -- ListTasks -> discover repos -> ListSuggestions (hQP40d) -> StartSuggestion (Rja83d)
+2. **Start Suggestions** -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> cap to remaining daily quota (KQOO7) -> StartSuggestion (Rja83d)
+3. **Batch Agent** -- ListSources -> ListSuggestions (hQP40d) per repo -> ONE StartSuggestion (Rja83d) per repo whose prompt carries every suggestion; same toggle + daily-quota (KQOO7) rules as Start Suggestions, except an explicitly chosen owner/repo is used as-is.
+4. **Remove Suggestions** -- ListSources (YqkSHd) filtered to Suggestions-enabled repos -> ListSuggestions (hQP40d) per repo -> DismissSuggestion (sc1vFf) per suggestion.
+5. **Export Suggestions JSON** -- ListSources (all connected repos, read-only) -> ListSuggestions (hQP40d) per repo -> JSON file via chrome.downloads (re-downloadable from the popup).
+
+Every mode accepts an optional repository filter (popup dropdown or typed `owner/repo`); empty = all repos. Matching is exact and case-insensitive (`owner/plate` never matches `owner/plate-docs`).
 
 Content script extracts auth tokens (SNlM0e, cfb2h, FdrFJe) from `WIZ_global_data` via MAIN world script injection. Also observes fetch() for Rja83d calls to capture model config and experiment IDs.
 
@@ -37,6 +42,7 @@ Background service worker makes all API calls. No DOM automation.
 - `Tjmm5c` -- ArchiveTask (taskId, action)
 - `hQP40d` -- ListSuggestions (repo)
 - `Rja83d` -- StartSuggestion (prompt, model config, repo, experiment IDs)
+- `sc1vFf` -- DismissSuggestion (suggestionId, [1]=2 dismiss)
 
 ## Development
 
@@ -60,6 +66,7 @@ Tag format: `v{version}`. PSR config: `semantic-release.toml`.
 ## CD Pipeline
 
 workflow_dispatch (beta/stable) -> PSR v10 -> zip extension files -> upload to GitHub Release.
+Both jobs use the built-in `GITHUB_TOKEN` (`contents: write`): the repo is a fork with no GitHub App, and `main` is not protected.
 No Docker, no npm/pypi, no MCP registry.
 
 ## Important Notes
@@ -67,6 +74,7 @@ No Docker, no npm/pypi, no MCP registry.
 - Zero dependencies -- vanilla JS, no build step
 - Biome for linting (biome.json config): single quotes, no semicolons, 120 line width
 - batchexecute responses have XSS prefix `)]}'` and may contain raw control chars in JSON strings
+- Tjmm5c archives in batches of 50; a batch rejected with an RPC error code (e.g. `[4]` DEADLINE_EXCEEDED) is retried in chunks of 10
 - Service worker keepAlive: `setInterval` calling `chrome.runtime.getPlatformInfo()` every 25s
 - State persisted in `chrome.storage.session` -- survives SW restart
 - Tests use `vm.createContext` sandbox to mock Chrome APIs
