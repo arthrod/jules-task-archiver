@@ -712,7 +712,9 @@ chrome.storage.sync.get(
   ],
   (syncData) => {
     loadSettings(syncData)
-    if (!isRunning() && !keepShownItems) {
+    // A run with no items to show (Export, a scheduled run) leaves the picker
+    // to the saved choice, never to the All it starts with.
+    if (!keepShownItems) {
       if (Array.isArray(syncData.items)) {
         restoreItems(syncData.items)
       } else if (typeof syncData.item === 'string') {
