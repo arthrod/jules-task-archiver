@@ -104,6 +104,9 @@ jobs:
             popup.js \
             popup.css \
             utils.js \
+            items.js \
+            settings.js \
+            fonts/ \
             license.html \
             license.css \
             LICENSE \

@@ -1,5 +1,5 @@
 // Modified by tommyzed: Added repository filtering and suggestions
-importScripts('utils.js')
+importScripts('utils.js', 'items.js', 'settings.js')
 /**
  * Jules Task Archiver v2 — Background Service Worker
  *
@@ -17,26 +17,108 @@ const JULES_ORIGIN = 'https://jules.google.com'
 // repos/tasks does not fire hundreds of simultaneous fetches at once.
 const API_CONCURRENCY = 5
 
-// Archive fan-out. Accounts (tabs) are processed in parallel; each account
-// drains its own pool, while a shared global limiter caps the TOTAL in-flight
-// archive requests across all accounts so parallel work cannot overwhelm Jules
-// (which rate-limits with HTTP 429). Retries with backoff absorb the rest.
-const PER_ACCOUNT_CONCURRENCY = 6
-const GLOBAL_CONCURRENCY = 12
-// Tjmm5c (ArchiveTask) accepts an array of task IDs, so archive in batches to cut
-// the request count (was 1 request per task). One batch = one batchexecute call.
-const ARCHIVE_BATCH_SIZE = 50
-// A 50-id batch can be rejected with an RPC error code (seen live: [4],
-// DEADLINE_EXCEEDED, on 2 of 147 batches) while the same ids succeed in
-// smaller chunks, so a rejected batch is retried at this size. Not anchored:
-// callBatchExecute rethrows as "batchexecute Tjmm5c failed: RPC Tjmm5c error code [4]".
-const ARCHIVE_SPLIT_SIZE = 10
+// Fan-out. Accounts (tabs) are processed in parallel; each account drains its
+// own pool of settings.perAccountParallel, while a shared limiter caps the
+// TOTAL in-flight requests at settings.totalParallel so parallel work cannot
+// overwhelm Jules (which rate-limits with HTTP 429).
+// ArchiveTasks takes an array of task IDs, so tasks are archived in batches of
+// julesApi.archiveBatch (50). A 50-id batch can be rejected with an RPC error
+// code (seen live: [4], DEADLINE_EXCEEDED, on 2 of 147 batches) while the same
+// ids succeed in smaller chunks, so a rejected batch is retried in chunks of
+// julesApi.archiveSplit (10). Not anchored: callBatchExecute rethrows as
+// "batchexecute Tjmm5c failed: RPC Tjmm5c error code [4]".
 const RPC_ERROR_CODE_REGEX = /\bRPC \w+ error code \[/
 
 // ⚡ Bolt Optimization: After parsing the URL, use a fast regex test to extract
 // the account ID instead of allocating string arrays via `.split('/')`. This avoids
 // object allocation overhead while preserving the original strict URL validation.
 const ACCOUNT_NUM_REGEX = /\/u\/(\d+)(?:\/|$)/
+
+// =============================================================================
+// Settings and Jules API values (settings.js)
+// =============================================================================
+
+// Kept in memory and refreshed from storage (see the onChanged listener), so
+// every request reads the values in force at that moment.
+let settings = normalizeSettings()
+let julesApi = normalizeJulesApi()
+
+// New values (from a rediscovery or the Settings panel) wait for the run in
+// progress to end, so one run never mixes two sets of RPC ids or states.
+let pendingJulesApi = null
+
+function applyJulesApi(raw) {
+  if (state.status === 'running') {
+    pendingJulesApi = { raw }
+    return
+  }
+  pendingJulesApi = null
+  julesApi = normalizeJulesApi(raw)
+  setTaskStates(julesApi.states)
+}
+
+function applyPendingJulesApi() {
+  if (pendingJulesApi) applyJulesApi(pendingJulesApi.raw)
+}
+
+// The sync values behind `settings`, kept so a change to one key can be
+// merged with the rest.
+const syncSettings = {}
+
+// A change that lands while the start-up read is in flight is newer than
+// what that read returns, so the read doesn't overwrite it.
+const changedSinceStart = { syncKeys: new Set(), julesApi: false }
+
+// Why the start-up read failed, or null. Runs refuse to start meanwhile:
+// running on the defaults would drop "Run up to N" and the saved RPC ids.
+let settingsLoadError = null
+
+const settingsReadyPromise = Promise.allSettled([
+  chrome.storage?.sync?.get?.(SETTINGS_SYNC_KEYS),
+  chrome.storage?.local?.get?.(JULES_API_KEY)
+]).then(([syncRead, localRead]) => {
+  if (syncRead.status === 'fulfilled') {
+    for (const key of SETTINGS_SYNC_KEYS) {
+      if (!changedSinceStart.syncKeys.has(key)) syncSettings[key] = syncRead.value?.[key]
+    }
+    settings = settingsFromSync(syncSettings)
+  }
+  if (localRead.status === 'fulfilled' && !changedSinceStart.julesApi) applyJulesApi(localRead.value?.[JULES_API_KEY])
+  const failed = [syncRead, localRead].find((read) => read.status === 'rejected')
+  if (failed) {
+    settingsLoadError = failed.reason?.message || String(failed.reason)
+    console.error('[JTA] Could not load settings:', failed.reason)
+  }
+})
+
+function settingsProblem() {
+  if (!settingsLoadError) return null
+  return `Could not read the settings (${settingsLoadError}). Reload the extension at chrome://extensions.`
+}
+
+// The popup saves settings to sync and the Jules API values to local storage.
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  const syncKeys = area === 'sync' ? SETTINGS_SYNC_KEYS.filter((key) => key in changes) : []
+  for (const key of syncKeys) {
+    changedSinceStart.syncKeys.add(key)
+    syncSettings[key] = changes[key].newValue
+  }
+  if (syncKeys.length) settings = settingsFromSync(syncSettings)
+  if (area === 'local' && JULES_API_KEY in changes) {
+    changedSinceStart.julesApi = true
+    applyJulesApi(changes[JULES_API_KEY].newValue)
+  }
+})
+
+// The RPC id Jules uses today for a SweBotService method (see settings.js). A
+// method a rediscovery put in doubt may hold another method's id, so it is
+// never sent.
+function rpc(method) {
+  if (julesApi.inDoubt.includes(method)) {
+    throw new Error(`Jules' ${method} id is in doubt: Rediscover from Jules or Reset to defaults in Settings first.`)
+  }
+  return julesApi.rpc[method]
+}
 
 // =============================================================================
 // Scheduling (chrome.alarms)
@@ -114,29 +196,48 @@ async function syncScheduleAlarm() {
   }
 }
 
-// One alarm tick: archive (normal mode — finished-state filter + open-PR check,
-// same defaults a manual Run uses; Force stays a deliberate manual choice), then
-// optionally start queued suggestions with a per-tick global cap.
+// One alarm tick: archive Completed tasks (with the open-PR check; Force stays
+// a deliberate manual choice), then optionally start queued suggestions with a
+// per-tick global cap.
 async function runScheduledTick() {
-  await stateReadyPromise
-  if (state.status === 'running') {
+  await Promise.all([stateReadyPromise, settingsReadyPromise])
+  if (settingsProblem()) {
+    console.error('[JTA] Scheduled tick skipped:', settingsProblem())
+    return
+  }
+  const cfg = await getScheduleConfig()
+  if (!cfg.schedEnabled) return // defensive: config toggled off after alarm fired
+  if (state.status === 'running' || startPending) {
     // A manual operation is in flight; skipping is safer than racing two bulk
     // runs against the same accounts (Jules rate-limits with HTTP 429).
     console.log('[JTA] Scheduled tick skipped: operation already running')
     return
   }
-  const cfg = await getScheduleConfig()
-  if (!cfg.schedEnabled) return // defensive: config toggled off after alarm fired
 
-  await startOperation({ dryRun: false, force: false, scope: 'all', opMode: 'archive', scheduled: true })
-  if (cfg.schedStartSuggestions) {
+  // The two steps are one run: they share the Run up to N budget, and an
+  // account the archive step paused or stopped stays so for the suggestions.
+  // Reset here, before either step, so a step that fails early can't skip it.
+  resetRunLimits()
+  await startOperation({
+    action: 'archive',
+    item: 'Completed',
+    dryRun: false,
+    force: false,
+    scope: 'all',
+    scheduled: true,
+    tickStep: true
+  })
+  // A manual run may have started while the archive step was finishing.
+  if (cfg.schedStartSuggestions && state.status !== 'running' && !startPending) {
     await startOperation({
+      action: 'proceed',
+      item: ITEM_SUGGESTIONS,
       dryRun: false,
       force: false,
       scope: 'all',
-      opMode: 'suggestions',
       maxSuggestions: cfg.schedMaxStarts,
-      scheduled: true
+      scheduled: true,
+      tickStep: true
     })
   }
 }
@@ -164,7 +265,7 @@ async function jFetch(url, options = {}) {
     throw new Error('Security Error: Disallowed fetch origin')
   }
 
-  const { token, headers = {}, timeout = 30000, ...rest } = options
+  const { token, headers = {}, timeout = settings.requestTimeoutSec * 1000, buffer = false, ...rest } = options
   const safeHeaders = { ...headers }
 
   if (token) {
@@ -184,14 +285,22 @@ async function jFetch(url, options = {}) {
     // Only restrict redirects when sending credentials, and ensure the restriction cannot be bypassed by `...rest`
     const finalRedirect = token ? 'error' : rest.redirect || 'follow'
     const res = await fetch(url, { headers: safeHeaders, signal: controller.signal, ...rest, redirect: finalRedirect })
+    // With `buffer`, the body is read under the same timeout, so a reply that
+    // stops arriving fails instead of hanging the run. Of the error bodies only
+    // a 400's is needed (it can carry a fresh sign-in token); any other error,
+    // a 429 above all, is thrown on its headers at once, so the account pauses
+    // before more requests go out.
+    const readBody = buffer && (res.ok || res.status === 400)
+    if (buffer && !readBody) res.body?.cancel?.().catch(() => {})
+    const reply = readBody ? await bufferedReply(res) : res
     if (!res.ok) {
       // Callers that need the error body (e.g. the XSRF refresh) read it here.
       const err = new Error(`HTTP ${res.status}`)
       err.status = res.status
-      err.response = res
+      err.response = reply
       throw err
     }
-    return res
+    return reply
   } catch (e) {
     if (e.name === 'AbortError') {
       throw new Error('NetworkError: Request timed out')
@@ -199,6 +308,25 @@ async function jFetch(url, options = {}) {
     throw e
   } finally {
     clearTimeout(timeoutId)
+  }
+}
+
+async function bufferedReply(res) {
+  let text
+  try {
+    text = await res.text()
+  } catch (e) {
+    // An error body that won't read, or stops arriving, only loses its hints:
+    // the status (a 429's Retry-After too) still stands.
+    if (res.ok) throw e
+    text = ''
+  }
+  return {
+    ok: res.ok,
+    status: res.status,
+    headers: res.headers,
+    text: async () => text,
+    json: async () => JSON.parse(text)
   }
 }
 
@@ -235,11 +363,13 @@ async function runInPool(items, limit, worker) {
  * used to cap TOTAL in-flight archive requests while accounts run in parallel.
  */
 function createLimiter(max) {
+  // `max` may be a function, so the limit follows the Settings panel.
+  const limit = typeof max === 'function' ? max : () => max
   let active = 0
   const queue = []
 
   function next() {
-    if (active >= max || queue.length === 0) return
+    if (active >= limit() || queue.length === 0) return
     active++
     const { fn, resolve, reject } = queue.shift()
     Promise.resolve()
@@ -258,7 +388,54 @@ function createLimiter(max) {
     })
 }
 
-const globalLimit = createLimiter(GLOBAL_CONCURRENCY)
+// --- Concurrency and pacing of requests to Jules ---
+// Every POST to Jules (postBatchExecute) takes a slot of its account
+// (Settings: parallel requests per account) and then one of the total. A
+// request that goes out while others of its account are in flight or waiting
+// first waits a random 0.5-2 s, plus up to the extra jitter when Settings
+// turns it on, so a burst never reaches Jules in lockstep. A lone request
+// goes straight out. GitHub calls don't go through here.
+const globalLimit = createLimiter(() => settings.totalParallel)
+const accountLimits = new Map() // accountNum -> limiter
+const accountActive = new Map() // accountNum -> requests in flight or waiting
+
+function accountKey(config) {
+  return String(config?.accountNum ?? '0')
+}
+
+function accountLimit(config) {
+  const key = accountKey(config)
+  if (!accountLimits.has(key))
+    accountLimits.set(
+      key,
+      createLimiter(() => settings.perAccountParallel)
+    )
+  return accountLimits.get(key)
+}
+
+function burstDelayMs() {
+  const span = BURST_JITTER_MAX_MS - BURST_JITTER_MIN_MS
+  const extra = settings.extraJitter ? Math.random() * settings.extraJitterMaxSec * 1000 : 0
+  return Math.round(BURST_JITTER_MIN_MS + Math.random() * span + extra)
+}
+
+// --- Run up to N items (Settings) ---
+// The whole run, across every account, acts on at most N items (dry runs
+// and scheduled runs too); 0 means no limit. Reset when a run starts.
+let runBudget = Number.POSITIVE_INFINITY
+
+function takeRunBudget(label, items, noun) {
+  if (items.length <= runBudget) {
+    runBudget -= items.length
+    return items
+  }
+  const kept = items.slice(0, Math.max(0, runBudget))
+  runBudget = 0
+  addLog(
+    `[${label}] Settings: run up to ${settings.runLimit} item(s), so only ${kept.length} of ${items.length} ${noun}`
+  )
+  return kept
+}
 
 // =============================================================================
 // batchexecute Client
@@ -286,9 +463,12 @@ function buildBatchRequest(rpcId, payload, config) {
   }
 }
 
-function postBatchExecute(rpcId, payload, config, timeout) {
+// The reply is read in full before this resolves, so postBatchExecute holds
+// its parallel slots while a task list (up to 100+ MB) downloads.
+function sendBatchExecute(rpcId, payload, config, timeout) {
   const { url, body } = buildBatchRequest(rpcId, payload, config)
   return jFetch(url, {
+    buffer: true,
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
@@ -298,6 +478,33 @@ function postBatchExecute(rpcId, payload, config, timeout) {
     body,
     ...(timeout ? { timeout } : {})
   })
+}
+
+// A pause or stop that lands while a request waits for its slot or its
+// jitter sends it back to wait, so nothing goes out during a 429 pause.
+const SEND_LATER = Symbol('send later')
+
+async function postBatchExecute(rpcId, payload, config, timeout) {
+  const key = accountKey(config)
+  const burst = (accountActive.get(key) || 0) > 0
+  accountActive.set(key, (accountActive.get(key) || 0) + 1)
+  try {
+    return await accountLimit(config)(async () => {
+      for (;;) {
+        await waitForAccount(config)
+        const pausedUntil = accountPauses.get(key) || 0
+        const res = await globalLimit(async () => {
+          const ms = burst ? burstDelayMs() : 0
+          if (ms > 0) await pause(ms)
+          if (stoppedAccounts.has(key) || (accountPauses.get(key) || 0) !== pausedUntil) return SEND_LATER
+          return sendBatchExecute(rpcId, payload, config, timeout)
+        })
+        if (res !== SEND_LATER) return res
+      }
+    })
+  } finally {
+    accountActive.set(key, accountActive.get(key) - 1)
+  }
 }
 
 // The XSRF token (WIZ_global_data.SNlM0e) is frozen at page load, while the
@@ -318,26 +525,215 @@ async function readXsrfToken(err) {
 
 async function mintXsrfToken(config) {
   try {
-    await postBatchExecute('KQOO7', [], { ...config, at: '' })
+    // Rate-limited like any request: a 429 here pauses the account too.
+    await postRateLimited(rpc('GetTaskUsage'), [], { ...config, at: '' })
     return null
   } catch (e) {
     return e.status === 400 ? readXsrfToken(e) : null
   }
 }
 
+function accountLabel(config) {
+  const num = String(config?.accountNum ?? '0')
+  return num !== '0' ? `u/${num}` : 'default'
+}
+
+// --- HTTP 429: pause the whole account ---
+// Jules answers 429 when an account sends too much. Every request of that
+// account then waits out Retry-After (30 s when Jules doesn't say) before it
+// goes; a wait longer than 5 minutes stops the account for this run.
+const RATE_LIMIT_DEFAULT_MS = 30 * 1000
+const RATE_LIMIT_MAX_WAIT_MS = 5 * 60 * 1000
+const RATE_LIMIT_RETRIES = 3
+const accountPauses = new Map() // accountNum -> when its pause ends (ms)
+const stoppedAccounts = new Map() // accountNum -> why it stopped
+// accountNum -> 429s in a row, across all of the account's requests; a
+// request that gets through resets it.
+const accountRateLimits = new Map()
+
+function pause(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function retryAfterMs(err) {
+  const header = err?.response?.headers?.get?.('retry-after')
+  if (!header) return RATE_LIMIT_DEFAULT_MS
+  const seconds = Number(header)
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000)
+  const date = Date.parse(header)
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : RATE_LIMIT_DEFAULT_MS
+}
+
+// Waits out the account's pause, again if it was extended meanwhile; throws
+// once the account is stopped for the run.
+async function waitForAccount(config) {
+  const key = accountKey(config)
+  let waitedFor = 0
+  for (;;) {
+    const stopped = stoppedAccounts.get(key)
+    if (stopped) throw new Error(stopped)
+    const until = accountPauses.get(key) || 0
+    if (until <= Date.now() || until === waitedFor) return
+    waitedFor = until
+    await pause(until - Date.now())
+  }
+}
+
+function pauseAccount(config, ms) {
+  const until = Date.now() + ms
+  if (until <= (accountPauses.get(accountKey(config)) || 0)) return // already paused at least this long
+  accountPauses.set(accountKey(config), until)
+  addLog(
+    `[${accountLabel(config)}] Jules is rate-limiting this account (HTTP 429): pausing its requests for ${Math.ceil(ms / 1000)} s`
+  )
+}
+
+async function postRateLimited(rpcId, payload, config, timeout) {
+  const key = accountKey(config)
+  for (;;) {
+    try {
+      const res = await postBatchExecute(rpcId, payload, config, timeout)
+      accountRateLimits.delete(key)
+      return res
+    } catch (e) {
+      if (e.status !== 429) throw e
+      const wait = retryAfterMs(e)
+      const inARow = (accountRateLimits.get(key) || 0) + 1
+      accountRateLimits.set(key, inARow)
+      if (inARow > RATE_LIMIT_RETRIES || wait > RATE_LIMIT_MAX_WAIT_MS) {
+        const why = `Jules rate-limited ${accountLabel(config)} (asked to wait ${Math.ceil(wait / 1000)} s); stopped this account for the run`
+        stoppedAccounts.set(accountKey(config), why)
+        throw new Error(why)
+      }
+      pauseAccount(config, wait)
+    }
+  }
+}
+
+// --- Sign-in tokens ---
+// A stale token answers HTTP 400 (401/403 when signed out). The steps run in
+// order, each only when the one before didn't bring new tokens, and the
+// request is sent again after any step that did:
+//   1. the fresh XSRF token Jules puts in the 400 body
+//   2. a token minted by a read-only call sent without one
+//   3. WIZ_global_data read again, past the content script's 5-minute cache
+//   4. the Jules tab reloaded (Settings, on by default), then read again
+// After the last one the account stops with a hint to sign in. The steps are
+// shared by every request of the run's config, so parallel requests don't
+// each reload the tab.
+const SIGN_IN_STATUSES = new Set([400, 401, 403])
+const SIGN_IN_STEPS = [
+  { name: 'the token in the 400 reply', run: async (_config, err) => ({ at: await readXsrfToken(err) }) },
+  {
+    name: 'a newly minted token',
+    run: async (config, err) => (err.status === 400 ? { at: await mintXsrfToken(config) } : null)
+  },
+  { name: "the tab's current tokens", run: (config) => readPageTokens(config) },
+  {
+    name: 'reloading the Jules tab',
+    run: async (config) => {
+      if (!settings.reloadTabOnSignIn || config.tabId === undefined) return null
+      if (!(await tabOnAccount(config))) {
+        addLog(`[${accountLabel(config)}] Not reloading: the tab is no longer on Jules for ${accountLabel(config)}`)
+        return null
+      }
+      await reloadJulesTab(config.tabId)
+      return readPageTokens(config)
+    }
+  }
+]
+
+// Copies new tokens into the run's config, so every later call uses them.
+// Returns whether anything changed.
+function setTokens(config, fresh) {
+  if (!fresh?.at) return false
+  const changed =
+    fresh.at !== config.at || (fresh.bl && fresh.bl !== config.bl) || (fresh.fsid && fresh.fsid !== config.fsid)
+  config.at = fresh.at
+  if (fresh.bl) config.bl = fresh.bl
+  if (fresh.fsid) config.fsid = fresh.fsid
+  return Boolean(changed)
+}
+
+// A tab switched to another account mid-run holds that account's tokens,
+// which must not be sent for this one.
+async function readPageTokens(config) {
+  if (config.tabId === undefined) return null
+  try {
+    const fresh = await getTabConfig(config.tabId, { fresh: true })
+    return fresh.accountNum === String(config.accountNum ?? '0') ? fresh : null
+  } catch {
+    return null
+  }
+}
+
+// The tab may have left Jules, or moved to another account, since the run
+// started; a reload then would throw away whatever the user has open there.
+async function tabOnAccount(config) {
+  try {
+    const { url } = await chrome.tabs.get(config.tabId)
+    return new URL(url).origin === JULES_ORIGIN && extractAccountNum(url) === accountKey(config)
+  } catch {
+    return false
+  }
+}
+
+// Reloads the tab and waits (up to 30 s) for it to finish loading.
+async function reloadJulesTab(tabId) {
+  await new Promise((resolve) => {
+    const timer = setTimeout(done, 30 * 1000)
+    function done() {
+      clearTimeout(timer)
+      chrome.tabs.onUpdated.removeListener(listener)
+      resolve()
+    }
+    function listener(id, info) {
+      if (id === tabId && info.status === 'complete') done()
+    }
+    chrome.tabs.onUpdated.addListener(listener)
+    chrome.tabs.reload(tabId).catch(done)
+  })
+}
+
+async function renewSignIn(config, err) {
+  const label = accountLabel(config)
+  while ((config.signInStep || 0) < SIGN_IN_STEPS.length) {
+    const step = SIGN_IN_STEPS[config.signInStep || 0]
+    config.signInStep = (config.signInStep || 0) + 1
+    addLog(`[${label}] Sign-in tokens rejected (HTTP ${err.status}): trying ${step.name}`)
+    if (setTokens(config, await step.run(config, err))) return true
+  }
+  return false
+}
+
+async function postWithSignIn(rpcId, payload, config, timeout) {
+  for (;;) {
+    const used = config.at
+    try {
+      const res = await postRateLimited(rpcId, payload, config, timeout)
+      config.signInStep = 0 // these tokens work; a later expiry starts over
+      return res
+    } catch (e) {
+      if (!SIGN_IN_STATUSES.has(e.status)) throw e
+      if (config.at !== used) continue // another request already renewed them
+      if (!config.signInPromise) {
+        config.signInPromise = renewSignIn(config, e).finally(() => {
+          config.signInPromise = null
+        })
+      }
+      if (!(await config.signInPromise) && config.at === used) {
+        // The rest of the run's requests for this account would fail the same way.
+        const why = `HTTP ${e.status}: Jules rejected the sign-in for ${accountLabel(config)}. Open that Jules tab, check you're signed in, and run again.`
+        stoppedAccounts.set(accountKey(config), why)
+        throw new Error(why)
+      }
+    }
+  }
+}
+
 async function callBatchExecute(rpcId, payload, config, { timeout } = {}) {
   try {
-    let res
-    try {
-      res = await postBatchExecute(rpcId, payload, config, timeout)
-    } catch (e) {
-      if (e.status !== 400) throw e
-      const fresh = (await readXsrfToken(e)) || (await mintXsrfToken(config))
-      if (!fresh) throw e
-      // Mutate the run's config so every later call reuses the fresh token.
-      config.at = fresh
-      res = await postBatchExecute(rpcId, payload, config, timeout)
-    }
+    const res = await postWithSignIn(rpcId, payload, config, timeout)
     return parseResponse(await res.text(), rpcId)
   } catch (e) {
     throw new Error(`batchexecute ${rpcId} failed: ${e.message}`)
@@ -447,21 +843,16 @@ function parseResponse(text, rpcId) {
 const TASK = {
   ID: 0,
   SHORT_TITLE: 1,
+  PROMPT: 2,
   SOURCE: 4,
   STATE: 5,
   CREATE_TIME: 6,
   UPDATE_TIME: 7,
+  PLAN: 10,
+  AWAITING_REVIEW: 12,
   STATUS_CODE: 25,
   DISPLAY_TITLE: 26
 }
-
-// Task states that indicate the task is finished and safe to archive.
-// Verified 2026-06-04 against 725 real tasks from the live batchexecute API:
-// finished tasks settle into states 2, 4, 12, or null. Any OTHER state is
-// treated as still-active and left untouched in the default flow (Force
-// archives regardless). Keeping this an allowlist means an unknown/new state
-// is protected by default rather than silently archived.
-const ARCHIVABLE_STATES = new Set([2, 4, 12])
 
 // Source (connected repo) row layout from YqkSHd.
 // [5] is a per-repo Suggestions block: [bool, bool, [TOGGLE], [bool]] where
@@ -471,8 +862,11 @@ const ARCHIVABLE_STATES = new Set([2, 4, 12])
 // all 5 accounts: the enabled-repo count matched UTrvy exactly every time.
 const SOURCE = {
   ID: 0,
+  // 1 = connected, 2 = disconnected (no longer shown in Jules' repo list).
+  STATUS: 4,
   SUGGESTION_BLOCK: 5
 }
+const SOURCE_DISCONNECTED = 2
 const SUGGESTION_TOGGLE_ON = 2
 
 // A Jules account may enable Suggestions on at most 5 repos. The extension must
@@ -480,6 +874,17 @@ const SUGGESTION_TOGGLE_ON = 2
 function isSuggestionEnabled(row) {
   const block = row?.[SOURCE.SUGGESTION_BLOCK]
   return Array.isArray(block) && Array.isArray(block[2]) && block[2][0] === SUGGESTION_TOGGLE_ON
+}
+
+// Jules titles a task or schedule without a title by its prompt's first line.
+// One match, not a split: a prompt can be 12 KB, on thousands of tasks.
+function firstLine(text) {
+  return (
+    String(text || '')
+      .match(/\S[^\r\n]*/)?.[0]
+      .trim()
+      .slice(0, 120) || ''
+  )
 }
 
 function parseTask(raw) {
@@ -509,20 +914,19 @@ function parseTask(raw) {
 
   return {
     id: raw[TASK.ID],
-    title: raw[TASK.DISPLAY_TITLE] || raw[TASK.SHORT_TITLE] || '(untitled)',
+    title: raw[TASK.DISPLAY_TITLE] || raw[TASK.SHORT_TITLE] || firstLine(raw[TASK.PROMPT]) || '(untitled)',
     source,
     state: raw[TASK.STATE],
+    // Jules shows a Completed task with this flag as "Ready for review".
+    awaitingReview: raw[TASK.AWAITING_REVIEW] === true,
     statusCode: raw[TASK.STATUS_CODE],
+    planId: raw[TASK.PLAN]?.[0] || null,
     repo: isGithub ? source.slice(7) : source,
     owner,
     repoName
   }
 }
 
-function isArchivable(task) {
-  // A null/undefined state is emitted for one class of completed tasks.
-  return task.state == null || ARCHIVABLE_STATES.has(task.state)
-}
 // ⚡ Bolt Optimization: Use a standard for loop instead of for...of, and replace
 // double Map lookup (.has() + .get()) with a single .get() + undefined check.
 // This reduces hashing and lookups in the hot path.
@@ -542,13 +946,12 @@ function groupTasksByRepo(tasks) {
 }
 
 // ListTasks returns every task with its full prompt in one response — 121 MB
-// and ~85 s for a 7,355-task account (measured 2026-10-19). The 30 s default
-// would abort it before the headers even arrive.
-const LIST_TASKS_TIMEOUT_MS = 5 * 60 * 1000
-
+// and ~85 s for a 7,355-task account (measured 2026-10-19). The 30 s request
+// timeout would abort it before the headers even arrive, so it gets its own
+// (settings.listTimeoutSec, 300 s by default).
 async function listTasks(filter, config) {
   const payload = [filter, 4]
-  const result = await callBatchExecute('p1Takd', payload, config, { timeout: LIST_TASKS_TIMEOUT_MS })
+  const result = await callBatchExecute(rpc('ListTasks'), payload, config, { timeout: settings.listTimeoutSec * 1000 })
   if (!result?.[0]) return []
 
   const arr = result[0]
@@ -574,21 +977,21 @@ async function safeListTasks(label, config) {
   }
 }
 
-async function archiveTasks(taskIds, config) {
+async function archiveTasks(taskIds, config, unarchive = false) {
   const payload = new Array(2).fill(null)
   payload[TJMM5C.TASK_IDS] = taskIds
   payload[TJMM5C.ACTION] = 1
-  await callBatchExecute('Tjmm5c', payload, config)
+  await callBatchExecute(rpc('ArchiveTasks'), unarchive ? [taskIds] : payload, config)
 }
 
 const RETRY_ATTEMPTS = 4
 const RETRY_BASE_MS = 400
 
-// Higher concurrency makes Jules more likely to answer 429 (rate limit) or a
-// transient 5xx. Rather than dropping those tasks, back off and retry so a fast
-// run degrades gracefully instead of failing.
+// A transient 5xx or network failure is retried with backoff rather than
+// dropping the task. HTTP 429 is handled by postRateLimited, which pauses the
+// whole account for as long as Jules asks.
 function isRetryable(message) {
-  return /HTTP 429|HTTP 5\d\d|Failed to fetch|NetworkError/i.test(message || '')
+  return /HTTP 5\d\d|Failed to fetch|NetworkError/i.test(message || '')
 }
 
 async function withRetry(fn) {
@@ -603,8 +1006,8 @@ async function withRetry(fn) {
   }
 }
 
-function archiveTasksWithRetry(taskIds, config) {
-  return withRetry(() => archiveTasks(taskIds, config))
+function archiveTasksWithRetry(taskIds, config, unarchive = false) {
+  return withRetry(() => archiveTasks(taskIds, config, unarchive))
 }
 
 // Dismiss a single suggestion via sc1vFf (DismissSuggestion)
@@ -618,7 +1021,7 @@ async function dismissSuggestion(suggestionId, config) {
   const payload = new Array(2).fill(null)
   payload[SC1VFF.SUGGESTION_ID] = suggestionId
   payload[SC1VFF.ACTION] = SC1VFF_ACTION_DISMISS
-  await callBatchExecute('sc1vFf', payload, config)
+  await callBatchExecute(rpc('UpdateProactiveSuggestionStatus'), payload, config)
 }
 
 function dismissSuggestionWithRetry(suggestionId, config) {
@@ -702,7 +1105,7 @@ function parseSuggestion(raw) {
 }
 
 async function listSuggestions(repo, config) {
-  const result = await callBatchExecute('hQP40d', [repo], config)
+  const result = await callBatchExecute(rpc('ListProactiveSuggestions'), [repo], config)
   if (!result || !Array.isArray(result) || !Array.isArray(result[0])) return []
 
   // ⚡ Bolt Optimization: Use a standard for loop instead of `.reduce()` to
@@ -722,7 +1125,7 @@ async function listSuggestions(repo, config) {
 // Returning every connected source (not just enabled ones) is what caused the
 // extension to start hundreds of unwanted suggestion tasks across all repos.
 async function listSuggestionEnabledSources(config) {
-  const result = await callBatchExecute('YqkSHd', [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
+  const result = await callBatchExecute(rpc('ListSources'), [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
   if (!result?.[0]) return []
 
   // ⚡ Bolt Optimization: Replace `.filter().map()` chain with a single
@@ -742,7 +1145,7 @@ async function listSuggestionEnabledSources(config) {
 // read-only work (export, repo picker) or an explicit user-chosen repo — never
 // for bulk session starts across "all" repos.
 async function listAllSources(config) {
-  const result = await callBatchExecute('YqkSHd', [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
+  const result = await callBatchExecute(rpc('ListSources'), [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
   if (!result?.[0]) return []
   const arr = result[0]
   const sources = []
@@ -753,6 +1156,15 @@ async function listAllSources(config) {
     }
   }
   return sources
+}
+
+// Every GitHub source the account ever had, the connected ones first: a
+// disconnected repo keeps its tasks. Read-only work only.
+async function listEverySource(config) {
+  const rows = (await callBatchExecute(rpc('ListSources'), [null, null], config))?.[0] || []
+  const github = rows.filter((row) => typeof row?.[SOURCE.ID] === 'string' && row[SOURCE.ID].startsWith('github/'))
+  const disconnected = (row) => row[SOURCE.STATUS] === SOURCE_DISCONNECTED
+  return [...github.filter((row) => !disconnected(row)), ...github.filter(disconnected)].map((row) => row[SOURCE.ID])
 }
 
 async function safeListSources(label, config, allowAll = false) {
@@ -779,7 +1191,7 @@ async function safeListSources(label, config, allowAll = false) {
 // 268/100). Returns null if the shape is unrecognised so callers can no-op the
 // guard rather than block the run.
 async function getDailySessionQuota(config) {
-  const result = await callBatchExecute('KQOO7', [], config)
+  const result = await callBatchExecute(rpc('GetTaskUsage'), [], config)
   if (!Array.isArray(result) || typeof result[0] !== 'number' || typeof result[2] !== 'number') return null
   return { used: result[0], limit: result[2], remaining: Math.max(0, result[2] - result[0]) }
 }
@@ -945,8 +1357,16 @@ function buildSuggestionMetadata(suggestionId, experimentIds) {
   return meta
 }
 
-function buildStartPayload(suggestion, repo, config, startConfig) {
-  return buildRja83dPayload(buildSuggestionPrompt(suggestion), suggestion.id, repo, config, startConfig)
+// "Add a message" on Suggestions goes at the end of every prompt.
+// The user's message goes after whatever text the extension sends (a
+// suggestion prompt, the default reply or retry), never in place of it.
+function appendMessage(prompt, message) {
+  return message ? `${prompt.trimEnd()}\n\n## Additional instructions\n\n${message}\n` : prompt
+}
+
+function buildStartPayload(suggestion, repo, config, startConfig, message) {
+  const prompt = appendMessage(buildSuggestionPrompt(suggestion), message)
+  return buildRja83dPayload(prompt, suggestion.id, repo, config, startConfig)
 }
 
 function buildRja83dPayload(prompt, suggestionId, repo, config, startConfig) {
@@ -963,9 +1383,9 @@ function buildRja83dPayload(prompt, suggestionId, repo, config, startConfig) {
   return payload
 }
 
-async function startSuggestion(suggestion, repo, config, startConfig) {
-  const payload = buildStartPayload(suggestion, repo, config, startConfig)
-  return callBatchExecute('Rja83d', payload, config)
+async function startSuggestion(suggestion, repo, config, startConfig, message) {
+  const payload = buildStartPayload(suggestion, repo, config, startConfig, message)
+  return callBatchExecute(rpc('CreateTask'), payload, config)
 }
 
 async function getStartConfig() {
@@ -1024,14 +1444,14 @@ async function processSuggestionsForTab(tab, options) {
 
   addLog(`\n[${label}] Fetching suggestions for ${targetRepos.length} repos concurrently...`)
   let totalDiscovered = 0
-  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) => {
+  const allSuggestions = await runInPool(targetRepos, settings.perAccountParallel, (repo) => {
     // ⚡ Bolt Optimization: Short-circuit network discovery if we've already
     // found enough suggestions to satisfy the daily quota limit. This prevents
     // dozens of wasteful `listSuggestions` batchexecute API calls.
     if (quota && totalDiscovered >= quota.remaining) {
       return Promise.resolve({ repo, suggestions: [], skipped: true })
     }
-    return globalLimit(() => listSuggestions(repo, config))
+    return listSuggestions(repo, config)
       .then((suggestions) => {
         totalDiscovered += suggestions.length
         return { repo, suggestions }
@@ -1084,6 +1504,7 @@ async function processSuggestionsForTab(tab, options) {
     addLog(`[${label}] Capping ${toStart.length} suggestions to ${options._remainingStarts} (per-tick cap)`)
     toStart = toStart.slice(0, Math.max(0, options._remainingStarts))
   }
+  toStart = takeRunBudget(label, toStart, 'suggestion(s) to start')
   if (options._remainingStarts !== undefined) {
     options._remainingStarts -= toStart.length
   }
@@ -1095,7 +1516,7 @@ async function processSuggestionsForTab(tab, options) {
 
   let totalStarted = 0
   let lastUpdate = 0
-  await runInPool(toStart, PER_ACCOUNT_CONCURRENCY, async ({ repo, s }) => {
+  await runInPool(toStart, settings.perAccountParallel, async ({ repo, s }) => {
     if (state.status === 'cancelled') return
 
     if (options.dryRun) {
@@ -1109,7 +1530,7 @@ async function processSuggestionsForTab(tab, options) {
       lastUpdate = now
     }
     try {
-      await globalLimit(() => withRetry(() => startSuggestion(s, repo, config, startConfig)))
+      await startSuggestion(s, repo, config, startConfig, options.message)
       totalStarted++
       state.progress.archived += 1
       if (Date.now() - lastUpdate > 500) {
@@ -1147,8 +1568,8 @@ async function processRemoveSuggestionsForTab(tab, options) {
   if (!targetRepos) return 0
 
   addLog(`\n[${label}] Fetching suggestions for ${targetRepos.length} repos concurrently...`)
-  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
-    globalLimit(() => listSuggestions(repo, config))
+  const allSuggestions = await runInPool(targetRepos, settings.perAccountParallel, (repo) =>
+    listSuggestions(repo, config)
       .then((suggestions) => ({ repo, suggestions }))
       .catch((e) => ({ repo, error: e.message }))
   )
@@ -1174,20 +1595,21 @@ async function processRemoveSuggestionsForTab(tab, options) {
     return 0
   }
 
+  const toRemove = takeRunBudget(label, work, 'suggestion(s) to remove')
   if (options.dryRun) {
-    addLog(`[${label}] DRY RUN - would remove ${work.length} suggestions`)
-    for (const { s } of work) {
+    addLog(`[${label}] DRY RUN - would remove ${toRemove.length} suggestions`)
+    for (const { s } of toRemove) {
       addLog(`  [DRY] Would remove [${label}] ${s.title} (${s.categorySlug})`)
     }
     return 0
   }
 
-  state.progress.total += work.length
+  state.progress.total += toRemove.length
   updateState({})
 
   let totalRemoved = 0
   let lastUpdate = 0
-  await runInPool(work, PER_ACCOUNT_CONCURRENCY, async ({ repo, s }) => {
+  await runInPool(toRemove, settings.perAccountParallel, async ({ repo, s }) => {
     if (state.status === 'cancelled') return
     const now = Date.now()
     if (now - lastUpdate > 500) {
@@ -1195,7 +1617,7 @@ async function processRemoveSuggestionsForTab(tab, options) {
       lastUpdate = now
     }
     try {
-      await globalLimit(() => dismissSuggestionWithRetry(s.id, config))
+      await dismissSuggestionWithRetry(s.id, config)
       totalRemoved++
       state.progress.archived++
       if (Date.now() - lastUpdate > 500) {
@@ -1210,6 +1632,230 @@ async function processRemoveSuggestionsForTab(tab, options) {
 
   addLog(`\n[${label}] TOTAL: ${totalRemoved} suggestions removed`)
   return totalRemoved
+}
+
+// =============================================================================
+// Proceed Orchestrator
+// =============================================================================
+
+// Interact (SLmX6) carries the client's experiment flags; these are the ones
+// the Jules UI sent with its own replies on 2026-10-19.
+const INTERACT_EXPERIMENT_IDS = [
+  98286823, 105606311, 105629939, 105705437, 105631223, 105732819, 105732273, 105732245, 105754330, 105703357,
+  105754824, 105739042, 105762189, 105800437
+]
+
+const PROCEED_VERBS = {
+  reply: { dry: 'reply to', done: 'Replied to' },
+  approve: { dry: 'approve the plan of', done: 'Approved the plan of' },
+  resume: { dry: 'resume', done: 'Resumed' },
+  retry: { dry: 'retry', done: 'Retried' },
+  followUp: { dry: 'send a follow-up to', done: 'Sent a follow-up to' }
+}
+
+// Proceed works through tasks in this order, so whatever daily quota is left
+// goes to the most useful work first.
+const PROCEED_ORDER = { feedback: 0, plan: 1, paused: 2, running: 3, unknown: 3, error: 4, completed: 5 }
+
+function taskKind(task) {
+  return taskStateFor(task)?.kind || 'unknown'
+}
+
+// What Proceed does with one task: { action, message, usesQuota } or
+// { skip: reason }. A retry or a follow-up starts a new run, so it counts
+// against the daily session quota; replying to a live session does not
+// (measured 2026-10-19 at 100/100: 13 replies went through, every retry got
+// RPC error code [8]).
+function planProceed(task, item, options = {}) {
+  const message = normalizeMessage(options.message)
+  const kind = taskKind(task)
+  switch (kind) {
+    case 'feedback':
+      return {
+        action: 'reply',
+        message: appendMessage(normalizeMessage(options.defaultReply) || DEFAULT_CONTINUE_MESSAGE, message)
+      }
+    case 'plan':
+      return task.planId ? { action: 'approve' } : { skip: 'no plan to approve' }
+    case 'paused':
+      return { action: 'resume' }
+    case 'error':
+      return {
+        action: 'retry',
+        message: appendMessage(normalizeMessage(options.defaultRetry) || DEFAULT_ERROR_CONTINUE_MESSAGE, message),
+        usesQuota: true
+      }
+    case 'completed':
+      if (item?.id === ITEM_ALL && !options.force)
+        return { skip: 'completed (Proceed on All skips them unless Force is on)' }
+      if (!message) return { skip: 'completed (a follow-up needs a message)' }
+      return { action: 'followUp', message, usesQuota: true }
+    default:
+      if (message) return { action: 'reply', message }
+      return { skip: kind === 'running' ? 'already running (add a message to send one)' : 'unknown state' }
+  }
+}
+
+// Planned work in PROCEED_ORDER, plus a count of skipped tasks per reason.
+function planProceedWork(tasks, item, options) {
+  const work = []
+  const skipped = new Map()
+  for (const task of tasks) {
+    const plan = planProceed(task, item, options)
+    if (plan.skip) skipped.set(plan.skip, (skipped.get(plan.skip) || 0) + 1)
+    else work.push({ task, plan, rank: PROCEED_ORDER[taskKind(task)] })
+  }
+  work.sort((a, b) => a.rank - b.rank)
+  return { work, skipped }
+}
+
+// GetTask view 3 includes the activity log. The UI threads every reply onto
+// the newest activity, so this does the same.
+async function getLastActivityId(taskId, config) {
+  const result = await callBatchExecute(rpc('GetTask'), [taskId, 3], config)
+  const activities = result?.[0]?.[3]
+  if (!Array.isArray(activities) || activities.length === 0) return null
+  return activities[activities.length - 1]?.[0] || null
+}
+
+// [taskId, interaction, null, [experimentIds]] where interaction is
+// [_, [planId] to approve the plan, [text, null, clientMessageId] to reply,
+// lastActivityId]. Captured from the Jules UI and its plan-approval code.
+function buildInteractPayload(task, plan, activityId) {
+  const interaction = new Array(4).fill(null)
+  if (plan.action === 'approve') {
+    interaction[1] = [task.planId]
+  } else {
+    interaction[2] = [plan.message, null, crypto.randomUUID().toUpperCase()]
+  }
+  interaction[3] = activityId
+  return [task.id, interaction, null, [INTERACT_EXPERIMENT_IDS]]
+}
+
+// Returns false when the task was skipped. The send is not retried: a 5xx may
+// still have delivered the reply, and a re-run only finds tasks still waiting.
+async function proceedTask(label, task, plan, config) {
+  if (plan.action === 'resume') {
+    await callBatchExecute(rpc('ResumeTask'), [task.id], config)
+    return true
+  }
+  const activityId = await withRetry(() => getLastActivityId(task.id, config))
+  if (!activityId) {
+    addLog(`  SKIP [${label}] [${task.id}] ${task.title} (no activity to reply to)`)
+    return false
+  }
+  await callBatchExecute(rpc('Interact'), buildInteractPayload(task, plan, activityId), config)
+  return true
+}
+
+// Drops the work that would start a new run beyond the remaining daily quota.
+// The work is already ordered, so failed sessions go before completed ones.
+async function capToQuota(label, work, config) {
+  const quotaWork = work.filter((w) => w.plan.usesQuota)
+  if (quotaWork.length === 0) return work
+  let quota = null
+  try {
+    quota = await getDailySessionQuota(config)
+  } catch (e) {
+    addLog(`[${label}] WARNING: Could not fetch daily quota: ${e.message}`)
+    return work
+  }
+  if (!quota || quota.remaining >= quotaWork.length) return work
+  const kept = new Set(quotaWork.slice(0, quota.remaining))
+  if (quota.remaining === 0) {
+    addLog(
+      `[${label}] Daily session limit reached (${quota.used}/${quota.limit}): skipping ${quotaWork.length} task(s) that would start a new run.`
+    )
+  } else {
+    addLog(
+      `[${label}] Daily sessions: ${quota.remaining} left, so only ${quota.remaining} of ${quotaWork.length} task(s) that start a new run will go.`
+    )
+  }
+  return work.filter((w) => !w.plan.usesQuota || kept.has(w))
+}
+
+// "12 Waiting on You (12), 3 Error (4)" for the log.
+function describeStates(tasks) {
+  const counts = new Map()
+  for (const t of tasks) {
+    const s = taskStateFor(t)
+    const key = s ? `${s.name} (${s.code})` : `state ${taskStateCode(t)}`
+    counts.set(key, (counts.get(key) || 0) + 1)
+  }
+  return [...counts].map(([key, n]) => `${n} ${key}`).join(', ')
+}
+
+// The tasks of the chosen item (and repository), logged with a count per state.
+function selectTasks(label, tasks, item, repoFilter) {
+  let selected = tasks.filter((t) => itemIncludesTask(item, t))
+  if (repoFilter) selected = selected.filter((t) => matchesRepoFilter(repoFilter, t.source, t.repo))
+  const where = repoFilter ? ` in ${repoFilter}` : ''
+  const breakdown = selected.length > 0 ? `: ${describeStates(selected)}` : ''
+  addLog(`[${label}] ${tasks.length} tasks, ${selected.length} match "${item.label}"${where}${breakdown}`)
+  return selected
+}
+
+async function processProceedForTab(tab, options) {
+  const { item } = options
+  if (!item) throw new Error('Proceed needs an item')
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  addLog(`[${label}] Fetching tasks via API...`)
+  const tasks = await safeListTasks(label, config)
+  if (!tasks) return 0
+
+  const selected = selectTasks(label, tasks, item, options.repoFilter)
+  const { work, skipped } = planProceedWork(selected, item, options)
+  for (const [reason, n] of skipped) addLog(`[${label}] Skipping ${n} task(s): ${reason}`)
+  if (work.length === 0) {
+    addLog(`[${label}] Nothing to proceed with.`)
+    return 0
+  }
+  if (
+    normalizeMessage(options.message) &&
+    work.some((w) => w.plan.action === 'approve' || w.plan.action === 'resume')
+  ) {
+    addLog(`[${label}] Plan approvals and resumes don't take a message; those tasks go without it.`)
+  }
+
+  const toProceed = takeRunBudget(label, await capToQuota(label, work, config), 'task(s) to proceed')
+  if (options.dryRun) {
+    for (const { task, plan } of toProceed) {
+      addLog(`  [DRY] Would ${PROCEED_VERBS[plan.action].dry} [${label}] [${task.id}] ${task.title}`)
+    }
+    return 0
+  }
+  if (toProceed.length === 0) {
+    addLog(`\n[${label}] TOTAL: 0 tasks proceeded`)
+    return 0
+  }
+
+  state.progress.total += toProceed.length
+  updateState({})
+
+  let proceeded = 0
+  await runInPool(toProceed, settings.perAccountParallel, async ({ task, plan }) => {
+    try {
+      const sent = await proceedTask(label, task, plan, config)
+      if (sent) {
+        proceeded++
+        state.progress.archived++
+        addLog(`  ${PROCEED_VERBS[plan.action].done} [${label}] [${task.id}] ${task.title}`)
+      } else {
+        state.progress.skipped++
+      }
+    } catch (e) {
+      state.progress.skipped++
+      const hint = /error code \[8\]/.test(e.message) ? ' (daily session limit reached)' : ''
+      addLog(`  ERROR [${label}] proceeding with [${task.id}] ${task.title}: ${e.message}${hint}`)
+    }
+    updateState({})
+  })
+
+  addLog(`\n[${label}] TOTAL: ${proceeded} tasks proceeded`)
+  return proceeded
 }
 
 // =============================================================================
@@ -1328,9 +1974,10 @@ async function processBatchAgentForTab(tab, options) {
       addLog(`[${label}] ${repo}: 0 suggestions. Skipping agent launch.`)
       continue
     }
+    if (takeRunBudget(label, [repo], 'agent launch(es)').length === 0) break
 
     addLog(`[${label}] ${repo}: Assembling ${suggestions.length} suggestions into 1 Unified Master Agent task...`)
-    const batchPrompt = buildBatchAgentPrompt(suggestions, repo)
+    const batchPrompt = appendMessage(buildBatchAgentPrompt(suggestions, repo), options.message)
 
     // Budget is spent before the call: a failed launch may still have
     // consumed a session server-side.
@@ -1345,7 +1992,7 @@ async function processBatchAgentForTab(tab, options) {
     updateState({ currentRepo: repo.replace(/^github\//, '') })
     const payload = buildRja83dPayload(batchPrompt, suggestions[0].id, repo, config, startConfig)
     try {
-      await globalLimit(() => withRetry(() => callBatchExecute('Rja83d', payload, config)))
+      await callBatchExecute(rpc('CreateTask'), payload, config)
       totalTasksLaunched++
       state.progress.archived++
       updateState({})
@@ -1377,8 +2024,8 @@ async function processExportSuggestionsForTab(tab, options) {
   if (!targetRepos) return 0
 
   addLog(`[${label}] Querying suggestions for ${targetRepos.length} repo(s)...`)
-  const allSuggestions = await runInPool(targetRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
-    globalLimit(() => listSuggestions(repo, config))
+  const allSuggestions = await runInPool(targetRepos, settings.perAccountParallel, (repo) =>
+    listSuggestions(repo, config)
       .then((suggestions) => ({ repo, suggestions }))
       .catch((e) => ({ repo, error: e.message }))
   )
@@ -1450,6 +2097,9 @@ function downloadExport(label, exportPayload) {
 // =============================================================================
 
 const prCache = new Map()
+// GitHub requests in flight. One sent while others are out waits the same
+// random burst delay as Jules requests do.
+let githubActive = 0
 
 function getOpenPRs(owner, repo, token) {
   const key = `${owner}/${repo}`
@@ -1469,10 +2119,15 @@ function getOpenPRs(owner, repo, token) {
       url.searchParams.set('state', 'open')
       url.searchParams.set('per_page', '100')
 
-      const res = await jFetch(url.toString(), {
-        headers: { Accept: 'application/vnd.github+json' },
-        token
-      })
+      const burst = githubActive > 0
+      githubActive++
+      let res
+      try {
+        if (burst) await pause(burstDelayMs())
+        res = await fetchOpenPRs(key, url.toString(), token)
+      } finally {
+        githubActive--
+      }
       const prs = await res.json()
       return prs.map((pr) => ({
         title: pr.title || '',
@@ -1480,13 +2135,30 @@ function getOpenPRs(owner, repo, token) {
         branch: pr.head?.ref || ''
       }))
     } catch (e) {
+      // null, not []: "no open PRs" would let every task through.
       addLog(`  WARNING: Could not check PRs for ${key}: ${e.message}`)
-      return []
+      return null
     }
   })()
 
   prCache.set(key, fetchPromise)
   return fetchPromise
+}
+
+// GitHub answers 404 for a repo the token can't see as well as for a wrong
+// name, which a second later is usually still true; one retry, after a random
+// wait and with a second more to answer, rules out a passing hiccup.
+async function fetchOpenPRs(key, url, token) {
+  const request = (timeout) =>
+    jFetch(url, { headers: { Accept: 'application/vnd.github+json' }, token, timeout, buffer: true })
+  try {
+    return await request()
+  } catch (e) {
+    if (e.status !== 404) throw e
+    addLog(`  GitHub answered 404 for ${key}; trying once more`)
+    await pause(burstDelayMs())
+    return request(settings.requestTimeoutSec * 1000 + 1000)
+  }
 }
 
 // ⚡ Bolt Optimization: Replace `.some()` with a standard for loop to avoid
@@ -1705,9 +2377,12 @@ async function ensureContentScript(tabId) {
   return documentId
 }
 
-async function getTabConfig(tabId) {
+// `fresh` reads WIZ_global_data again instead of the content script's cached
+// copy (sign-in renewal). The tab id rides along so a stale token can be
+// renewed from the tab later in the run.
+async function getTabConfig(tabId, { fresh = false } = {}) {
   const documentId = await ensureContentScript(tabId)
-  const response = await chrome.tabs.sendMessage(tabId, { action: 'GET_CONFIG' }, { documentId })
+  const response = await chrome.tabs.sendMessage(tabId, { action: 'GET_CONFIG', fresh }, { documentId })
   if (!response?.config?.at) {
     throw new Error('Could not extract page config (XSRF token missing). Try refreshing the Jules tab.')
   }
@@ -1718,7 +2393,8 @@ async function getTabConfig(tabId) {
   }
   return {
     ...response.config,
-    accountNum
+    accountNum,
+    tabId
   }
 }
 
@@ -1726,25 +2402,15 @@ async function getTabConfig(tabId) {
 // Orchestrator
 // =============================================================================
 
+// The Items dropdown picks which states to archive; Force only skips the
+// open-PR check.
 async function filterArchivableTasks(label, tasks, options) {
   if (options.force) {
-    addLog(`[${label}] FORCE: archiving all ${tasks.length} tasks (skip state filter + PR check)`)
+    addLog(`[${label}] FORCE: archiving all ${tasks.length} tasks without the open-PR check`)
     return { toArchive: [...tasks], toSkip: [] }
   }
 
-  const candidates = tasks.filter(isArchivable)
-  const activeCount = tasks.length - candidates.length
-
-  addLog(`[${label}] ${tasks.length} total: ${candidates.length} archivable, ${activeCount} active`)
-
-  if (candidates.length === 0) {
-    const states = [...new Set(tasks.map((t) => t.state))].join(', ')
-    addLog(`[${label}] No archivable tasks among ${tasks.length} (states seen: ${states}).`)
-    addLog(`[${label}] Enable Force to archive regardless of state.`)
-    return { toArchive: [], toSkip: [] }
-  }
-
-  const byRepo = groupTasksByRepo(candidates)
+  const byRepo = groupTasksByRepo(tasks)
   addLog(`\n[${label}] Checking open PRs per task...`)
   const { ghOwner } = await chrome.storage.sync.get(['ghOwner'])
   const { ghToken } = await chrome.storage.local.get(['ghToken'])
@@ -1762,6 +2428,15 @@ async function filterArchivableTasks(label, tasks, options) {
   for (let i = 0; i < repoEntries.length; i++) {
     const [repo, repoTasks] = repoEntries[i]
     const openPRs = allPRs[i]
+    if (openPRs === null) {
+      // Unknown is not "none": without Force, these wait for a check that works.
+      prLogs.push(`  ${repo}: ${repoTasks.length} tasks, open PRs unknown`)
+      for (const task of repoTasks) {
+        toSkip.push(task)
+        prLogs.push(`    SKIP [${task.id}] ${task.title} (couldn't check its open PRs)`)
+      }
+      continue
+    }
     prLogs.push(`  ${repo}: ${repoTasks.length} tasks, ${openPRs.length} open PRs`)
 
     for (const task of repoTasks) {
@@ -1803,25 +2478,27 @@ function getTaskIds(tasks) {
 
 // Returns the tasks that were archived. HTTP-level failures (auth, network)
 // are not split: every chunk would fail the same way.
-async function archiveBatchWithSplit(label, batch, config) {
+// The split is read once: Settings may change it while a batch is going.
+async function archiveBatchWithSplit(label, batch, config, unarchive = false) {
+  const split = julesApi.archiveSplit
   try {
-    await globalLimit(() => archiveTasksWithRetry(getTaskIds(batch), config))
+    await archiveTasksWithRetry(getTaskIds(batch), config, unarchive)
     return batch
   } catch (e) {
-    if (batch.length <= ARCHIVE_SPLIT_SIZE || !RPC_ERROR_CODE_REGEX.test(e.message)) {
-      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+    if (batch.length <= split || !RPC_ERROR_CODE_REGEX.test(e.message)) {
+      addLog(`  ERROR [${label}] ${unarchive ? 'unarchiving' : 'archiving'} batch: ${e.message}`)
       return []
     }
-    addLog(`  [${label}] Batch of ${batch.length} rejected (${e.message}); retrying in chunks of ${ARCHIVE_SPLIT_SIZE}`)
+    addLog(`  [${label}] Batch of ${batch.length} rejected (${e.message}); retrying in chunks of ${split}`)
   }
   const archived = []
-  for (let i = 0; i < batch.length; i += ARCHIVE_SPLIT_SIZE) {
-    const chunk = batch.slice(i, i + ARCHIVE_SPLIT_SIZE)
+  for (let i = 0; i < batch.length; i += split) {
+    const chunk = batch.slice(i, i + split)
     try {
-      await globalLimit(() => archiveTasksWithRetry(getTaskIds(chunk), config))
+      await archiveTasksWithRetry(getTaskIds(chunk), config, unarchive)
       archived.push(...chunk)
     } catch (e) {
-      addLog(`  ERROR [${label}] archiving batch: ${e.message}`)
+      addLog(`  ERROR [${label}] ${unarchive ? 'unarchiving' : 'archiving'} batch: ${e.message}`)
     }
   }
   return archived
@@ -1832,11 +2509,11 @@ async function executeArchive(label, toArchive, config) {
   let lastUpdate = 0
 
   const batches = []
-  for (let i = 0; i < toArchive.length; i += ARCHIVE_BATCH_SIZE) {
-    batches.push(toArchive.slice(i, i + ARCHIVE_BATCH_SIZE))
+  for (let i = 0; i < toArchive.length; i += julesApi.archiveBatch) {
+    batches.push(toArchive.slice(i, i + julesApi.archiveBatch))
   }
 
-  await runInPool(batches, PER_ACCOUNT_CONCURRENCY, async (batch) => {
+  await runInPool(batches, settings.perAccountParallel, async (batch) => {
     const now = Date.now()
     if (now - lastUpdate > 500) {
       updateState({ currentRepo: batch[0].repo || '(no repo)' })
@@ -1858,6 +2535,8 @@ async function executeArchive(label, toArchive, config) {
 }
 
 async function processTab(tab, options) {
+  const { item } = options
+  if (!item) throw new Error('Archive needs an item')
   const prepared = await prepareTab(tab)
   if (!prepared) return 0
   const { label, config } = prepared
@@ -1866,30 +2545,24 @@ async function processTab(tab, options) {
   const tasks = await safeListTasks(label, config)
   if (!tasks) return 0
 
-  let filteredTasks = tasks
-  if (options.repoFilter) {
-    filteredTasks = tasks.filter((t) => matchesRepoFilter(options.repoFilter, t.source, t.repo))
-    addLog(
-      `[${label}] Filtered tasks by repo "${options.repoFilter}": keeping ${filteredTasks.length} of ${tasks.length} tasks`
-    )
-    if (filteredTasks.length === 0) {
-      addLog(`[${label}] No matching tasks found. Nothing to do.`)
-      return 0
-    }
-  }
-
-  const { toArchive, toSkip } = await filterArchivableTasks(label, filteredTasks, options)
-
-  if (toSkip.length > 0) {
-    addLog(`\n[${label}] ${toSkip.length} tasks skipped (open PRs matching)`)
-  }
-
-  if (toArchive.length === 0) {
-    if (!options.force && filteredTasks.some(isArchivable)) {
-      addLog(`[${label}] Nothing to archive (all tasks have matching open PRs).`)
-    }
+  const selected = selectTasks(label, tasks, item, options.repoFilter)
+  if (selected.length === 0) {
+    addLog(`[${label}] Nothing to archive.`)
     return 0
   }
+
+  const filtered = await filterArchivableTasks(label, selected, options)
+  const { toSkip } = filtered
+
+  if (toSkip.length > 0) {
+    addLog(`\n[${label}] ${toSkip.length} tasks skipped by the open-PR check`)
+  }
+
+  if (filtered.toArchive.length === 0) {
+    addLog(`[${label}] Nothing to archive: every task was skipped by the open-PR check.`)
+    return 0
+  }
+  const toArchive = takeRunBudget(label, filtered.toArchive, 'task(s) to archive')
 
   const totalTasks = toArchive.length
   addLog(`\n[${label}] Archiving ${totalTasks} tasks`)
@@ -1912,7 +2585,49 @@ const OP_MODE_HEADERS = {
   suggestions: '=== SUGGESTIONS MODE ===',
   agent_batch: '=== BATCH AGENT MODE ===',
   remove_suggestions: '=== REMOVE SUGGESTIONS MODE ===',
-  export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ==='
+  export_suggestions: '=== EXPORT SUGGESTIONS JSON MODE ===',
+  proceed: '=== PROCEED MODE ==='
+}
+
+const RUN_ACTIONS = new Set(['proceed', 'archive', 'export'])
+
+// The popup and the CLI send { action, item }; this turns them into the opMode
+// that picks the per-tab orchestrator. Throws on a missing or unknown action
+// or item.
+// Set while a START waits for the settings, so a second START (or a
+// scheduled tick) can't slip in before the first run marks itself running.
+let startPending = false
+
+// Why a START message from the popup can't run, or null. A popup newer than
+// this worker must not have its options read the old way.
+function startMessageProblem(msg) {
+  const reload = 'Reload the extension at chrome://extensions, then open the popup again.'
+  if (msg.protocol !== RUN_PROTOCOL) return `The popup and the background are different versions. ${reload}`
+  const options = msg.options
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return 'The run has no options.'
+  const unknown = Object.keys(options).filter((key) => !START_OPTION_KEYS.includes(key))
+  if (unknown.length) return `Unknown option ${unknown.join(', ')}. ${reload}`
+  return null
+}
+
+function resolveRunOptions(options) {
+  if (!RUN_ACTIONS.has(options.action)) throw new Error(`Unknown action "${options.action}"`)
+  const resolved = { ...options, message: normalizeMessage(options.message) }
+  if (options.action === 'export') {
+    resolved.opMode = 'export_suggestions'
+    return resolved
+  }
+  // No default: a missing item must never turn into "All" for an archive run.
+  const item = resolveItem(options.item)
+  if (!item) throw new Error(`Unknown item "${options.item}"`)
+  resolved.item = item
+  if (item.type === 'suggestions') {
+    if (options.action === 'archive') resolved.opMode = 'remove_suggestions'
+    else resolved.opMode = options.oneSession ? 'agent_batch' : 'suggestions'
+  } else {
+    resolved.opMode = options.action === 'archive' ? 'archive' : 'proceed'
+  }
+  return resolved
 }
 
 function initOperationState(options) {
@@ -1938,6 +2653,8 @@ function initOperationState(options) {
 
   const isSuggestions = options.opMode === 'suggestions'
   addLog(options.dryRun ? '=== DRY RUN MODE ===' : OP_MODE_HEADERS[options.opMode] || '=== ARCHIVE MODE ===')
+  if (options.item?.label) addLog(`=== ITEM: ${options.item.label} ===`)
+  if (options.action === 'archive' && options.message) addLog("Archive doesn't use the message; it is ignored.")
   if (options.scheduled) addLog('=== SCHEDULED (chrome.alarms) ===')
   if (options.force) addLog('=== FORCE MODE (skip PR check) ===')
   addLog('=== v2: batchexecute API ===')
@@ -2001,6 +2718,8 @@ function getTabProcessor(opMode) {
       return processExportSuggestionsForTab
     case 'agent_batch':
       return processBatchAgentForTab
+    case 'proceed':
+      return processProceedForTab
     default:
       return processTab
   }
@@ -2029,7 +2748,9 @@ const OP_MODE_SUMMARY = {
   suggestions: { verb: 'started', itemLabel: 'suggestions' },
   remove_suggestions: { verb: 'removed', itemLabel: 'suggestions' },
   export_suggestions: { verb: 'exported', itemLabel: 'suggestions' },
-  agent_batch: { verb: 'launched', itemLabel: 'master agent sessions' }
+  agent_batch: { verb: 'launched', itemLabel: 'master agent sessions' },
+  proceed: { verb: 'proceeded', itemLabel: 'tasks' },
+  more: { verb: 'processed', itemLabel: 'items' }
 }
 
 // Accepts the run's options (opMode) or the legacy isSuggestions boolean.
@@ -2055,16 +2776,42 @@ function finalizeOperation(results, optionsOrIsSuggestions) {
   updateState({ status: 'done', results })
 }
 
+// What a run tracks across its accounts: the Run up to N budget, and the
+// accounts paused, stopped or counting 429s.
+function resetRunLimits() {
+  runBudget = settings.runLimit > 0 ? settings.runLimit : Number.POSITIVE_INFINITY
+  accountPauses.clear()
+  stoppedAccounts.clear()
+  accountRateLimits.clear()
+}
+
 function handleOperationError(e) {
   const msg = e?.message || String(e) || 'Unknown error'
   addLog(`FATAL ERROR: ${msg}`)
   updateState({ status: 'error', error: msg })
 }
 
-async function startOperation(options) {
+async function startOperation(rawOptions) {
+  let options
+  try {
+    options = resolveRunOptions(rawOptions)
+  } catch (e) {
+    handleOperationError(e)
+    return
+  }
   const isSuggestions = initOperationState(options)
 
   try {
+    // A run that may change Jules leaves no cached load behind; Export reads only.
+    if (options.dryRun !== true && options.opMode !== 'export_suggestions') await clearMoreCache()
+    // After initOperationState, so a second START already sees the run going.
+    await settingsReadyPromise
+    options.defaultReply = settings.defaultReply
+    options.defaultRetry = settings.defaultRetry
+    // runScheduledTick resets once for both of its steps.
+    if (!options.tickStep) resetRunLimits()
+    if (settings.runLimit > 0) addLog(`Settings: run up to ${settings.runLimit} item(s)`)
+
     const tabs = await discoverTabs(options)
     if (!tabs) return
 
@@ -2074,12 +2821,877 @@ async function startOperation(options) {
     handleOperationError(e)
   } finally {
     stopKeepAlive()
+    applyPendingJulesApi()
+  }
+}
+
+// =============================================================================
+// More Actions
+// =============================================================================
+
+// The last load: an id for each Load, its repo ('' = every repo) and its items
+// keyed by account + kind + id. Actions only touch items of this load.
+let moreItems = new Map()
+let moreLoadId = null
+let moreLoadRepo = ''
+// The load whose archived tasks are listing or listed: once per load, so a
+// second, older answer can't bring back an item an action already used.
+let moreArchivedFor = null
+let moreArchivedDone = false
+let moreItemsError = null
+const moreItemsReadyPromise = chrome.storage.session
+  .get('moreItems')
+  .then((data) => {
+    const saved = data.moreItems
+    moreLoadId = typeof saved?.id === 'string' ? saved.id : null
+    moreLoadRepo = typeof saved?.repo === 'string' ? saved.repo : ''
+    moreArchivedDone = saved?.archived === true
+    moreArchivedFor = moreArchivedDone ? moreLoadId : null
+    moreItems = new Map((Array.isArray(saved?.items) ? saved.items : []).map((item) => [moreItemKey(item), item]))
+  })
+  .catch((e) => {
+    moreItemsError = e.message
+  })
+
+// Saves what is in memory now. Every change to the load is made in memory
+// before its save starts, and Chrome writes in order, so the last save always
+// holds the newest load.
+function saveMoreLoad() {
+  return chrome.storage.session.set({
+    moreItems: { id: moreLoadId, repo: moreLoadRepo, archived: moreArchivedDone, items: [...moreItems.values()] }
+  })
+}
+
+// A load Chrome can't save (over the 10 MB session storage quota, say) still
+// answers from memory, with a note. The older saved load is dropped, so a
+// restarted worker acts on no load rather than on that one.
+async function saveMoreLoadOrNote(notes) {
+  try {
+    await saveMoreLoad()
+  } catch (e) {
+    notes.push(
+      `Chrome could not keep this list (${e.message}): it is lost if the extension restarts, so act on it now or load again.`
+    )
+    await chrome.storage.session.set({ moreItems: null }).catch(() => {})
+  }
+}
+
+// `fresh` is Refresh: list again past the cache (see cachedMoreRead).
+const MORE_MESSAGE_KEYS = {
+  LOAD_ITEMS: ['action', 'protocol', 'repo', 'category', 'fresh'],
+  LOAD_ARCHIVED: ['action', 'protocol', 'loadId', 'fresh'],
+  APPLY_ACTION: ['action', 'protocol', 'operation', 'dryRun', 'force', 'items']
+}
+
+function moreMessageProblem(msg) {
+  if (msg.protocol !== RUN_PROTOCOL) {
+    return 'The popup and the background are different versions. Reload the extension at chrome://extensions.'
+  }
+  const keys = MORE_MESSAGE_KEYS[msg.action]
+  const unknown = Object.keys(msg).filter((key) => !keys.includes(key))
+  if (unknown.length) return `Unknown option ${unknown.join(', ')}. Reload the extension.`
+  if ('fresh' in msg && typeof msg.fresh !== 'boolean') return 'Invalid fresh option.'
+  if (msg.action === 'LOAD_ITEMS') {
+    if (typeof msg.repo !== 'string' || (msg.repo !== '' && !/^[\w.-]+\/[\w.-]+$/.test(msg.repo))) {
+      return 'Enter a repo in org/repo format.'
+    }
+    if (!Object.hasOwn(MORE_LOAD_CATEGORIES, msg.category)) return `Unknown load category "${msg.category}".`
+  } else if (msg.action === 'LOAD_ARCHIVED') {
+    if (typeof msg.loadId !== 'string') return 'Invalid load id.'
+  } else {
+    if (!Object.hasOwn(MORE_ACTIONS, msg.operation)) return `Unknown action "${msg.operation}"`
+    if (MORE_ACTIONS[msg.operation].local) return `${MORE_ACTIONS[msg.operation].label} runs in the popup.`
+    if (typeof msg.dryRun !== 'boolean' || typeof msg.force !== 'boolean' || !Array.isArray(msg.items)) {
+      return 'Invalid action options.'
+    }
+    if (
+      msg.items.some(
+        (item) =>
+          !item ||
+          typeof item !== 'object' ||
+          Object.keys(item).some((key) => !['account', 'kind', 'id'].includes(key)) ||
+          ['account', 'kind', 'id'].some((key) => typeof item[key] !== 'string')
+      )
+    )
+      return 'Invalid selected items.'
+  }
+  return null
+}
+
+function moreTaskItem(task) {
+  return {
+    id: task.id,
+    title: task.title,
+    state: taskStateCode(task),
+    repo: task.repo,
+    awaitingReview: task.awaitingReview
+  }
+}
+
+function moreScheduleItem(row) {
+  return {
+    id: row[0],
+    title: firstLine(row[3]?.[0]) || '(untitled)',
+    state: row[6],
+    repo: String(row[1] || '').replace(/^github\//, ''),
+    cron: row[2]?.[7]?.[3] || '',
+    timeZone: row[2]?.[7]?.[4] || ''
+  }
+}
+
+// A load's task or schedule with the source Jules gave it, as the cache keeps
+// it: a load for one repo picks its items by source.
+function moreTaskEntry(task) {
+  return { ...moreTaskItem(task), source: task.source }
+}
+
+function moreScheduleEntry(row) {
+  return { ...moreScheduleItem(row), source: String(row[1] || '') }
+}
+
+function moreItemOfEntry(entry) {
+  const { source: _source, ...item } = entry
+  return item
+}
+
+// =============================================================================
+// More Actions cache
+// =============================================================================
+
+// What a Load read, so a Load within ttlMs answers at once: an account's
+// tasks (of every repo or of one source), its schedules, each repo's archived
+// tasks and its repo list. Kept in chrome.storage.local per Google account
+// (WIZ_global_data S06Grb, content.js's `user`): u/N can be another account
+// after a sign-in change, and an account without the id is not cached. Only
+// Loads read it; the checks behind actions (Delete permanently's, the
+// Unarchive check, open PRs) list live.
+const MORE_CACHE_KEY = 'moreCache'
+const MORE_CACHE_VERSION = 1
+// maxBytes counts UTF-8 bytes, as Chrome's storage quota does.
+const MORE_CACHE = { ttlMs: 30 * 60 * 1000, maxItems: 20000, maxBytes: 4 * 1024 * 1024 }
+
+// The entries, oldest first: a read that is kept goes to the end. null when
+// chrome.storage.local could not be read; the next call tries again.
+let moreCachePromise = null
+
+// The reads still waiting for Jules, as { user, list, source, dropped }. An
+// action that changes their list marks them dropped: what they bring back
+// may be from before it, so it is not kept.
+const moreCacheReads = new Set()
+
+function moreCacheKey(user, list, source) {
+  return JSON.stringify([user, list, source])
+}
+
+function validMoreCacheEntry(entry) {
+  return (
+    typeof entry?.user === 'string' &&
+    entry.user !== '' &&
+    typeof entry.list === 'string' &&
+    typeof entry.source === 'string' &&
+    Number.isFinite(entry.at) &&
+    Array.isArray(entry.items)
+  )
+}
+
+function moreCacheEntries() {
+  moreCachePromise ??= chrome.storage.local.get(MORE_CACHE_KEY).then(
+    (data) => {
+      const cache = data?.[MORE_CACHE_KEY]
+      const saved = cache?.version === MORE_CACHE_VERSION ? cache.entries : null
+      const entries = (Array.isArray(saved) ? saved : []).filter(validMoreCacheEntry).sort((a, b) => a.at - b.at)
+      return new Map(entries.map((entry) => [moreCacheKey(entry.user, entry.list, entry.source), entry]))
+    },
+    () => {
+      // Unread, the cache can't be used, and a save would write over every
+      // other account's entries.
+      moreCachePromise = null
+      return null
+    }
+  )
+  return moreCachePromise
+}
+
+function freshMoreCacheEntry(entry) {
+  const age = Date.now() - entry.at
+  return age >= 0 && age < MORE_CACHE.ttlMs
+}
+
+// One read of a Load: the cached answer while it is fresh, else the read's
+// own, which is kept, dated from when the read began. `cache.fresh`
+// (Refresh) skips the cache and still keeps the answer; `cache.cachedAt`
+// gets the date of the oldest answer used. A read that fails keeps nothing.
+async function cachedMoreRead(cache, user, list, source, read) {
+  if (typeof user !== 'string' || user === '') return read()
+  const entries = await moreCacheEntries()
+  if (!entries) return read()
+  const key = moreCacheKey(user, list, source)
+  const hit = entries.get(key)
+  if (!cache.fresh && hit && freshMoreCacheEntry(hit)) {
+    cache.cachedAt = Math.min(cache.cachedAt ?? hit.at, hit.at)
+    return hit.items
+  }
+  const at = Date.now()
+  const pending = { user, list, source, dropped: false }
+  moreCacheReads.add(pending)
+  let items
+  try {
+    items = await read()
+  } finally {
+    moreCacheReads.delete(pending)
+  }
+  if (pending.dropped) return items
+  // A run that cleared the cache meanwhile left these entries behind.
+  entries.delete(key)
+  entries.set(key, { user, list, source, at, items })
+  return items
+}
+
+// Saves the newest entries within MORE_CACHE's limits; expired ones go.
+async function saveMoreCache() {
+  const entries = await moreCacheEntries()
+  if (!entries) return
+  const utf8 = new TextEncoder()
+  const sizes = new Map()
+  let items = 0
+  let bytes = 0
+  for (const [key, entry] of entries) {
+    if (!freshMoreCacheEntry(entry)) {
+      entries.delete(key)
+      continue
+    }
+    sizes.set(key, utf8.encode(JSON.stringify(entry)).length)
+    items += entry.items.length
+    bytes += sizes.get(key)
+  }
+  for (const [key, entry] of entries) {
+    if (items <= MORE_CACHE.maxItems && bytes <= MORE_CACHE.maxBytes) break
+    entries.delete(key)
+    items -= entry.items.length
+    bytes -= sizes.get(key)
+  }
+  try {
+    await chrome.storage.local.set({
+      [MORE_CACHE_KEY]: { version: MORE_CACHE_VERSION, entries: [...entries.values()] }
+    })
+  } catch {
+    // Chrome could not keep it (its quota, say): the next Load lists live.
+    entries.clear()
+    await chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
+  }
+}
+
+// The lists of a load each action changes.
+const MORE_ACTION_LISTS = {
+  pauseTask: ['tasks'],
+  resumeTask: ['tasks'],
+  archive: ['tasks', 'archived'],
+  unarchive: ['tasks', 'archived'],
+  deleteTask: ['archived'],
+  pauseSchedule: ['schedules'],
+  resumeSchedule: ['schedules'],
+  deleteSchedule: ['schedules']
+}
+
+// Before an action and after it: its account's entries of the lists it
+// changes go, for its items' repos and for every repo, and so do the reads
+// of them still waiting, so the next Load lists them live.
+async function dropMoreCache(user, operation, items) {
+  if (typeof user !== 'string' || user === '') return
+  const lists = MORE_ACTION_LISTS[operation] || []
+  const sources = new Set(items.map((item) => `github/${item.repo}`.toLowerCase()))
+  const changes = (entry) =>
+    entry.user === user &&
+    lists.includes(entry.list) &&
+    (entry.source === '' || sources.has(entry.source.toLowerCase()))
+  for (const pending of moreCacheReads) if (changes(pending)) pending.dropped = true
+  const entries = await moreCacheEntries()
+  if (!entries) return clearMoreCache()
+  let dropped = false
+  for (const [key, entry] of entries) {
+    if (!changes(entry)) continue
+    entries.delete(key)
+    dropped = true
+  }
+  if (dropped) await saveMoreCache()
+}
+
+// A run can change any list of any account.
+function clearMoreCache() {
+  for (const pending of moreCacheReads) pending.dropped = true
+  moreCachePromise = Promise.resolve(new Map())
+  return chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
+}
+
+// Every archived task of the account, one repo at a time: Jules
+// gives up (RPC error [4], after about 90 s) on a large account's whole
+// archive, but lists one repo's in seconds. A repo it can't list goes into a
+// note; the others still load. Once a newer Load replaces this one, no
+// more repos are asked for.
+async function listArchivedByRepo(config, { account, notes, progress, cache }) {
+  const sources = await moreSources(config, cache)
+  progress.add(sources.length)
+  const failed = []
+  const lists = await runInPool(sources, settings.perAccountParallel, async (source) => {
+    if (progress.replaced()) return []
+    try {
+      return await withRetry(() => (progress.replaced() ? [] : moreArchivedOf(source, config, cache)))
+    } catch (e) {
+      failed.push(`${source.replace(/^github\//, '')} (${e.message})`)
+      return []
+    } finally {
+      progress.done()
+    }
+  })
+  if (failed.length) {
+    const named =
+      failed.length > 3 ? `${failed.slice(0, 3).join(', ')} and ${failed.length - 3} more` : failed.join(', ')
+    notes.push(
+      `Jules could not list the archived tasks of ${failed.length} of ${sources.length} repos of ${account}: ` +
+        `${named}.`
+    )
+  }
+  return lists.flat()
+}
+
+// One repo's archived tasks, as entries.
+function moreArchivedOf(source, config, cache) {
+  return cachedMoreRead(cache, config.user, 'archived', source, async () =>
+    (await listTasks(`source_id=${source} AND is_archived=true`, config)).map(moreTaskEntry)
+  )
+}
+
+// The account's repos, the disconnected ones too (see listEverySource).
+function moreSources(config, cache) {
+  return cachedMoreRead(cache, config.user, 'sources', '', () => listEverySource(config))
+}
+
+// What each list of a load reads, as entries, and the kind its items get.
+// With a repo, Jules is asked for that repo's source only.
+const MORE_LISTS = {
+  tasks: {
+    kind: 'task',
+    label: 'tasks',
+    read: (config, source, { cache }) =>
+      cachedMoreRead(cache, config.user, 'tasks', source, async () =>
+        (await listTasks(source ? `source_id=${source} AND is_archived=false` : '', config)).map(moreTaskEntry)
+      )
+  },
+  schedules: {
+    kind: 'schedule',
+    label: 'schedules',
+    read: (config, _source, { cache }) =>
+      cachedMoreRead(cache, config.user, 'schedules', '', async () =>
+        ((await callBatchExecute(rpc('ListScheduledTasks'), [], config))?.[0] || []).map(moreScheduleEntry)
+      )
+  },
+  archived: {
+    kind: 'archived',
+    label: 'archived tasks',
+    read: (config, source, context) =>
+      source ? moreArchivedOf(source, config, context.cache) : listArchivedByRepo(config, context)
+  }
+}
+
+// The "N of M repos" the popup shows while every repo's archived tasks list.
+// Saved at most twice a second, and once more at the end.
+function moreArchivedProgress(loadId) {
+  const counts = { loadId, done: 0, total: 0 }
+  let timer = null
+  const save = () => {
+    clearTimeout(timer)
+    timer = null
+    // A newer load's count is the one to keep.
+    if (moreLoadId === loadId) chrome.storage.session.set({ moreArchivedProgress: { ...counts } })
+  }
+  const soon = () => {
+    timer ??= setTimeout(save, 500)
+  }
+  return {
+    add(n) {
+      counts.total += n
+      soon()
+    },
+    done() {
+      counts.done++
+      soon()
+    },
+    finish() {
+      if (counts.total) save()
+      else clearTimeout(timer)
+    },
+    replaced: () => moreLoadId !== loadId
+  }
+}
+
+const NO_PROGRESS = { add() {}, done() {}, finish() {}, replaced: () => false }
+
+// The repo's source id as the account's repos spell it (a disconnected one
+// too): Jules matches source_id by exact case. null when the account
+// doesn't have it.
+async function moreRepoSource(repo, config, { account, notes, cache }) {
+  const wanted = `github/${repo}`
+  try {
+    const source = (await moreSources(config, cache)).find((s) => s.toLowerCase() === wanted.toLowerCase())
+    if (!source) notes.push(`${account} has no repo ${repo}.`)
+    return source || null
+  } catch (e) {
+    notes.push(`Could not read the repos of ${account}, so ${repo} is used as typed: ${e.message}`)
+    return wanted
+  }
+}
+
+// What Load lists for each choice of its dropdown. Jules has no filter for
+// Completed, so those are picked here. The archived tasks come only with
+// LOAD_ARCHIVED: for all repos they take a few minutes on a large account.
+const MORE_LOAD_CATEGORIES = {
+  all: { lists: ['tasks', 'schedules'] },
+  scheduled: { lists: ['schedules'] },
+  complete: { lists: ['tasks'], keep: isCompletedTask },
+  archive: { lists: [] }
+}
+
+// Every signed-in account's `lists`, for one repo or all of them. A list
+// Jules can't give becomes a note for that account; the rest still load.
+// `cache` is { fresh, cachedAt } (see cachedMoreRead).
+async function listMoreItems(repo, lists, keep = () => true, progress = NO_PROGRESS, cache = { fresh: false }) {
+  const tabs = keepFirstTabPerAccount(await getJulesTabs())
+  if (!tabs.length) throw new Error('No Jules tabs found. Open jules.google.com first.')
+  const matches = (source) => !repo || String(source).toLowerCase() === `github/${repo}`.toLowerCase()
+  return Promise.all(
+    tabs.map(async (tab) => {
+      const account = `u/${extractAccountNum(tab.url)}`
+      const result = { account, notes: [] }
+      for (const list of lists) result[list] = []
+      const prepared = await prepareTab(tab)
+      if (!prepared) {
+        result.notes.push(`Could not prepare ${account}. Open that Jules tab, check you are signed in.`)
+        return result
+      }
+      // The Google account the items belong to; the worker keeps it, the popup doesn't get it.
+      result.user = prepared.config.user ?? null
+      const context = { account, notes: result.notes, progress, cache }
+      // Schedules are filtered here; only the task lists need the source id.
+      const source =
+        repo && lists.some((list) => list !== 'schedules') ? await moreRepoSource(repo, prepared.config, context) : ''
+      const reads = await Promise.allSettled(
+        lists.map((list) =>
+          list !== 'schedules' && source === null ? [] : MORE_LISTS[list].read(prepared.config, source, context)
+        )
+      )
+      for (const [index, list] of lists.entries()) {
+        const read = reads[index]
+        if (read.status === 'rejected') {
+          result.notes.push(`Jules could not list the ${MORE_LISTS[list].label} of ${account}: ${read.reason.message}.`)
+        } else if (list === 'schedules') {
+          result.schedules = read.value.filter((entry) => matches(entry.source)).map(moreItemOfEntry)
+        } else {
+          result[list] = read.value.filter((entry) => matches(entry.source) && keep(entry)).map(moreItemOfEntry)
+        }
+      }
+      return result
+    })
+  )
+}
+
+function popupMoreAccount({ user: _user, ...account }) {
+  return account
+}
+
+function moreItemsOf(accounts, lists) {
+  return accounts.flatMap((account) =>
+    lists.flatMap((list) =>
+      account[list].map((item) => ({
+        ...item,
+        account: account.account,
+        user: account.user ?? null,
+        kind: MORE_LISTS[list].kind
+      }))
+    )
+  )
+}
+
+// A load answers with the lists of its category; LOAD_ARCHIVED adds the
+// archived tasks to it. `cachedAt` dates the oldest cached list it used
+// (null: all live).
+async function loadMoreItems(repo, category, fresh = false) {
+  startKeepAlive()
+  resetRunLimits()
+  try {
+    const { lists, keep } = MORE_LOAD_CATEGORIES[category]
+    const cache = { fresh, cachedAt: null }
+    const accounts = await listMoreItems(repo, lists, keep, NO_PROGRESS, cache)
+    await saveMoreCache()
+    // The new load replaces the old one before its save starts: an older
+    // load's archived answer arriving meanwhile is then stale.
+    const id = crypto.randomUUID()
+    moreLoadId = id
+    moreLoadRepo = repo
+    moreArchivedFor = null
+    moreArchivedDone = false
+    moreItems = new Map(moreItemsOf(accounts, lists).map((item) => [moreItemKey(item), item]))
+    moreItemsError = null
+    const notes = []
+    await saveMoreLoadOrNote(notes)
+    return { loadId: id, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
+  } finally {
+    stopKeepAlive()
+  }
+}
+
+// Read-only, so a run may start meanwhile. It keeps the worker alive on its
+// own: the run's keep-alive stops when the run ends, and this must not stop it.
+async function loadMoreArchived(loadId, fresh = false) {
+  const replaced = () => new Error('A newer load replaced this one. Load again.')
+  if (loadId !== moreLoadId) throw replaced()
+  if (moreArchivedFor === loadId) throw new Error('The archived tasks of this load are already listed. Load again.')
+  moreArchivedFor = loadId
+  const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo(), 25000)
+  const progress = moreArchivedProgress(loadId)
+  try {
+    const cache = { fresh, cachedAt: null }
+    const accounts = await listMoreItems(moreLoadRepo, ['archived'], undefined, progress, cache)
+    // What was listed is kept even when a newer load replaced this one.
+    await saveMoreCache()
+    if (loadId !== moreLoadId) throw replaced()
+    for (const item of moreItemsOf(accounts, ['archived'])) moreItems.set(moreItemKey(item), item)
+    moreArchivedDone = true
+    const notes = []
+    await saveMoreLoadOrNote(notes)
+    return { loadId, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
+  } catch (e) {
+    // Nothing was listed (no Jules tab, say): the same load may try again.
+    if (moreArchivedFor === loadId && !moreArchivedDone) moreArchivedFor = null
+    throw e
+  } finally {
+    progress.finish()
+    clearInterval(keepAlive)
+  }
+}
+
+async function executeMoreBatches(label, items, config, unarchive) {
+  const acted = []
+  for (let i = 0; i < items.length; i += julesApi.archiveBatch) {
+    acted.push(...(await archiveBatchWithSplit(label, items.slice(i, i + julesApi.archiveBatch), config, unarchive)))
+  }
+  if (!unarchive || !acted.length) return acted
+  // A batch can answer [] and still skip an id. The ids Jules doesn't list
+  // again are sent once more; any still missing after that are not counted.
+  // If the first check can't be read, the replies are trusted; the retried
+  // ids were already skipped once, so they count only when Jules lists them.
+  const missing = await stillArchived(label, acted, config)
+  if (!missing?.length) return acted
+  addLog(`[${label}] Unarchive check: retrying ${missing.length} missing item(s) once`)
+  const retried = []
+  for (let i = 0; i < missing.length; i += julesApi.archiveBatch) {
+    retried.push(...(await archiveBatchWithSplit(label, missing.slice(i, i + julesApi.archiveBatch), config, true)))
+  }
+  const failed = new Set(missing.filter((item) => !retried.includes(item)))
+  const after = await stillArchived(label, retried, config)
+  for (const item of after || retried) {
+    addLog(
+      `  [${label}] [${item.id}] ${item.title}: ${after ? 'still archived after a retry' : 'retried, not confirmed'}`
+    )
+    failed.add(item)
+  }
+  return acted.filter((item) => !failed.has(item))
+}
+
+// DeleteTasks takes a list of ids; Jules' own Delete permanently sends one.
+// The other per-item RPCs take the id alone.
+function moreActionPayload(operation, item) {
+  return operation === 'deleteTask' ? [[item.id]] : [item.id]
+}
+
+// The selected tasks Jules still lists as archived, read live: a load (a
+// cached one, say) may be older than a task's unarchiving in Jules, and
+// Delete permanently must not reach a task that is no longer archived. A
+// repo whose archive can't be read deletes nothing.
+async function stillArchivedInJules(label, items, config) {
+  const byRepo = new Map()
+  for (const item of items) byRepo.set(item.repo, [...(byRepo.get(item.repo) || []), item])
+  const archived = new Set()
+  const unread = new Set()
+  await runInPool([...byRepo], settings.perAccountParallel, async ([repo, group]) => {
+    try {
+      if (!repo) throw new Error('Jules gave no repo for them')
+      const listed = await withRetry(() => listTasks(`source_id=github/${repo} AND is_archived=true`, config))
+      for (const task of listed) archived.add(task.id)
+    } catch (e) {
+      unread.add(repo)
+      addLog(
+        `  [${label}] Could not check the archived tasks of ${repo || '(no repo)'}, so none of its ` +
+          `${group.length} task(s) are deleted: ${e.message}`
+      )
+    }
+  })
+  return items.filter((item) => {
+    if (unread.has(item.repo)) return false
+    if (archived.has(item.id)) return true
+    addLog(`  [${label}] [${item.id}] ${item.title}: Jules no longer lists it as archived; not deleted`)
+    return false
+  })
+}
+
+// The items Jules doesn't list among the non-archived tasks, or null when
+// the list can't be read.
+async function stillArchived(label, items, config) {
+  if (!items.length) return []
+  try {
+    const visible = new Set((await listTasks('', config)).map((task) => task.id))
+    return items.filter((item) => !visible.has(item.id))
+  } catch (e) {
+    addLog(`  [${label}] Could not check the unarchived tasks: ${e.message}`)
+    return null
+  }
+}
+
+// Archive checks the open PRs like the main Archive does; Force skips that
+// check and means nothing to the other actions.
+async function startMoreOperation(msg) {
+  const force = msg.operation === 'archive' && msg.force
+  const options = { action: 'more', opMode: 'more', moreAction: msg.operation, dryRun: msg.dryRun, force }
+  initOperationState(options)
+  resetRunLimits()
+  addLog(`=== MORE ACTIONS: ${MORE_ACTIONS[msg.operation].label} ===`)
+  updateState({ progress: { archived: 0, skipped: 0, total: msg.items.length } })
+  try {
+    if (moreItemsError) throw new Error(`Could not restore the last load: ${moreItemsError}. Load items again.`)
+    const groups = new Map()
+    const seen = new Set()
+    for (const selection of msg.items) {
+      const key = moreItemKey(selection)
+      const item = moreItems.get(key)
+      if (!moreActionFits(msg.operation, item) || seen.has(key)) {
+        addLog(
+          `Skipped [${selection.account}] [${selection.id}]: missing from last load, duplicate, or action does not fit`
+        )
+        state.progress.skipped++
+        continue
+      }
+      seen.add(key)
+      const group = groups.get(item.account) || []
+      group.push(item)
+      groups.set(item.account, group)
+    }
+    const tabs = keepFirstTabPerAccount(await getJulesTabs())
+    const results = await Promise.all(
+      [...groups].map(async ([account, selected]) => {
+        let count = 0
+        let work = null
+        try {
+          let candidates = selected
+          if (msg.operation === 'archive') {
+            const tasks = selected.map((item) => {
+              const [owner = '', repoName = ''] = (item.repo || '').split('/')
+              return { ...item, owner, repoName }
+            })
+            candidates = (await filterArchivableTasks(account, tasks, { force })).toArchive
+            state.progress.skipped += selected.length - candidates.length
+          }
+          work = takeRunBudget(account, candidates, 'selected item(s)')
+          state.progress.skipped += candidates.length - work.length
+          if (!work.length) return { label: account, count }
+          let acted
+          if (msg.dryRun) acted = work
+          else {
+            const tab = tabs.find((t) => `u/${extractAccountNum(t.url)}` === account)
+            const prepared = tab && (await prepareTab(tab))
+            if (!prepared) throw new Error('Open that Jules tab, check you are signed in, then load again.')
+            // After a sign-in change u/N is another account, whose credentials must not act on the load;
+            // one that no longer names its account can't be checked, so it doesn't act either.
+            const user = prepared.config.user ?? null
+            if (work.some((item) => item.user && item.user !== user)) {
+              throw new Error(
+                user
+                  ? `${account} is another Google account now than when it was loaded. Load again.`
+                  : `${account} no longer says which Google account it is, so the load can't be checked. Load again.`
+              )
+            }
+            await dropMoreCache(user, msg.operation, work)
+            try {
+              if (msg.operation === 'archive' || msg.operation === 'unarchive') {
+                acted = await executeMoreBatches(account, work, prepared.config, msg.operation === 'unarchive')
+              } else {
+                const targets =
+                  msg.operation === 'deleteTask' ? await stillArchivedInJules(account, work, prepared.config) : work
+                acted = []
+                for (const item of targets) {
+                  try {
+                    await callBatchExecute(
+                      rpc(MORE_ACTIONS[msg.operation].method),
+                      moreActionPayload(msg.operation, item),
+                      prepared.config
+                    )
+                    acted.push(item)
+                  } catch (e) {
+                    addLog(`ERROR [${account}] [${item.id}]: ${e.message}`)
+                  }
+                }
+              }
+            } finally {
+              // An older Load still listing may have read these lists while the action ran.
+              await dropMoreCache(user, msg.operation, work)
+            }
+          }
+          for (const item of acted) {
+            addLog(
+              `${msg.dryRun ? 'DRY RUN - would ' : ''}${MORE_ACTIONS[msg.operation].label} [${account}] [${item.id}] ${item.title}`
+            )
+            if (!msg.dryRun) moreItems.delete(moreItemKey(item))
+          }
+          count = acted.length
+          state.progress.archived += count
+          state.progress.skipped += work.length - count
+          updateState({})
+          return { label: account, count }
+        } catch (e) {
+          addLog(`ERROR [${account}]: ${e.message}`)
+          // Before the budget is taken, every selected item is still waiting.
+          state.progress.skipped += work ? work.length - count : selected.length
+          return { label: account, count, err: e.message }
+        }
+      })
+    )
+    if (!msg.dryRun) await saveMoreLoad()
+    finalizeOperation(results, options)
+  } catch (e) {
+    handleOperationError(e)
+  } finally {
+    stopKeepAlive()
+    applyPendingJulesApi()
   }
 }
 
 // =============================================================================
 // Message Handlers
 // =============================================================================
+
+// =============================================================================
+// Jules API rediscovery
+// =============================================================================
+
+// Reads the RPC ids and the task-state map from the Jules web app's scripts,
+// from Settings > "Rediscover from Jules" and once a day. Changes apply at
+// once and go to a short log (JULES_API_LOG_KEY).
+const API_REDISCOVER_ALARM = 'jta-api-rediscover'
+
+// Runs inside the Jules tab (isolated world), so it must stand alone. Fetches
+// only https scripts on jules.google.com or *.gstatic.com and returns parsed
+// values, never the script text.
+async function readJulesBundle() {
+  const urls = new Set()
+  for (const el of document.scripts) if (el.src) urls.add(el.src)
+  for (const entry of performance.getEntriesByType('resource')) {
+    if (entry.initiatorType === 'script') urls.add(entry.name)
+  }
+  const allowed = [...urls].filter((u) => {
+    try {
+      const { protocol, hostname } = new URL(u)
+      return protocol === 'https:' && (hostname === 'jules.google.com' || hostname.endsWith('.gstatic.com'))
+    } catch {
+      return false
+    }
+  })
+  const rpc = []
+  const stateMaps = []
+  const rpcPattern = /\{S:"([A-Za-z0-9]{5,6})",V:"\/([\w.]+)"/g
+  const mapStart = 'new Map([[0,"Unknown"]'
+  for (const url of allowed.slice(0, 40)) {
+    // A script that stops arriving is skipped, not waited on forever.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 20 * 1000)
+    let text
+    try {
+      text = await (await fetch(url, { signal: controller.signal })).text()
+    } catch {
+      continue
+    } finally {
+      clearTimeout(timer)
+    }
+    for (const m of text.matchAll(rpcPattern)) rpc.push([m[1], m[2]])
+    for (let at = text.indexOf(mapStart); at !== -1; at = text.indexOf(mapStart, at + 1)) {
+      const open = at + 'new Map('.length
+      let depth = 0
+      let end = -1
+      for (let i = open; i < text.length && i < open + 4000; i++) {
+        if (text[i] === '"') i = text.indexOf('"', i + 1)
+        else if (text[i] === '[') depth++
+        else if (text[i] === ']' && --depth === 0) {
+          end = i + 1
+          break
+        }
+        if (i === -1) break
+      }
+      if (end === -1) continue
+      try {
+        stateMaps.push(JSON.parse(text.slice(open, end)))
+      } catch {
+        /* not a plain literal */
+      }
+    }
+  }
+  return { rpc, stateMaps, scripts: allowed.length }
+}
+
+// One check at a time: a second request (the popup's button while the daily
+// alarm runs) gets the same answer.
+let rediscovery = null
+
+// A check stuck in the tab must not hold every later one.
+const REDISCOVER_DEADLINE_MS = 2 * 60 * 1000
+
+// Each check gets a number; only the latest one, within its deadline, may save
+// what it found. A check that ran out of time and ends later is dropped, so it
+// can't roll back a newer check's values.
+let rediscoveryGeneration = 0
+
+function rediscoverJulesApi() {
+  if (rediscovery) return rediscovery
+  const generation = ++rediscoveryGeneration
+  let timer
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      if (rediscoveryGeneration === generation) rediscoveryGeneration++
+      reject(new Error('The Jules check took too long. Reload the Jules tab and try again.'))
+    }, REDISCOVER_DEADLINE_MS)
+  })
+  const current = () => rediscoveryGeneration === generation
+  rediscovery = Promise.race([discoverJulesApi(current), deadline]).finally(() => {
+    clearTimeout(timer)
+    rediscovery = null
+  })
+  return rediscovery
+}
+
+async function discoverJulesApi(current = () => true) {
+  const [tab] = await getJulesTabs()
+  if (!tab) throw new Error('Open a Jules tab first.')
+  const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 })
+  if (!frame?.url || new URL(frame.url).origin !== JULES_ORIGIN) throw new Error('The Jules tab is not on Jules.')
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, documentIds: [frame.documentId] },
+    func: readJulesBundle
+  })
+  const found = injection?.result
+  if (!found?.scripts)
+    throw new Error("Could not read the Jules web app's scripts. Reload the Jules tab and try again.")
+
+  if (!current()) throw new Error('A newer Jules check replaced this one.')
+  const stored = await chrome.storage.local.get([JULES_API_KEY, JULES_API_LOG_KEY])
+  const { api, changes, problems } = applyDiscovery(stored[JULES_API_KEY], found, TASK_STATES)
+  api.checkedAt = Date.now()
+  const pastLog = Array.isArray(stored[JULES_API_LOG_KEY]) ? stored[JULES_API_LOG_KEY] : []
+  const log = [{ at: api.checkedAt, changes, problems }, ...pastLog].slice(0, JULES_API_LOG_MAX)
+  if (!current()) throw new Error('A newer Jules check replaced this one.')
+  await chrome.storage.local.set({ [JULES_API_KEY]: api, [JULES_API_LOG_KEY]: log })
+  // The deadline can pass during the save. A newer check's save lands after
+  // this one, so storage ends on its values; memory must not go back either.
+  if (!current()) throw new Error('A newer Jules check replaced this one.')
+  applyJulesApi(api)
+  if (changes.length) console.info('[JTA] Jules API values changed:', changes.join('; '))
+  return { api, changes, problems }
+}
 
 // Repo picker source for the popup: every connected repo of the first Jules
 // tab's account, as sorted "owner/repo" display names.
@@ -2101,6 +3713,68 @@ async function getAllSourceNames() {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.action) {
+    case 'LOAD_ITEMS':
+    case 'LOAD_ARCHIVED':
+    case 'APPLY_ACTION': {
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      if (state.status === 'running' || startPending) {
+        sendResponse({ error: 'A run is already going. Wait for it to finish.' })
+        break
+      }
+      const problem = moreMessageProblem(msg)
+      if (problem) {
+        sendResponse({ error: problem })
+        break
+      }
+      const ready = Promise.all([stateReadyPromise, settingsReadyPromise, moreItemsReadyPromise]).then(() => {
+        if (settingsProblem()) throw new Error(settingsProblem())
+      })
+      // The archived listing is read-only and slow, so it holds nothing back.
+      if (msg.action === 'LOAD_ARCHIVED') {
+        ready
+          .then(() => loadMoreArchived(msg.loadId, msg.fresh === true))
+          .then(sendResponse, (e) => sendResponse({ error: e.message }))
+        return true
+      }
+      startPending = true
+      ready
+        .then(async () => {
+          if (state.status === 'running') throw new Error('A run is already going. Wait for it to finish.')
+          if (msg.action === 'LOAD_ITEMS') return loadMoreItems(msg.repo, msg.category, msg.fresh === true)
+          startMoreOperation(msg)
+          return { ok: true }
+        })
+        .then(
+          (response) => {
+            startPending = false
+            sendResponse(response)
+          },
+          (e) => {
+            startPending = false
+            sendResponse({ error: e.message })
+          }
+        )
+      return true
+    }
+
+    case 'REDISCOVER_API':
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      // New RPC ids mid-run would mix two sets of values in one run.
+      if (state.status === 'running') {
+        sendResponse({ error: 'A run is going. Rediscover once it finishes.' })
+        break
+      }
+      rediscoverJulesApi()
+        .then((result) => sendResponse(result))
+        .catch((err) => sendResponse({ error: err.message }))
+      return true
+
     case 'GET_ALL_SOURCES':
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })
@@ -2114,14 +3788,49 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         })
       return true
 
-    case 'START':
+    case 'HELLO':
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })
         break
       }
-      startOperation(msg.options)
-      sendResponse({ ok: true })
+      sendResponse({ protocol: RUN_PROTOCOL })
       break
+
+    case 'START': {
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      // One run at a time: two runs would read the same daily quota and race
+      // each other on the same tasks.
+      if (state.status === 'running' || startPending) {
+        sendResponse({ error: 'A run is already going. Wait for it to finish.' })
+        break
+      }
+      const problem = startMessageProblem(msg)
+      if (problem) {
+        sendResponse({ error: problem })
+        break
+      }
+      // Wait for the run state a woken worker restores (restoring it after
+      // the run began would mark the run interrupted and let a second START
+      // in) and for the task states saved by the last rediscovery, which the
+      // item is resolved against.
+      startPending = true
+      Promise.all([stateReadyPromise, settingsReadyPromise])
+        .then(() => {
+          if (settingsProblem()) throw new Error(settingsProblem())
+          resolveRunOptions(msg.options)
+          if (state.status === 'running') throw new Error('A run is already going. Wait for it to finish.')
+          startOperation(msg.options)
+          sendResponse({ ok: true })
+        })
+        .catch((e) => sendResponse({ error: e.message }))
+        .finally(() => {
+          startPending = false
+        })
+      return true
+    }
 
     case 'GET_STATE':
       if (_sender.tab) {
@@ -2170,6 +3879,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Optional chaining keeps the script loadable in non-extension contexts where
 // these APIs may be absent (e.g. unit-test sandboxes with partial mocks).
 chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === API_REDISCOVER_ALARM) {
+    if (state.status === 'running' || startPending) return // tomorrow's check will do
+    rediscoverJulesApi().catch((e) => console.warn('[JTA] Daily Jules API check skipped:', e.message))
+    return
+  }
   if (alarm.name !== SCHEDULE_ALARM_NAME) return
   // Fire-and-forget is fine here: a tick that throws still resolves cleanly —
   // startOperation captures failures into state.error for the popup to show.
@@ -2191,3 +3905,8 @@ chrome.storage?.onChanged?.addListener((changes, area) => {
 
 // Reconcile alarm vs config on every SW startup (alarms outlive the worker).
 syncScheduleAlarm().catch((e) => console.error('[JTA] Alarm sync failed:', e))
+
+// The daily Jules API check; created once, kept across worker restarts.
+Promise.resolve(chrome.alarms?.get?.(API_REDISCOVER_ALARM))
+  .then((alarm) => alarm || chrome.alarms?.create?.(API_REDISCOVER_ALARM, { periodInMinutes: 24 * 60 }))
+  .catch((e) => console.error('[JTA] Could not schedule the daily Jules API check:', e))

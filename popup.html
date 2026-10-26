@@ -7,109 +7,338 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <header>
-      <h1>Jules Task Archiver</h1>
-      <span class="version">v2.0</span>
+    <header class="top">
+      <h1 class="brand mono">JULES<span class="dot" aria-hidden="true">·</span>TASK ARCHIVER</h1>
+      <nav class="lrow" aria-label="Settings, schedule, more actions and export">
+        <button type="button" class="xbtn" id="settingsToggle" aria-expanded="false" aria-controls="settingsPanel">
+          <span class="caret" aria-hidden="true"></span>Settings
+        </button>
+        <button type="button" class="xbtn" id="scheduleToggle" aria-expanded="false" aria-controls="schedulePanel">
+          <span class="caret" aria-hidden="true"></span>Schedule
+        </button>
+        <button type="button" class="xbtn" id="moreToggle" aria-expanded="false" aria-controls="morePanel">
+          <span class="caret" aria-hidden="true"></span>More Actions
+        </button>
+        <button
+          type="button"
+          class="linkbtn"
+          id="exportBtn"
+          title="Export the code suggestions of every Jules tab to a JSON file you can download"
+        >
+          ↓ Export
+        </button>
+      </nav>
+      <div class="status mono" id="tabStatus">
+        <span class="pulse" aria-hidden="true"></span><span id="tabStatusText">Checking tabs…</span>
+      </div>
     </header>
 
-    <form id="mainForm">
-    <section class="options">
-      <h2>Options</h2>
-      <div class="setting-row">
-        <fieldset class="fieldset-reset">
-          <legend id="opModeLabel">Operation</legend>
-          <div class="segmented" id="opMode">
-            <button type="button" data-value="archive" class="active" aria-pressed="true">Archive Tasks</button>
-            <button type="button" data-value="suggestions" aria-pressed="false">Start (Separate)</button>
-            <button type="button" data-value="agent_batch" aria-pressed="false">Batch to 1 Agent</button>
-            <button type="button" data-value="remove_suggestions" aria-pressed="false">Remove</button>
-            <button type="button" data-value="export_suggestions" aria-pressed="false">Export JSON</button>
+    <div class="cols" id="mainView">
+      <main class="body">
+        <div class="row">
+          <span class="k mono" id="itemsLabel">Items</span>
+          <div class="v">
+            <div class="sel">
+              <button
+                type="button"
+                class="sel-btn"
+                id="itemsBtn"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                aria-controls="itemsMenu"
+                aria-labelledby="itemsLabel itemsBtnText"
+              >
+                <span id="itemsBtnText">All</span><span class="tri" aria-hidden="true"></span>
+              </button>
+              <div class="menu" id="itemsMenu" role="listbox" aria-labelledby="itemsLabel" tabindex="-1"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="opts">
+            <label class="cb"><input type="checkbox" id="dryRun" checked aria-describedby="idleText" />Dry-run</label>
+            <span class="tip">
+              <label class="cb"><input type="checkbox" id="force" aria-describedby="forceTip" />Force</label>
+              <button type="button" class="tip-btn" aria-label="What Force does" aria-describedby="forceTip">?</button>
+              <span class="tip-box" role="tooltip" id="forceTip"
+                >Archive skips the open-PR check. Proceed on All also messages Completed tasks.</span
+              >
+            </span>
+            <span class="tip">
+              <label class="cb"
+                ><input type="checkbox" id="addMessage" aria-controls="message" aria-describedby="messageHint" />Add a
+                message</label
+              >
+              <button type="button" class="tip-btn" aria-label="What the message does" aria-describedby="messageHint">
+                ?
+              </button>
+              <span class="tip-box" role="tooltip" id="messageHint"></span>
+            </span>
+          </div>
+          <textarea
+            id="message"
+            rows="3"
+            maxlength="2000"
+            disabled
+            aria-label="Message"
+            aria-describedby="messageHint"
+            placeholder="Your message"
+          ></textarea>
+        </div>
+
+        <label class="cb hidden" id="oneSessionRow"
+          ><input type="checkbox" id="oneSession" />One session for all<span class="hint">one per repo, carrying all its suggestions</span></label
+        >
+
+        <hr />
+
+        <fieldset class="row fieldset-reset">
+          <legend class="k mono" id="scopeLabel">Scope</legend>
+          <div class="v" role="radiogroup" aria-labelledby="scopeLabel">
+            <label class="cb"><input type="radio" name="scope" value="all" checked />All Jules tabs</label>
+            <label class="cb"><input type="radio" name="scope" value="current" />Current tab</label>
           </div>
         </fieldset>
-      </div>
-      <div class="setting-row">
-        <fieldset class="fieldset-reset">
-          <legend id="execModeLabel">Execution Mode</legend>
-          <div class="radio-group" role="radiogroup" aria-labelledby="execModeLabel">
-            <label><input type="radio" name="mode" value="dry" checked /> Dry Run</label>
-            <label><input type="radio" name="mode" value="run" /> Run</label>
+
+        <div class="row">
+          <label class="k mono" for="repoFilter">Repository</label>
+          <div class="v">
+            <select id="repoFilter" class="sel-btn sm" aria-describedby="repoFilterHint">
+              <option value="" selected>All Repositories</option>
+            </select>
+            <input
+              type="text"
+              id="customRepoInput"
+              class="custom-repo-input"
+              placeholder="owner/repo"
+              spellcheck="false"
+              autocomplete="off"
+              aria-label="Custom repository (owner/repo)"
+              aria-describedby="repoFilterHint"
+              maxlength="140"
+              pattern="[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+"
+            />
           </div>
-        </fieldset>
-      </div>
-      <div class="setting-row">
-        <label class="checkbox">
-          <input type="checkbox" id="force" aria-describedby="forceHint" />
-          Force
-        </label>
-      <label for="force" class="hint block-hint" id="forceHint">Archive every task, ignoring state and matching open Pull Requests</label>
-      </div>
-      <div class="setting-row">
-        <fieldset class="fieldset-reset">
-          <legend id="scopeLabel">Scope</legend>
-          <div class="radio-group" role="radiogroup" aria-labelledby="scopeLabel">
-            <label><input type="radio" name="scope" value="current" /> Current tab</label>
-            <label><input type="radio" name="scope" value="all" checked /> All Jules tabs</label>
+        </div>
+        <span class="hint sr-only" id="repoFilterHint">Select from the list or type owner/repo</span>
+
+        <p class="alert hidden" id="staleBanner" role="alert">
+          The extension changed on disk but Chrome is still running the old version, so nothing can run and the
+          schedule is locked. Reload the extension at chrome://extensions, then open this popup again.
+        </p>
+        <div class="actions">
+          <button type="button" class="act pri" id="proceedBtn">Proceed</button>
+          <button type="button" class="act" id="archiveBtn">Archive</button>
+        </div>
+      </main>
+      <section class="log" id="progressSection" aria-label="Progress">
+        <div class="log-in">
+          <div class="h"><span>Progress / log</span><span id="logStatus">Idle</span></div>
+          <div
+            class="bar"
+            role="progressbar"
+            aria-valuenow="0"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-label="Operation progress"
+          >
+            <i id="progressFill"></i>
           </div>
-        </fieldset>
+          <span class="idle" id="idleText">Dry-run is on: Proceed and Archive only list what they would do.</span>
+          <div id="currentInfo" class="current-info" aria-live="polite"></div>
+          <!-- biome-ignore lint/a11y/noNoninteractiveTabindex: Scrollable log needs tabindex -->
+          <pre id="log" class="hidden" aria-live="off" tabindex="0"></pre>
+          <div id="summarySection" class="hidden">
+            <div id="summary" class="summary" aria-live="polite"></div>
+          </div>
+          <div class="btns">
+            <button type="button" id="resetBtn" class="sb hidden">Reset</button>
+            <button type="button" id="downloadBtn" class="sb pri hidden">⬇ Download suggestions JSON</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="xb set hidden" id="settingsPanel" aria-labelledby="settingsToggle">
+      <div class="scol">
+        <div class="srow">
+          <span class="sk mono">GitHub</span>
+          <div class="sv">
+            <div class="line">
+              <label class="l" for="ghOwner">Owner</label>
+              <input
+                type="text"
+                id="ghOwner"
+                class="m"
+                placeholder="org or user"
+                spellcheck="false"
+                autocomplete="username"
+                aria-describedby="ghOwnerHint ghOwnerError"
+                maxlength="39"
+                pattern="[a-zA-Z0-9\-]+"
+              />
+              <label class="l" for="ghToken">Token</label>
+              <input
+                type="password"
+                id="ghToken"
+                class="s"
+                placeholder="ghp_..."
+                spellcheck="false"
+                autocomplete="current-password"
+                aria-describedby="ghOwnerHint"
+                maxlength="255"
+              />
+            </div>
+            <span class="shint" id="ghOwnerHint">Optional. Archive skips tasks with a matching open PR; the token is for private repos.</span>
+            <div id="ghOwnerError" class="validation-error" aria-live="polite">
+              Only alphanumeric characters and hyphens allowed.
+            </div>
+          </div>
+        </div>
+        <div class="srow">
+          <span class="sk mono">Timeouts</span>
+          <div class="sv">
+            <div class="line">
+              <label class="l" for="requestTimeoutSec">Request</label>
+              <input type="number" id="requestTimeoutSec" class="n" min="5" max="600" step="1" inputmode="numeric" />
+              <span class="u">s</span>
+              <label class="l" for="listTimeoutSec">Task list</label>
+              <input type="number" id="listTimeoutSec" class="n" min="30" max="1800" step="1" inputmode="numeric" />
+              <span class="u">s</span>
+            </div>
+            <span class="shint">Listing every task can take minutes on a big account.</span>
+          </div>
+        </div>
+        <div class="srow">
+          <span class="sk mono">Pacing</span>
+          <div class="sv">
+            <span class="shint" id="pacingHint"
+              >Requests sent together each wait 0.5–2 s first. On HTTP 429 the account pauses as long as Jules asks.</span
+            >
+            <div class="line">
+              <label class="cb"
+                ><input type="checkbox" id="extraJitter" aria-describedby="pacingHint" />Extra jitter, up to</label
+              >
+              <input
+                type="number"
+                id="extraJitterMaxSec"
+                class="n"
+                min="1"
+                max="300"
+                step="1"
+                inputmode="numeric"
+                aria-label="Extra jitter, maximum seconds"
+              />
+              <span class="u">s</span>
+            </div>
+            <div class="line">
+              <span class="l">Parallel requests</span>
+              <input
+                type="number"
+                id="perAccountParallel"
+                class="n"
+                min="1"
+                max="20"
+                step="1"
+                inputmode="numeric"
+                aria-label="Parallel requests per account"
+              />
+              <span class="u">per account</span>
+              <input
+                type="number"
+                id="totalParallel"
+                class="n"
+                min="1"
+                max="50"
+                step="1"
+                inputmode="numeric"
+                aria-label="Parallel requests in total"
+              />
+              <span class="u">total</span>
+            </div>
+          </div>
+        </div>
+        <div class="srow">
+          <span class="sk mono">Runs</span>
+          <div class="sv">
+            <div class="line">
+              <label class="l" for="runLimit">Run up to</label>
+              <input
+                type="number"
+                id="runLimit"
+                class="n"
+                min="0"
+                max="100000"
+                step="1"
+                inputmode="numeric"
+                aria-describedby="runLimitHint"
+              />
+              <span class="u" id="runLimitHint">items per run (0 = no limit)</span>
+            </div>
+            <label class="cb"
+              ><input type="checkbox" id="reloadTabOnSignIn" />Reload the Jules tab when its sign-in stops working</label
+            >
+          </div>
+        </div>
+        <div class="srow last">
+          <span class="sk mono">About</span>
+          <div class="sv">
+            <a href="license.html" target="_blank" rel="noopener noreferrer" class="linkrow">License &amp; Credits</a>
+          </div>
+        </div>
       </div>
-      <div class="setting-row">
-        <label for="repoFilter">Repository</label>
-        <span class="hint block-hint" id="repoFilterHint">(select from list or type owner/repo below)</span>
-        <select id="repoFilter" aria-describedby="repoFilterHint">
-          <option value="" selected>All Repositories</option>
-        </select>
-        <input
-          type="text"
-          id="customRepoInput"
-          class="custom-repo-input"
-          placeholder="Or enter owner/repo"
-          spellcheck="false"
-          autocomplete="off"
-          aria-label="Custom repository (owner/repo)"
-          aria-describedby="repoFilterHint"
-          maxlength="140"
-          pattern="[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+"
-        />
+      <div class="scol">
+        <div class="srow">
+          <span class="sk mono">Default messages</span>
+          <div class="sv">
+            <label class="l" for="defaultReply">Reply to sessions waiting on you</label>
+            <textarea id="defaultReply" class="sm" rows="2" maxlength="2000" aria-describedby="defaultsHint"></textarea>
+            <label class="l" for="defaultRetry">Retry for sessions that failed</label>
+            <textarea id="defaultRetry" class="sm" rows="2" maxlength="2000" aria-describedby="defaultsHint"></textarea>
+            <span class="shint" id="defaultsHint">Empty uses the built-in text. Add a message goes after these.</span>
+            <span class="alert hidden" id="settingsStatus" role="alert"></span>
+          </div>
+        </div>
+        <div class="srow last">
+          <span class="sk mono">Jules API values</span>
+          <div class="sv">
+            <div class="rpcs" id="rpcInputs"></div>
+            <div class="line">
+              <label class="l" for="archiveBatch">Archive batch</label>
+              <input type="number" id="archiveBatch" class="n" min="1" max="200" step="1" inputmode="numeric" />
+              <label class="l" for="archiveSplit">split when rejected</label>
+              <input type="number" id="archiveSplit" class="n" min="1" max="200" step="1" inputmode="numeric" />
+            </div>
+            <span class="shint" id="apiStates"></span>
+            <div class="line">
+              <button type="button" class="sb" id="rediscoverBtn">Rediscover from Jules</button>
+              <button type="button" class="sb" id="resetApiBtn">Reset to defaults</button>
+            </div>
+            <span class="shint" id="apiStatus" aria-live="polite"></span>
+          </div>
+        </div>
       </div>
     </section>
-
-    <section class="settings">
-      <h2>Settings</h2>
-      <div class="setting-row">
-        <label for="ghOwner">GitHub Owner</label>
-        <span class="hint block-hint" id="ghOwnerHint">(optional, used for PR checks)</span>
-        <input type="text" id="ghOwner" placeholder="your-github-username" spellcheck="false" autocomplete="username" aria-describedby="ghOwnerHint ghOwnerError" maxlength="39" pattern="[a-zA-Z0-9\-]+" />
-        <div id="ghOwnerError" class="validation-error" aria-live="polite">Only alphanumeric characters and hyphens allowed.</div>
-      </div>
-      <div class="setting-row">
-        <label for="ghToken">GitHub Token</label>
-        <span class="hint block-hint" id="ghTokenHint">(optional, for private repos)</span>
-        <input
-          type="password"
-          id="ghToken"
-          placeholder="ghp_..."
-          spellcheck="false"
-          autocomplete="current-password"
-          aria-describedby="ghTokenHint"
-          maxlength="255"
-        />
-      </div>
-    </section>
-
-    <section class="schedule">
-      <h2>Schedule</h2>
-      <div class="setting-row">
-        <label class="checkbox">
-          <input type="checkbox" id="schedEnabled" aria-describedby="schedEnabledHint" />
-          Auto-archive on a schedule
-        </label>
-        <span class="hint block-hint" id="schedEnabledHint">Periodically archives finished tasks across all Jules tabs (background alarm)</span>
-      </div>
-      <div class="setting-row">
-        <label for="schedInterval">Every</label>
+    <section class="xb hidden" id="schedulePanel" aria-labelledby="scheduleToggle">
+      <label class="cb"
+        ><input
+          type="checkbox"
+          class="switch"
+          id="schedEnabled"
+          aria-describedby="schedEnabledHint"
+        />Archive
+        Completed tasks automatically</label
+      >
+      <span class="shint" id="schedEnabledHint"
+        >Runs in the background across all Jules tabs and skips tasks with a matching open PR.</span
+      >
+      <div class="line">
+        <label class="l" for="schedInterval">Every</label>
         <input
           type="number"
           id="schedInterval"
+          class="n"
           min="1"
           max="1440"
           step="1"
@@ -117,20 +346,20 @@
           inputmode="numeric"
           aria-describedby="schedIntervalHint"
         />
-        <span class="hint" id="schedIntervalHint">minutes (1–1440)</span>
+        <span class="u" id="schedIntervalHint">minutes (1–1440)</span>
+        <span class="hint hidden" id="schedNext"></span>
       </div>
-      <div class="setting-row">
-        <label class="checkbox">
-          <input type="checkbox" id="schedSuggestions" aria-describedby="schedSuggestionsHint" />
-          Also start suggestions each tick
-        </label>
-        <span class="hint block-hint" id="schedSuggestionsHint">Starts queued code suggestions after archiving, capped per tick</span>
-      </div>
-      <div class="setting-row">
-        <label for="schedMaxStarts">Max starts per tick</label>
+      <label class="cb"
+        ><input type="checkbox" id="schedSuggestions" aria-describedby="schedSuggestionsHint" />Also start
+        suggestions each run</label
+      >
+      <span class="shint" id="schedSuggestionsHint">Starts queued code suggestions after archiving.</span>
+      <div class="line">
+        <label class="l" for="schedMaxStarts">Max starts per run</label>
         <input
           type="number"
           id="schedMaxStarts"
+          class="n"
           min="1"
           max="500"
           step="1"
@@ -138,34 +367,48 @@
           inputmode="numeric"
           aria-describedby="schedMaxStartsHint"
         />
-        <span class="hint" id="schedMaxStartsHint">(1–500, shared across all accounts)</span>
+        <span class="u" id="schedMaxStartsHint">1–500, shared across accounts</span>
       </div>
     </section>
 
-    <button type="submit" id="startBtn" class="primary">Start Archiving</button>
-    <button type="button" id="resetBtn" class="secondary hidden">Reset</button>
-    <button type="button" id="downloadBtn" class="primary download-btn hidden">⬇ Download Suggestions JSON</button>
-    </form>
-
-    <section id="progressSection" class="hidden">
-      <h2>Progress</h2>
-      <div id="currentInfo" class="current-info" aria-live="polite"></div>
-      <div class="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-label="Operation progress">
-        <div id="progressFill" class="progress-fill"></div>
+    <section class="xb hidden" id="morePanel" aria-labelledby="moreToggle">
+      <fieldset class="more-scope">
+        <legend class="k mono">Scope</legend>
+        <div class="line">
+          <label class="cb"><input type="radio" name="moreScope" id="moreAll" value="all" checked />All</label>
+          <label class="cb"><input type="radio" name="moreScope" id="moreRepoScope" value="repo" />Repo</label>
+          <input type="text" id="moreRepo" placeholder="org/repo" aria-label="Repository (org/repo)" />
+          <select id="moreCategory" aria-label="Items to load">
+            <option value="all" selected>All</option>
+            <option value="scheduled">Scheduled</option>
+            <option value="complete">Completed</option>
+            <option value="archive">Archived</option>
+          </select>
+          <button type="button" class="sb" id="moreLoad">Load</button>
+          <button type="button" class="sb hidden" id="moreRefresh" title="List again from Jules, past the cache">
+            Refresh
+          </button>
+        </div>
+      </fieldset>
+      <span class="shint" id="moreStatus" aria-live="polite">Load items to choose actions.</span>
+      <fieldset class="more-chips" id="moreChips" aria-label="Item categories"></fieldset>
+      <div class="line">
+        <label class="cb"><input type="checkbox" id="moreSelectAll" />Select all shown</label>
+        <label class="cb"><input type="checkbox" id="moreDryRun" />Dry run</label>
+        <label class="cb" title="Archive without the open-PR check"
+          ><input type="checkbox" id="moreForce" disabled />Force</label
+        >
       </div>
-      <!-- biome-ignore lint/a11y/noNoninteractiveTabindex: Scrollable log needs tabindex -->
-      <pre id="log" class="log" aria-live="off" tabindex="0"></pre>
+      <section id="moreList" aria-label="Loaded items"></section>
+      <div class="line">
+        <label class="l" for="moreAction">Action</label>
+        <select id="moreAction"><option value="">Choose an action</option></select>
+        <button type="button" class="sb" id="moreConfirm" disabled>Confirm</button>
+      </div>
     </section>
 
-    <section id="summarySection" class="hidden">
-      <h2>Summary</h2>
-      <div id="summary" class="summary" aria-live="polite"></div>
-    </section>
-
-    <footer>
-      <a href="license.html" target="_blank" rel="noopener noreferrer" class="footer-link">License &amp; Credits</a>
-    </footer>
-
+    <script src="items.js"></script>
+    <script src="settings.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

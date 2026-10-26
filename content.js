@@ -10,14 +10,38 @@
 // Store config extracted from MAIN world
 let cachedConfig = null
 
+// Tell main-world.js which CreateTask RPC id to watch: the one saved in the
+// Jules API values (settings.js), null for the built-in one, or '' for none
+// while a rediscovery has CreateTask in doubt: background.js doesn't send it
+// then, and the id may now be another method's.
+function postCreateTaskRpc(julesApi) {
+  const rpcId = julesApi?.rpc?.CreateTask
+  const inDoubt = Array.isArray(julesApi?.inDoubt) && julesApi.inDoubt.includes('CreateTask')
+  window.postMessage(
+    { type: 'JULES_CREATE_TASK_RPC', rpcId: inDoubt ? '' : typeof rpcId === 'string' ? rpcId : null },
+    window.location.origin
+  )
+}
+
+function sendCreateTaskRpc() {
+  chrome.storage?.local?.get?.('julesApi', (data) => postCreateTaskRpc(data?.julesApi))
+}
+
 // Inject main-world.js into the page to access variables
 function injectMainWorldScript() {
   const script = document.createElement('script')
   script.src = chrome.runtime.getURL('main-world.js')
-  script.onload = () => script.remove()
+  script.onload = () => {
+    script.remove()
+    sendCreateTaskRpc()
+  }
   ;(document.head || document.documentElement).appendChild(script)
 }
 injectMainWorldScript()
+
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  if (area === 'local' && 'julesApi' in changes) postCreateTaskRpc(changes.julesApi.newValue)
+})
 
 // Reject messages that did not originate from this page's own window/origin.
 // The MAIN world script and isolated world share the same window and origin,
@@ -36,7 +60,10 @@ window.addEventListener('message', (event) => {
   if (event.data?.type === 'JULES_ARCHIVER_CONFIG') {
     cachedConfig = event.data.config
   }
-  if (event.data?.type === 'JULES_START_CONFIG') {
+  // Only the current observer (main-world.js version 4) is relayed. An older
+  // one stays installed on a page opened before an update, and version 2
+  // posted the first RPC of any request, so its config is not trusted.
+  if (event.data?.type === 'JULES_START_CONFIG' && event.data.observer === 4) {
     chrome.runtime.sendMessage({
       action: 'CACHE_START_CONFIG',
       config: event.data.config
@@ -45,9 +72,11 @@ window.addEventListener('message', (event) => {
 })
 
 // Request fresh config from MAIN world script
-function extractConfig() {
+// `fresh` skips the cache: the background asks for it when Jules rejected the
+// cached tokens.
+function extractConfig(fresh = false) {
   // If already cached and fresh (less than 5 min old), return it
-  if (cachedConfig?.timestamp && Date.now() - cachedConfig.timestamp < 300000) {
+  if (!fresh && cachedConfig?.timestamp && Date.now() - cachedConfig.timestamp < 300000) {
     return Promise.resolve(cachedConfig)
   }
 
@@ -99,7 +128,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       break
 
     case 'GET_CONFIG':
-      extractConfig().then((config) => {
+      extractConfig(msg.fresh === true).then((config) => {
         sendResponse({
           config,
           accountNum: getAccountNum(),

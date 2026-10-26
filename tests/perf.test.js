@@ -6,6 +6,8 @@ const path = require('node:path')
 
 const bgScriptPath = path.join(__dirname, '..', 'background.js')
 const bgScriptContent = fs.readFileSync(bgScriptPath, 'utf8')
+const itemsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'items.js'), 'utf8')
+const settingsScriptContent = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8')
 
 function setupEnvironment(initialStorage = {}) {
   let currentStorage = { ...initialStorage }
@@ -64,7 +66,13 @@ function setupEnvironment(initialStorage = {}) {
   }
 
   vm.createContext(sandbox)
-  vm.runInContext(bgScriptContent, sandbox, { filename: bgScriptPath })
+  for (const [source, filename] of [
+    [itemsScriptContent, path.join(__dirname, '..', 'items.js')],
+    [settingsScriptContent, path.join(__dirname, '..', 'settings.js')],
+    [bgScriptContent, bgScriptPath]
+  ])
+    vm.runInContext(source, sandbox, { filename })
+  sandbox.burstDelayMs = () => 0 // no pacing waits in tests
 
   return sandbox
 }
@@ -146,7 +154,7 @@ describe('Orchestrator Performance Optimization', () => {
     }
 
     const tab = { id: 123, url: 'https://jules.google.com/u/0/' }
-    const options = { force: true } // Force to skip PR check for simplicity
+    const options = { item: sandbox.resolveItem('All'), force: true } // Force to skip PR check for simplicity
 
     await sandbox.processTab(tab, options)
 
@@ -182,7 +190,7 @@ describe('Throttling Optimization', () => {
     }
 
     const tab = { id: 123, url: 'https://jules.google.com/u/0/' }
-    const options = { force: true }
+    const options = { item: sandbox.resolveItem('All'), force: true }
 
     await sandbox.processTab(tab, options)
 
