@@ -3011,7 +3011,9 @@ async function writeMoreView(view) {
   try {
     await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView })
   } catch {
-    moreView = { ...moreView, items: [], error: MORE_VIEW_TOO_LARGE }
+    // The items shown change, so the rev rises: the popup rebuilds its list.
+    const rev = moreView.items?.length ? (moreView.rev ?? 0) + 1 : moreView.rev
+    moreView = { ...moreView, items: [], error: MORE_VIEW_TOO_LARGE, rev }
     await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView }).catch(() => {})
   }
   return moreView

@@ -906,15 +906,18 @@ function populateCodebases(attempt = 0) {
 populateCodebases()
 
 // The dropdown and the free-text owner/repo box are mutually exclusive.
+// Both are one control, the repo a run uses: a change of either keeps the
+// saved one out of both.
 repoFilterInput.addEventListener('change', () => {
   if (repoFilterInput.value) customRepoInput.value = ''
   savedRepoFilter = null
-  touch('repoFilter')
+  touch('repo')
   savePopupView()
 })
 customRepoInput.addEventListener('input', () => {
   if (customRepoInput.value.trim()) repoFilterInput.value = ''
-  touch('customRepo')
+  savedRepoFilter = null
+  touch('repo')
   savePopupView()
 })
 
@@ -1387,16 +1390,21 @@ function moreCacheAge() {
   return `from the cache, ${minutes < 1 ? 'under a minute' : `${minutes} min`} old`
 }
 
-// The age of a cached load goes on counting while the popup stays open; the
-// timer stops once a load is not from the cache.
-let moreAgeTimer = null
+// The status line goes on while the popup stays open: the age of a cached
+// load counts on, and a listing with no news says it stopped. The timer stops
+// once the view is neither.
+let moreStatusTimer = null
 
-function noteMoreCache(cachedAt) {
-  if (!Number.isFinite(cachedAt)) return
-  moreAgeTimer ??= setInterval(() => {
-    if (moreCachedAt !== null) return renderMoreStatus()
-    clearInterval(moreAgeTimer)
-    moreAgeTimer = null
+function moreStatusMoves() {
+  return moreCachedAt !== null || !!moreView?.loading || moreArchivedState() === 'loading'
+}
+
+function keepMoreStatusMoving() {
+  if (!moreStatusMoves()) return
+  moreStatusTimer ??= setInterval(() => {
+    if (moreStatusMoves()) return renderMoreStatus()
+    clearInterval(moreStatusTimer)
+    moreStatusTimer = null
   }, 30000)
 }
 
@@ -1415,13 +1423,13 @@ function setMoreView(view) {
     const keys = new Set(moreViewItems().map(moreItemKey))
     selectedMoreItems = new Set([...selectedMoreItems].filter((key) => keys.has(key)))
   }
-  noteMoreCache(moreCachedAt)
+  keepMoreStatusMoving()
 }
 
-// The worker wrote the view: the list is rebuilt when its items changed, and
-// the status line follows every change.
+// The worker wrote the view: the list is rebuilt when its items changed or a
+// new load cleared the selection, and the status line follows every change.
 function applyMoreView(view) {
-  const changed = view?.rev !== moreView?.rev
+  const changed = view?.rev !== moreView?.rev || view?.loadId !== moreView?.loadId
   setMoreView(view)
   if (changed) renderMoreItems()
   renderMoreStatus()
@@ -1642,13 +1650,23 @@ function restoreRepoFilter(value) {
   applyRepoFilter(trimmed)
 }
 
+// The custom box wins over the dropdown, as it does for a run: the two are
+// never both set.
+function restoreRepo(repoFilter, customRepo) {
+  const custom = typeof customRepo === 'string' ? customRepo.trim().slice(0, MAX_REPO_LEN) : ''
+  if (!custom) return restoreRepoFilter(repoFilter)
+  savedRepoFilter = null
+  repoFilterInput.value = ''
+  customRepoInput.value = custom
+}
+
 // The popup's place, restored when the session read answers. A value it
 // cannot use is ignored, never a wider choice.
 function restorePopupView(view) {
   if (!view || view.version !== POPUP_VIEW_VERSION) return
   const more = view.more && typeof view.more === 'object' ? view.more : {}
   // A run that is going shows the log, not a panel.
-  if (!touched.has('panel') && PANEL_BY_NAME[view.panel] && !isRunning()) openPanel(view.panel)
+  if (!touched.has('panel') && Object.hasOwn(PANEL_BY_NAME, view.panel) && !isRunning()) openPanel(view.panel)
   if (!touched.has('force') && typeof view.force === 'boolean') forceInput.checked = view.force
   if (!touched.has('addMessage') && typeof view.addMessage === 'boolean') {
     addMessageInput.checked = view.addMessage
@@ -1656,10 +1674,7 @@ function restorePopupView(view) {
   }
   if (!touched.has('oneSession') && typeof view.oneSession === 'boolean') oneSessionInput.checked = view.oneSession
   if (!touched.has('scope') && (view.scope === 'all' || view.scope === 'current')) setScope(view.scope)
-  if (!touched.has('repoFilter')) restoreRepoFilter(view.repoFilter)
-  if (!touched.has('customRepo') && typeof view.customRepo === 'string') {
-    customRepoInput.value = view.customRepo.trim().slice(0, MAX_REPO_LEN)
-  }
+  if (!touched.has('repo')) restoreRepo(view.repoFilter, view.customRepo)
   if (!touched.has('more.category') && MORE_CATEGORIES.includes(more.category)) {
     moreCategorySelect.value = more.category
   }
@@ -1670,10 +1685,9 @@ function restorePopupView(view) {
   if (!touched.has('more.chip') && MORE_CHIPS.includes(more.chip)) moreCategory = more.chip
   if (!touched.has('more.force') && typeof more.force === 'boolean') moreForce.checked = more.force
   if (!touched.has('more.selected') && Array.isArray(more.selected)) {
-    // Only the items the view holds stay selected.
-    const items = moreViewItems()
-    const keys = items.length ? new Set(items.map(moreItemKey)) : null
-    selectedMoreItems = new Set(more.selected.filter((key) => typeof key === 'string' && (!keys || keys.has(key))))
+    // Only the items the view holds stay selected: none, when it holds none.
+    const keys = new Set(moreViewItems().map(moreItemKey))
+    selectedMoreItems = new Set(more.selected.filter((key) => typeof key === 'string' && keys.has(key)))
   }
 }
 
