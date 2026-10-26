@@ -3075,6 +3075,45 @@ describe('More Actions view', () => {
     assert.strictEqual(rebuilt.focused, true, 'the focus stays on the same item')
   })
 
+  it('rebuilds the list for a new load even when its items, and so its rev, are the same', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    const checkbox = el['#moreList'].children[1].children[0]
+    checkbox.checked = true
+    await checkbox.dispatchEvent('change')
+    // Load again: the same items come back, under a new load id.
+    env.sessionChange({ moreView: { newValue: moreView({ items, loadId: 'L2' }) } })
+    await env.tick()
+    assert.strictEqual(
+      el['#moreList'].children[1].children[0].checked,
+      false,
+      'a new load starts with nothing selected, and the list shows it'
+    )
+  })
+
+  it('says a live listing stopped while the popup stays open, with no news from the worker', async () => {
+    const timers = []
+    const start = 1_800_000_000_000
+    const env = setupPopupSandbox({
+      session: { moreView: moreView({ category: 'archive', archived: 'loading', updatedAt: start }) }
+    })
+    env.sandbox.setInterval = (fn, ms) => timers.push({ fn, ms, on: true })
+    env.sandbox.clearInterval = (id) => {
+      if (timers[id - 1]) timers[id - 1].on = false
+    }
+    env.sandbox.__now = start
+    vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
+    env.load()
+    await env.tick()
+    assert.doesNotMatch(env.elements['#moreStatus'].textContent, /The listing stopped/)
+    // The worker died: no view and no count come any more.
+    env.sandbox.__now += 11 * 60000
+    for (const timer of timers.filter((t) => t.on)) timer.fn()
+    assert.match(env.elements['#moreStatus'].textContent, /The listing stopped\. Load again\./)
+  })
+
   it('marks the list busy while the worker lists', async () => {
     const env = setupPopupSandbox({
       session: {
@@ -3486,6 +3525,94 @@ describe('The popup keeps its place', () => {
     await env.tick()
     assert.strictEqual(env.elements['#repoFilter'].value, 'owner/scraped')
     assert.strictEqual(env.elements['#customRepoInput'].value, '')
+  })
+
+  // The dropdown and the custom box are one control: the repo a run uses.
+  it('a repo typed before the restore answers wins over the saved filter', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ repoFilter: 'org/saved' }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    env.elements['#customRepoInput'].value = 'owner/mine'
+    await env.elements['#customRepoInput'].dispatchEvent('input')
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'owner/mine', 'the typed repo stays')
+    assert.strictEqual(env.elements['#repoFilter'].value, '')
+  })
+
+  it('a dropdown repo chosen before the restore answers is not joined by the saved custom repo', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ customRepo: 'org/saved' }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    await env.tick()
+    env.elements['#repoFilter'].value = 'owner/scraped'
+    await env.elements['#repoFilter'].dispatchEvent('change')
+    answer()
+    await env.tick()
+    // A run takes the custom box first: a saved repo there would retarget it.
+    assert.strictEqual(env.elements['#customRepoInput'].value, '', 'the custom box stays empty')
+    assert.strictEqual(env.elements['#repoFilter'].value, 'owner/scraped')
+  })
+
+  it('a repo typed before the repo list comes in keeps its place', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ repoFilter: 'owner/scraped' }) } })
+    const held = []
+    env.sandbox.chrome.tabs.sendMessage = (_tabId, msg, cb) => {
+      if (msg.action === 'GET_CODEBASES') held.push(() => cb({ codebases: ['owner/scraped'] }))
+      else cb?.()
+    }
+    env.load()
+    await env.tick()
+    assert.ok(held.length, 'the popup asks the tab for its repos')
+    env.elements['#customRepoInput'].value = 'owner/mine'
+    await env.elements['#customRepoInput'].dispatchEvent('input')
+    for (const answer of held) answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'owner/mine', 'the typed repo stays')
+    assert.strictEqual(env.elements['#repoFilter'].value, '')
+  })
+
+  it('restores the custom repo over the dropdown when both were saved', async () => {
+    const env = setupPopupSandbox({
+      session: { popupView: saved({ repoFilter: 'owner/scraped', customRepo: 'org/typed' }) }
+    })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'org/typed')
+    assert.strictEqual(env.elements['#repoFilter'].value, '', 'the two are never both set')
+  })
+
+  it('opens only a panel it knows, never a name every object has', async () => {
+    for (const panel of ['constructor', 'toString', '__proto__']) {
+      const env = setupPopupSandbox({ session: { popupView: saved({ panel }) } })
+      const toggled = []
+      for (const id of ['#settingsToggle', '#scheduleToggle', '#moreToggle']) {
+        const toggle = env.elements[id]
+        const setAttribute = toggle.setAttribute.bind(toggle)
+        toggle.setAttribute = (name, value) => {
+          if (name === 'aria-expanded') toggled.push(`${id}=${value}`)
+          return setAttribute(name, value)
+        }
+      }
+      env.load()
+      await env.tick()
+      assert.strictEqual(toggled.join(' '), '', `${panel} is not a panel`)
+    }
+  })
+
+  it('keeps no selection when the view has no items', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ items: [] }),
+        popupView: saved({ panel: 'more', more: { ...saved().more, selected: [key('u/1', 'task', 'run')] } })
+      }
+    })
+    env.load()
+    await env.tick()
+    // Any change saves the place again, with the selection the popup holds.
+    env.elements['#force'].checked = true
+    await env.elements['#force'].dispatchEvent('change')
+    assert.strictEqual(JSON.stringify(env.sessionStorage.popupView.more.selected), '[]')
   })
 
   it('shows the load and the place of the last popup when it opens again', async () => {

@@ -5975,6 +5975,30 @@ describe('More Actions view', () => {
     assert.ok(!view.items?.length, 'the small view carries no items')
     assert.strictEqual(view.error, 'The list is too large to keep while the popup is closed. Load again.')
   })
+
+  it('a view Chrome refuses raises the rev when it drops the items shown', async () => {
+    const env = setupMoreEnvironment()
+    const set = env.sandbox.chrome.storage.session.set
+    const stored = []
+    let refuse = false
+    env.sandbox.chrome.storage.session.set = async (data) => {
+      if (refuse && data.moreView?.items?.length) throw new Error('Session storage quota bytes exceeded.')
+      if (data.moreView) stored.push(JSON.parse(JSON.stringify(data.moreView)))
+      return set(data)
+    }
+    await env.load('', 'all')
+    assert.ok(env.view().items.length, 'the first Load is kept with its items')
+    refuse = true
+    await env.load('', 'all')
+    // The popup rebuilds its list only when the rev changes, so every change
+    // of the items it shows raises the rev.
+    for (let i = 1; i < stored.length; i++) {
+      const before = stored[i - 1]
+      const after = stored[i]
+      if (JSON.stringify(before.items) === JSON.stringify(after.items)) continue
+      assert.notStrictEqual(after.rev, before.rev, `write ${i} changed the items under the same rev`)
+    }
+  })
 })
 
 describe('More Actions load choices', () => {
