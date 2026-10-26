@@ -2120,7 +2120,7 @@ function installMoreWorker(env, accounts, { cachedAt = null, notes = null } = {}
     },
     // The view the popup sees; a new one replaces the old.
     write(view) {
-      worker.view = { ...view, rev: (worker.view?.rev ?? 0) + 1, updatedAt: Date.now() }
+      worker.view = { version: 1, ...view, rev: (worker.view?.rev ?? 0) + 1, updatedAt: Date.now() }
       env.sessionStorage.moreView = worker.view
       env.sessionChange({ moreView: { newValue: worker.view } })
       return worker.view
@@ -2133,7 +2133,8 @@ function installMoreWorker(env, accounts, { cachedAt = null, notes = null } = {}
         category,
         repo,
         items: worker.items(category),
-        notes: notes ?? (category === 'archive' ? [] : accountNotes),
+        // The accounts' notes here are the archived listing's: they come with its end.
+        notes: notes ?? [],
         cachedAt: cache,
         archived: category === 'archive' ? 'loading' : 'none'
       })

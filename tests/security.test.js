@@ -53,6 +53,11 @@ describe('Security: ghToken Storage Cleanup', () => {
             if (cb) cb()
           }
         },
+        // The popup keeps its place here; this test reads nothing from it.
+        session: {
+          get: (_keys, cb) => cb({}),
+          set: () => {}
+        },
         onChanged: {
           addListener: () => {}
         }

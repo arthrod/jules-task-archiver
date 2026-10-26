@@ -5286,23 +5286,32 @@ function setupMoreEnvironment(sync = {}, storage = {}) {
     moreMessage(env, { action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId, ...freshness(fresh) })
   // The worker lists the archived tasks of an Archived load by itself, once
   // LOAD_ITEMS has answered (Spec B); `moreView` (session) is what a reopened
-  // popup shows of the load.
-  env.view = () => env.sessionSetData.findLast((data) => data.moreView)?.moreView
-  env.viewSettled = async (loadId = null) => {
-    for (let i = 0; i < 250; i++) {
+  // popup shows of the load. A copy, as Chrome's storage gives one: arrays made
+  // in the sandbox would not deepStrictEqual the test's own literals.
+  env.view = () => {
+    const view = env.sessionSetData.findLast((data) => data.moreView)?.moreView
+    return view === undefined ? undefined : JSON.parse(JSON.stringify(view))
+  }
+  // Waits on the clock, not on a number of turns: a listing that retries a 5xx
+  // waits its backoff (400 ms and more) before it ends.
+  const waitForView = async (done) => {
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
       const view = env.view()
-      if (view && view.loading === null && (loadId === null || view.loadId === loadId)) return view
+      if (done(view)) return view
       await new Promise((resolve) => setTimeout(resolve, 0))
     }
-    throw new Error('the view never settled')
+    return null
+  }
+  env.viewSettled = async (loadId = null) => {
+    const view = await waitForView((v) => v && v.loading === null && (loadId === null || v.loadId === loadId))
+    if (!view) throw new Error('the view never settled')
+    return view
   }
   env.archivedEnd = async (loadId) => {
-    for (let i = 0; i < 250; i++) {
-      const view = env.view()
-      if (view?.loadId === loadId && view.archived !== 'loading') return view
-      await new Promise((resolve) => setTimeout(resolve, 0))
-    }
-    throw new Error(`the archived listing of ${loadId} never ended`)
+    const view = await waitForView((v) => v?.loadId === loadId && v.archived !== 'loading')
+    if (!view) throw new Error(`the archived listing of ${loadId} never ended`)
+    return view
   }
   // A Load of the Archived category: the reply first, then the archived tasks
   // the worker lists on its own; `view` is the record once they are in.
@@ -5408,10 +5417,13 @@ describe('More Actions background', () => {
   it('an Archived load answers without the archived tasks, then adds them by itself', async () => {
     const env = setupMoreEnvironment()
     const original = env.sandbox.callBatchExecute
-    // One held listing per account.
+    // One held listing per account; env.calls records a call only once it is
+    // let through, so the held filters are kept here.
     const held = []
+    const asked = []
     env.sandbox.callBatchExecute = (rpc, payload, config) => {
       if (rpc === 'p1Takd' && archivedFilter(payload[0])) {
+        asked.push(payload[0])
         return new Promise((resolve) => held.push(() => resolve(original(rpc, payload, config))))
       }
       return original(rpc, payload, config)
@@ -5421,9 +5433,7 @@ describe('More Actions background', () => {
     assert.ok(load.accounts.every((account) => Object.keys(account).sort().join() === 'account,notes'))
     for (let i = 0; i < 100; i++) await Promise.resolve()
     assert.ok(
-      env.calls.some(
-        (call) => call.rpc === 'p1Takd' && call.payload[0] === 'source_id=github/Org/Repo AND is_archived=true'
-      ),
+      asked.includes('source_id=github/Org/Repo AND is_archived=true'),
       'the listing starts without LOAD_ARCHIVED'
     )
     env.calls.length = 0
@@ -6085,9 +6095,13 @@ describe('More Actions load choices', () => {
     }
     const { view } = await env.loadArchive()
     assert.strictEqual(view.items.filter((item) => item.account === 'u/1').length, 1)
+    // The view keeps every account's notes, and both accounts have repo-docs.
     assert.deepStrictEqual(
       [...view.notes],
-      ['Jules could not list the archived tasks of 1 of 2 repos of u/1: org/repo-docs (RPC p1Takd error code [4]).']
+      [
+        'Jules could not list the archived tasks of 1 of 2 repos of u/1: org/repo-docs (RPC p1Takd error code [4]).',
+        'Jules could not list the archived tasks of 1 of 2 repos of u/2: org/repo-docs (RPC p1Takd error code [4]).'
+      ]
     )
   })
 
@@ -7176,11 +7190,13 @@ describe('More Actions cache', () => {
 
   it("Delete permanently drops the repo's cached archived tasks, and only them", async () => {
     const env = setupCacheEnvironment()
+    // Both lists cached: the tasks (All) and each repo's archived tasks.
+    await env.load('', 'all')
     await env.loadArchive()
     await env.apply('deleteTask', [{ account: 'u/1', kind: 'archived', id: 'archived' }])
     env.calls.length = 0
-    await env.loadArchive()
     await env.load('', 'all')
+    await env.loadArchive()
     assert.deepStrictEqual(env.listed(), [['1', 'source_id=github/Org/Repo AND is_archived=true']])
   })
 
