@@ -1416,6 +1416,28 @@ describe('Popup open', () => {
     assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
   })
 
+  // A run with no items to show leaves the picker to the saved choice, in
+  // either order of the two answers: never the All it starts with.
+  for (const [name, options] of [
+    ['an Export', { action: 'export' }],
+    ['a scheduled run', { action: 'archive', items: ['Completed'] }]
+  ]) {
+    it(`restores the saved choice read after GET_STATE while ${name} runs`, () => {
+      const env = setupPopupSandbox({ sync: { items: ['state:12'] } })
+      const pending = []
+      const get = env.sandbox.chrome.storage.sync.get
+      env.sandbox.chrome.storage.sync.get = (keys, cb) => pending.push(() => get(keys, cb))
+      env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+        if (!cb) return
+        if (msg.action === 'GET_STATE') cb({ status: 'running', log: [], progress: {}, options })
+        else cb({ repos: [] })
+      }
+      env.load()
+      for (const answer of pending) answer()
+      assert.strictEqual(env.elements['#itemsBtnText'].textContent, 'Waiting on You (12)')
+    })
+  }
+
   it('rehydrates a running operation started earlier (the old single item)', () => {
     const env = setupPopupSandbox()
     env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
