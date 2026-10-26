@@ -71,6 +71,7 @@ Tag format: `v{version}`. PSR config: `semantic-release.toml`.
 ## CD Pipeline
 
 workflow_dispatch (beta/stable) -> PSR v10 -> zip extension files -> upload to GitHub Release.
+Both jobs use the built-in `GITHUB_TOKEN` (`contents: write`): the repo is a fork with no GitHub App, and `main` is not protected.
 No Docker, no npm/pypi, no MCP registry.
 
 ## Important Notes
