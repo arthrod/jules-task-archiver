@@ -86,21 +86,37 @@ let backgroundStale = false
 // for it: an old worker would act on a schedule change with its own rules.
 let backgroundOk = false
 let moreLoading = false
-let loadedMoreItems = []
+// The worker's view of the last load (chrome.storage.session `moreView`):
+// what the popup shows of it, so a Load that goes on while the popup is
+// closed is still there when the popup opens again.
+let moreView = null
 let selectedMoreItems = new Set()
+// The chip of the More Actions list: 'all', 'scheduled' or 'completed'.
 let moreCategory = 'all'
-// What the last Load listed: 'all', 'scheduled', 'complete' or 'archive'.
-let moreLoadedCategory = null
-// The worker's id for the last Load; the archived tasks come in a second
-// answer, which a newer Load makes stale. moreArchived: 'none', 'loading',
-// 'done' or 'failed'.
-let moreLoadId = null
-let moreArchived = 'none'
 // How many repos the worker's All-repos archived listing has done: { done, total }.
 let moreArchivedRepos = null
-let moreNotes = []
+// When the listing's count last came in.
+let moreProgressAt = null
+// Set once a view or a count comes through onChanged: the read of the session
+// storage when the popup opens is older, and never replaces it.
+let moreViewChanged = false
+let moreProgressChanged = false
 // When the oldest cached list of the shown load was read; null when all of it is live.
 let moreCachedAt = null
+// The version of the worker's view of the load (background.js `moreView`).
+const MORE_VIEW_VERSION = 1
+// The newest view the popup has had (its `updatedAt`): an older one, or the
+// worker's answer about an older one, is not shown over it.
+let moreViewSeenAt = Number.NEGATIVE_INFINITY
+// What the popup says of a list Chrome can't keep (background.js `unsaved`).
+const MORE_VIEW_UNSAVED = "Chrome can't keep a list this large: act on it before the popup closes."
+// The scope of a run: every Jules tab, or the one that is open.
+let scopeValue = 'all'
+// A saved repository filter, applied when the dropdown knows its options.
+let savedRepoFilter = null
+// The repository filter's box (popup.html) takes a repo of at most this many
+// characters.
+const MAX_REPO_LEN = 140
 // Delete permanently and Delete schedule can't be undone, so their Confirm
 // takes a second click, at least 0.5 s after the first (a double-click is one
 // gesture) and at most 10 s after it. A held key's repeats never press
@@ -436,6 +452,8 @@ const PANELS = [
   [scheduleToggle, schedulePanel],
   [moreToggle, morePanel]
 ]
+// The panel each toggle opens, by the name the popup remembers.
+const PANEL_BY_NAME = { settings: settingsToggle, schedule: scheduleToggle, more: moreToggle }
 function togglePanel(toggle) {
   let anyOpen = false
   for (const [btn, panel] of PANELS) {
@@ -460,6 +478,8 @@ for (const tip of tips) {
 
 dryRunInput.addEventListener('change', () => {
   if (!isRunning()) showIdle()
+  // Dry run itself is never kept: the place is, the choice is not.
+  savePopupView()
 })
 
 // =============================================================================
@@ -852,6 +872,14 @@ function applyCodebases(codebases) {
     repoFilterInput.appendChild(opt)
   }
 
+  // The dropdown knows its options now: a saved filter that is among them
+  // belongs there.
+  if (savedRepoFilter !== null) {
+    applyRepoFilter(savedRepoFilter)
+    savedRepoFilter = null
+    return
+  }
+
   if (currentValue) {
     repoFilterInput.value = currentValue
   }
@@ -887,11 +915,19 @@ function populateCodebases(attempt = 0) {
 populateCodebases()
 
 // The dropdown and the free-text owner/repo box are mutually exclusive.
+// Both are one control, the repo a run uses: a change of either keeps the
+// saved one out of both.
 repoFilterInput.addEventListener('change', () => {
   if (repoFilterInput.value) customRepoInput.value = ''
+  savedRepoFilter = null
+  touch('repo')
+  savePopupView()
 })
 customRepoInput.addEventListener('input', () => {
   if (customRepoInput.value.trim()) repoFilterInput.value = ''
+  savedRepoFilter = null
+  touch('repo')
+  savePopupView()
 })
 
 // =============================================================================
@@ -1082,8 +1118,36 @@ exportBtn.addEventListener('click', () => startRun('export'))
 // More Actions
 // =============================================================================
 
+// The items the worker's view holds of the last load.
+function moreViewItems() {
+  return Array.isArray(moreView?.items) ? moreView.items : []
+}
+
+// The notes the worker keeps about the last load.
+function moreViewNotes() {
+  return Array.isArray(moreView?.notes) ? moreView.notes : []
+}
+
+// What the shown load holds: 'all', 'scheduled', 'complete' or 'archive'.
+function moreLoadedCategory() {
+  return moreView?.category ?? null
+}
+
+// How far the archived listing of the shown load got: 'none', 'loading',
+// 'done' or 'failed'.
+function moreArchivedState() {
+  return moreView?.archived ?? 'none'
+}
+
+// A view of another version, or one without items, is not used.
+function validMoreView(view) {
+  if (!view) return false
+  if (view.version !== MORE_VIEW_VERSION) return false
+  return Array.isArray(view.items) && Array.isArray(view.notes)
+}
+
 function shownMoreItems(category = moreCategory) {
-  return loadedMoreItems.filter(
+  return moreViewItems().filter(
     (item) =>
       category === 'all' ||
       (category === 'scheduled' && item.kind === 'schedule') ||
@@ -1092,7 +1156,7 @@ function shownMoreItems(category = moreCategory) {
 }
 
 function fittingMoreItems(action) {
-  return loadedMoreItems.filter((item) => selectedMoreItems.has(moreItemKey(item)) && moreActionFits(action, item))
+  return moreViewItems().filter((item) => selectedMoreItems.has(moreItemKey(item)) && moreActionFits(action, item))
 }
 
 function disarmMoreDelete() {
@@ -1165,10 +1229,13 @@ function renderMoreSelection() {
 }
 
 function renderMoreItems() {
+  // The list is rebuilt, so the scroll place and the focus go with it.
+  const scrollTop = moreList.scrollTop
+  const focusedKey = document.activeElement?.dataset?.moreKey || null
   moreChips.textContent = ''
   // A load of one category needs no chips.
   const chips =
-    moreLoadedCategory === 'all'
+    moreLoadedCategory() === 'all'
       ? [
           ['all', 'All'],
           ['scheduled', 'Scheduled'],
@@ -1183,23 +1250,31 @@ function renderMoreItems() {
     chip.setAttribute('aria-pressed', String(category === moreCategory))
     chip.addEventListener('click', () => {
       moreCategory = category
+      touch('more.chip')
+      savePopupView()
       renderMoreItems()
     })
     moreChips.appendChild(chip)
   }
   moreList.textContent = ''
   const fragment = document.createDocumentFragment()
+  const checkboxes = new Map()
   for (const item of shownMoreItems()) {
+    const key = moreItemKey(item)
     const row = document.createElement('label')
     row.className = 'more-row'
     const checkbox = document.createElement('input')
     checkbox.type = 'checkbox'
-    checkbox.checked = selectedMoreItems.has(moreItemKey(item))
+    checkbox.dataset.moreKey = key
+    checkbox.checked = selectedMoreItems.has(key)
     checkbox.addEventListener('change', () => {
-      if (checkbox.checked) selectedMoreItems.add(moreItemKey(item))
-      else selectedMoreItems.delete(moreItemKey(item))
+      if (checkbox.checked) selectedMoreItems.add(key)
+      else selectedMoreItems.delete(key)
+      touch('more.selected')
+      savePopupView()
       renderMoreSelection()
     })
+    checkboxes.set(key, checkbox)
     const text = document.createElement('span')
     text.className = 'more-text'
     const title = document.createElement('span')
@@ -1227,55 +1302,115 @@ function renderMoreItems() {
     fragment.appendChild(row)
   }
   moreList.appendChild(fragment)
+  moreList.scrollTop = scrollTop
+  // The focus stays on the item it was on.
+  if (focusedKey && checkboxes.has(focusedKey)) checkboxes.get(focusedKey).focus()
   renderMoreSelection()
 }
 
-for (const input of [moreAll, moreRepoScope]) input.addEventListener('change', updateMoreControls)
+for (const input of [moreAll, moreRepoScope]) {
+  input.addEventListener('change', () => {
+    touch('more.repoScope')
+    savePopupView()
+    updateMoreControls()
+  })
+}
 moreRepo.addEventListener('input', () => {
-  if (moreRepo.value.trim()) moreRepoScope.checked = true
+  // Typing a repo scopes the Load to it: a late restore leaves both alone.
+  if (moreRepo.value.trim()) {
+    moreRepoScope.checked = true
+    touch('more.repoScope')
+  }
+  touch('more.repo')
+  savePopupView()
   updateMoreControls()
 })
 for (const input of [moreAction, moreDryRun]) {
   input.addEventListener('change', () => {
     disarmMoreDelete()
+    if (input === moreAction) touch('more.action')
+    // Dry run itself is never kept: the place is, the choice is not.
+    savePopupView()
     updateMoreControls()
   })
 }
+moreForce.addEventListener('change', () => {
+  touch('more.force')
+  savePopupView()
+})
 moreSelectAll.addEventListener('change', () => {
   for (const item of shownMoreItems()) {
     if (moreSelectAll.checked) selectedMoreItems.add(moreItemKey(item))
     else selectedMoreItems.delete(moreItemKey(item))
   }
+  touch('more.selected')
+  savePopupView()
   renderMoreItems()
 })
 
-const MORE_KINDS = { tasks: 'task', schedules: 'schedule', archived: 'archived' }
-
-function moreItemsFrom(accounts) {
-  return accounts.flatMap((account) =>
-    Object.entries(MORE_KINDS).flatMap(([list, kind]) =>
-      (account[list] || []).map((item) => ({ ...item, account: account.account, kind }))
-    )
-  )
-}
-
 function renderMoreStatus() {
-  const count = (kind) => loadedMoreItems.filter((item) => item.kind === kind).length
+  const items = moreViewItems()
+  const count = (kind) => items.filter((item) => item.kind === kind).length
+  const stale = moreListingStale()
   const archived = {
-    loading: moreArchivedRepos
-      ? `Listing the archived tasks… ${moreArchivedRepos.done} of ${moreArchivedRepos.total} repos`
-      : 'Listing the archived tasks…',
+    loading: stale
+      ? ''
+      : moreArchivedRepos
+        ? `Listing the archived tasks… ${moreArchivedRepos.done} of ${moreArchivedRepos.total} repos`
+        : 'Listing the archived tasks…',
     done: `${count('archived')} archived tasks`,
     failed: '',
     none: ''
-  }[moreArchived]
+  }[moreArchivedState()]
   const counts = {
     all: `${count('task')} tasks, ${count('schedule')} schedules`,
     scheduled: `${count('schedule')} schedules`,
     complete: `${count('task')} completed tasks`,
     archive: archived
-  }[moreLoadedCategory]
-  moreStatus.textContent = [counts, moreCacheAge(), ...moreNotes].filter(Boolean).join(' · ')
+  }[moreLoadedCategory()]
+  const parts = [counts, moreCacheAge(), ...moreViewNotes(), moreNoteText()]
+  // A listing that stopped must not lock the panel: Load stays free.
+  if (stale) parts.push('The listing stopped. Load again.')
+  if (moreView?.error) parts.push(moreView.error)
+  if (moreView?.unsaved && !moreView.partial) parts.push(MORE_VIEW_UNSAVED)
+  if (moreView?.outdated) parts.push('Loaded before the last run; Load again to see it as it is now.')
+  moreStatus.textContent = parts.filter(Boolean).join(' · ')
+  updateMoreBusy()
+}
+
+// A message of the popup's own (a Load it could not send, a copy, an action
+// started) stays on the status line for 30 s, past the renders meanwhile.
+const MORE_NOTE_MS = 30000
+let moreNote = null
+
+function noteMore(text) {
+  moreNote = { text, at: Date.now() }
+  renderMoreStatus()
+}
+
+function moreNoteText() {
+  if (moreNote && Date.now() - moreNote.at < MORE_NOTE_MS) return moreNote.text
+  moreNote = null
+  return ''
+}
+
+// The list is busy while the worker lists.
+function updateMoreBusy() {
+  const busy = !!(moreView?.loading || moreArchivedState() === 'loading')
+  moreList.setAttribute('aria-busy', String(busy))
+}
+
+// A listing that has come of nothing for ten minutes stopped: the worker may
+// have died with it.
+const MORE_LISTING_STALE_MS = 10 * 60 * 1000
+
+function moreListingStale() {
+  if (!moreView) return false
+  if (!moreView.loading && moreArchivedState() !== 'loading') return false
+  // The listing is alive while its count still comes in; the view alone is
+  // older than the listing.
+  const seen = moreProgressAt === null ? moreView.updatedAt : Math.max(moreView.updatedAt, moreProgressAt)
+  return Number.isFinite(seen) && Date.now() - seen > MORE_LISTING_STALE_MS
 }
 
 // The worker keeps what a Load listed for 30 minutes (background.js MORE_CACHE).
@@ -1285,18 +1420,81 @@ function moreCacheAge() {
   return `from the cache, ${minutes < 1 ? 'under a minute' : `${minutes} min`} old`
 }
 
-// The age of a cached load goes on counting while the popup stays open; the
-// timer stops once a load is not from the cache.
-let moreAgeTimer = null
+// The status line goes on while the popup stays open: the age of a cached
+// load counts on, and a listing with no news says it stopped. The timer stops
+// once the view is neither.
+let moreStatusTimer = null
 
-function noteMoreCache(cachedAt) {
-  if (!Number.isFinite(cachedAt)) return
-  moreCachedAt = Math.min(moreCachedAt ?? cachedAt, cachedAt)
-  moreAgeTimer ??= setInterval(() => {
-    if (moreCachedAt !== null) return renderMoreStatus()
-    clearInterval(moreAgeTimer)
-    moreAgeTimer = null
+function moreStatusMoves() {
+  return moreCachedAt !== null || !!moreView?.loading || moreArchivedState() === 'loading'
+}
+
+function keepMoreStatusMoving() {
+  if (!moreStatusMoves()) return
+  moreStatusTimer ??= setInterval(() => {
+    if (moreStatusMoves()) return renderMoreStatus()
+    clearInterval(moreStatusTimer)
+    moreStatusTimer = null
   }, 30000)
+}
+
+// The worker's view of the load, as the popup shows it. A new load replaces
+// the old one's selection and chip.
+function setMoreView(view) {
+  const previous = moreView
+  moreView = view
+  moreCachedAt = Number.isFinite(view?.cachedAt) ? view.cachedAt : null
+  if (previous && previous.loadId !== view?.loadId) {
+    selectedMoreItems.clear()
+    moreCategory = 'all'
+    moreArchivedRepos = null
+  } else if (view) {
+    // Only the items the view holds stay selected.
+    const keys = new Set(moreViewItems().map(moreItemKey))
+    selectedMoreItems = new Set([...selectedMoreItems].filter((key) => keys.has(key)))
+  }
+  keepMoreStatusMoving()
+}
+
+// The worker wrote the view: the list is rebuilt when its items changed or a
+// new load cleared the selection (or `rebuild` says so), and the status line
+// follows every change.
+function applyMoreView(view, rebuild = false) {
+  const changed = rebuild || view?.rev !== moreView?.rev || view?.loadId !== moreView?.loadId
+  setMoreView(view)
+  if (changed) renderMoreItems()
+  renderMoreStatus()
+}
+
+// A view the worker saved. One Chrome could not keep (`partial`) holds no
+// items: the worker still does, so the popup asks for them.
+function takeMoreView(view) {
+  if (view.updatedAt < moreViewSeenAt) return
+  seeMoreView(view)
+  if (!view.partial) return applyMoreView(view)
+  return askMoreView(view)
+}
+
+function seeMoreView(view) {
+  if (Number.isFinite(view.updatedAt)) moreViewSeenAt = Math.max(moreViewSeenAt, view.updatedAt)
+}
+
+async function askMoreView(saved) {
+  const view = await workerMoreView(saved)
+  // A newer view came meanwhile: that one is shown.
+  if (saved.updatedAt < moreViewSeenAt) return
+  seeMoreView(view)
+  // Without the worker's items, the small view empties the list.
+  applyMoreView(view, view === saved)
+}
+
+// The worker's view for a saved one without items: the saved one when the
+// worker no longer holds the items (it restarted) or does not answer.
+async function workerMoreView(saved) {
+  const reply = await sendMore({ action: 'GET_MORE_VIEW', protocol: RUN_PROTOCOL })
+  const view = reply?.view
+  if (!validMoreView(view) || view.partial || !(view.updatedAt >= saved.updatedAt)) return saved
+  return view
 }
 
 function sendMore(msg) {
@@ -1307,25 +1505,9 @@ function sendMore(msg) {
   })
 }
 
-// Jules can take about 90 s on a large archive (and then give up), so the
-// list is usable before the archived tasks arrive.
-async function loadMoreArchived(loadId, fresh) {
-  const reply = await sendMore({ action: 'LOAD_ARCHIVED', protocol: RUN_PROTOCOL, loadId, fresh })
-  if (loadId !== moreLoadId) return
-  if (!reply?.accounts || reply.error) {
-    moreArchived = 'failed'
-    moreNotes.push(`Could not list the archived tasks: ${reply?.error || 'no answer'}`)
-  } else {
-    moreArchived = 'done'
-    noteMoreCache(reply.cachedAt)
-    loadedMoreItems.push(...moreItemsFrom(reply.accounts))
-    moreNotes.push(...(reply.notes || []), ...reply.accounts.flatMap((account) => account.notes || []))
-  }
-  renderMoreStatus()
-  renderMoreItems()
-}
-
-// Load answers from the worker's cache when it can; Refresh (`fresh`) lists live.
+// Load answers from the worker's cache when it can; Refresh (`fresh`) lists
+// live. The items are the worker's view of the load, which the popup shows
+// as it is.
 async function loadMore(fresh) {
   updateMoreControls()
   if (moreLoad.disabled) return
@@ -1346,29 +1528,10 @@ async function loadMore(fresh) {
       category,
       fresh
     })
-    if (!response?.accounts || response.error) throw new Error(response?.error || 'Could not load items.')
-    moreLoadId = response.loadId
-    moreLoadedCategory = category
-    moreArchived = category === 'archive' ? 'loading' : 'none'
-    moreArchivedRepos = null
-    moreCachedAt = null
-    noteMoreCache(response.cachedAt)
-    loadedMoreItems = moreItemsFrom(response.accounts)
-    moreNotes = [...(response.notes || []), ...response.accounts.flatMap((account) => account.notes || [])]
-    selectedMoreItems = new Set()
-    moreCategory = 'all'
-    renderMoreStatus()
-    renderMoreItems()
-    if (category === 'archive') loadMoreArchived(response.loadId, fresh)
+    // The view shows a failure of the Load itself (`inView`).
+    if (response?.error && !response.inView) throw new Error(response.error)
   } catch (e) {
-    moreLoadId = null
-    moreLoadedCategory = null
-    moreArchived = 'none'
-    moreCachedAt = null
-    loadedMoreItems = []
-    selectedMoreItems.clear()
-    renderMoreItems()
-    moreStatus.textContent = e.message
+    noteMore(e.message)
   } finally {
     moreLoading = false
     moreLoad.textContent = 'Load'
@@ -1385,9 +1548,9 @@ async function copyMoreSessionUrls() {
   const urls = fittingMoreItems('copyUrl').map(moreSessionUrl)
   try {
     await navigator.clipboard.writeText(urls.join('\n'))
-    moreStatus.textContent = `Copied ${urls.length} session ${urls.length === 1 ? 'URL' : 'URLs'}.`
+    noteMore(`Copied ${urls.length} session ${urls.length === 1 ? 'URL' : 'URLs'}.`)
   } catch (e) {
-    moreStatus.textContent = `Could not copy the URLs: ${e.message}`
+    noteMore(`Could not copy the URLs: ${e.message}`)
   }
 }
 
@@ -1447,13 +1610,216 @@ moreConfirm.addEventListener('click', async (event) => {
       } else if (!dryRun) {
         for (const item of items) selectedMoreItems.delete(moreItemKey(item))
         renderMoreItems()
-        moreStatus.textContent = 'Load again to refresh item states after this action.'
+        noteMore('Load again to refresh item states after this action.')
       }
     }
   )
 })
 
 renderMoreItems()
+
+// =============================================================================
+// The popup keeps its place
+// =============================================================================
+
+// Chrome destroys the popup when it loses focus, so what the popup holds in
+// memory is lost with it. The worker's view of the last load lives in the
+// session storage (background.js `moreView`), and the popup's own controls in
+// `popupView`, so the popup opens where it left off.
+const POPUP_VIEW_VERSION = 1
+// The categories the Load dropdown and the chips know.
+const MORE_CATEGORIES = ['all', 'scheduled', 'complete', 'archive']
+const MORE_CHIPS = ['all', 'scheduled', 'completed']
+// The controls the user changed in this popup: the restore leaves them alone.
+const touched = new Set()
+
+function touch(name) {
+  touched.add(name)
+}
+
+// The panel that is open, by the name the popup remembers.
+function openPanelName() {
+  for (const [name, toggle] of Object.entries(PANEL_BY_NAME)) {
+    if (toggle.getAttribute('aria-expanded') === 'true') return name
+  }
+  return null
+}
+
+function openPanel(name) {
+  const toggle = PANEL_BY_NAME[name]
+  if (toggle) togglePanel(toggle)
+}
+
+// The scope of a run: every Jules tab, or the one that is open. The radio
+// the user chose is the scope, not the one the group checked first.
+const scopeInputs = [...document.querySelectorAll('input[name="scope"]')]
+
+function currentScope() {
+  return scopeValue
+}
+
+function setScope(scope) {
+  scopeValue = scope === 'current' ? 'current' : 'all'
+  for (const input of scopeInputs) input.checked = input.value === scopeValue
+}
+
+// The popup's own place, saved on every change of its controls. Dry run is
+// never kept: it must be a choice of this popup, every time.
+function savePopupView() {
+  const view = {
+    version: POPUP_VIEW_VERSION,
+    panel: openPanelName(),
+    force: forceInput.checked,
+    addMessage: addMessageInput.checked,
+    scope: currentScope(),
+    repoFilter: repoFilterInput.value,
+    customRepo: customRepoInput.value,
+    oneSession: oneSessionInput.checked,
+    more: {
+      category: moreCategorySelect.value,
+      repoScope: moreRepoScope.checked,
+      repo: moreRepo.value,
+      chip: moreCategory,
+      action: moreAction.value,
+      force: moreForce.checked,
+      selected: [...selectedMoreItems]
+    }
+  }
+  chrome.storage.session.set({ popupView: view })
+}
+
+// A saved repository filter goes to the dropdown when it is among its options,
+// and to the custom box when it is not: the typed repo wins over the dropdown.
+function applyRepoFilter(value) {
+  const options = Array.from(repoFilterInput.options, (option) => option.value)
+  if (!value) {
+    repoFilterInput.value = ''
+    customRepoInput.value = ''
+    return
+  }
+  if (options.includes(value)) {
+    repoFilterInput.value = value
+    customRepoInput.value = ''
+  } else {
+    repoFilterInput.value = ''
+    customRepoInput.value = value
+  }
+}
+
+function restoreRepoFilter(value) {
+  if (typeof value !== 'string') return
+  const trimmed = value.trim().slice(0, MAX_REPO_LEN)
+  savedRepoFilter = trimmed || null
+  applyRepoFilter(trimmed)
+}
+
+// The custom box wins over the dropdown, as it does for a run: the two are
+// never both set.
+function restoreRepo(repoFilter, customRepo) {
+  const custom = typeof customRepo === 'string' ? customRepo.trim().slice(0, MAX_REPO_LEN) : ''
+  if (!custom) return restoreRepoFilter(repoFilter)
+  savedRepoFilter = null
+  repoFilterInput.value = ''
+  customRepoInput.value = custom
+}
+
+// The popup's place, restored when the session read answers. A value it
+// cannot use is ignored, never a wider choice.
+function restorePopupView(view) {
+  if (!view || view.version !== POPUP_VIEW_VERSION) return
+  const more = view.more && typeof view.more === 'object' ? view.more : {}
+  // A run that is going shows the log, not a panel.
+  if (!touched.has('panel') && Object.hasOwn(PANEL_BY_NAME, view.panel) && !isRunning()) openPanel(view.panel)
+  if (!touched.has('force') && typeof view.force === 'boolean') forceInput.checked = view.force
+  if (!touched.has('addMessage') && typeof view.addMessage === 'boolean') {
+    addMessageInput.checked = view.addMessage
+    updateMessageBox()
+  }
+  if (!touched.has('oneSession') && typeof view.oneSession === 'boolean') oneSessionInput.checked = view.oneSession
+  if (!touched.has('scope') && (view.scope === 'all' || view.scope === 'current')) setScope(view.scope)
+  if (!touched.has('repo')) restoreRepo(view.repoFilter, view.customRepo)
+  if (!touched.has('more.category') && MORE_CATEGORIES.includes(more.category)) {
+    moreCategorySelect.value = more.category
+  }
+  if (!touched.has('more.repoScope') && typeof more.repoScope === 'boolean') moreRepoScope.checked = more.repoScope
+  if (!touched.has('more.repo') && typeof more.repo === 'string') {
+    moreRepo.value = more.repo.trim().slice(0, MAX_REPO_LEN)
+  }
+  if (!touched.has('more.chip') && MORE_CHIPS.includes(more.chip)) moreCategory = more.chip
+  if (!touched.has('more.force') && typeof more.force === 'boolean') moreForce.checked = more.force
+  if (!touched.has('more.selected') && Array.isArray(more.selected)) {
+    // Only the items the view holds stay selected: none, when it holds none.
+    const keys = new Set(moreViewItems().map(moreItemKey))
+    selectedMoreItems = new Set(more.selected.filter((key) => typeof key === 'string' && keys.has(key)))
+  }
+}
+
+// The action goes back after the list is built: the list decides which
+// actions are offered.
+function restoreMoreAction(action) {
+  if (touched.has('more.action') || typeof action !== 'string') return
+  if (![...moreAction.children].some((option) => option.value === action)) return
+  moreAction.value = action
+  updateMoreControls()
+}
+
+// The worker's view of the last load and the popup's own place, read when
+// the popup opens.
+chrome.storage.session.get(['moreView', 'moreArchivedProgress', 'popupView'], async (data) => {
+  // A view Chrome could not keep holds no items: the worker's answer does,
+  // and comes before the saved selection is restored.
+  const stored = data?.moreView
+  const view = validMoreView(stored) && stored.partial ? await workerMoreView(stored) : stored
+  // A view or a count that came through onChanged meanwhile is newer than
+  // this read: it stays.
+  if (!moreViewChanged && validMoreView(view)) {
+    seeMoreView(view)
+    setMoreView(view)
+  }
+  const progress = data?.moreArchivedProgress
+  if (!moreProgressChanged && progress && progress.loadId === moreView?.loadId && moreArchivedState() === 'loading') {
+    moreArchivedRepos = { done: progress.done, total: progress.total }
+    // The listing is alive while its count moves, also before this popup.
+    if (Number.isFinite(progress.updatedAt)) moreProgressAt = progress.updatedAt
+  }
+  const saved = data?.popupView
+  restorePopupView(saved)
+  renderMoreItems()
+  renderMoreStatus()
+  if (saved?.version === POPUP_VIEW_VERSION) restoreMoreAction(saved.more?.action)
+  updateMoreControls()
+})
+
+// The controls the popup remembers, saved as the user changes them.
+for (const [btn] of PANELS) {
+  btn.addEventListener('click', () => {
+    touch('panel')
+    savePopupView()
+  })
+}
+forceInput.addEventListener('change', () => {
+  touch('force')
+  savePopupView()
+})
+addMessageInput.addEventListener('change', () => {
+  touch('addMessage')
+  savePopupView()
+})
+oneSessionInput.addEventListener('change', () => {
+  touch('oneSession')
+  savePopupView()
+})
+for (const input of scopeInputs) {
+  input.addEventListener('change', (event) => {
+    touch('scope')
+    scopeValue = event.target?.value || currentScope()
+    savePopupView()
+  })
+}
+moreCategorySelect.addEventListener('change', () => {
+  touch('more.category')
+  savePopupView()
+})
 
 // --- Reset ---
 resetBtn.addEventListener('click', () => {
@@ -1473,10 +1839,21 @@ resetBtn.addEventListener('click', () => {
   proceedBtn.focus()
 })
 
-// The worker saves its count while it lists every repo's archived tasks.
+// The worker writes the view of the load and its count while it lists every
+// repo's archived tasks.
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'session') return
+  const view = changes.moreView?.newValue
+  // A view of another version is ignored.
+  if (view && validMoreView(view)) {
+    moreViewChanged = true
+    takeMoreView(view)
+  }
   const progress = changes.moreArchivedProgress?.newValue
-  if (area !== 'session' || !progress || progress.loadId !== moreLoadId || moreArchived !== 'loading') return
+  if (!progress) return
+  moreProgressChanged = true
+  moreProgressAt = Date.now()
+  if (progress.loadId !== moreView?.loadId || moreArchivedState() !== 'loading') return
   moreArchivedRepos = { done: progress.done, total: progress.total }
   renderMoreStatus()
 })
@@ -1636,7 +2013,11 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
   if (state && state.status !== 'idle') {
     // Rehydrate the items the run was started with.
     rehydrateRunItems(state.options)
-    if (state.status === 'running') setRunning(state.options?.action || 'proceed', state.options?.dryRun === true)
+    if (state.status === 'running') {
+      setRunning(state.options?.action || 'proceed', state.options?.dryRun === true)
+      // The log of a running task wins over a panel the popup restores.
+      togglePanel(null)
+    }
     renderState(state)
     if (state.status !== 'running') resetBtn.classList.remove('hidden')
   }

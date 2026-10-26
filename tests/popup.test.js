@@ -52,13 +52,14 @@ function createMockElement(tag = 'div', attrs = {}) {
       if (!element.listeners[type]) element.listeners[type] = []
       element.listeners[type].push(cb)
     },
+    // The event bubbles up the parents and reaches the document, as in a browser.
     dispatchEvent: (type, eventProps = {}) => {
+      const event = { type, target: element, preventDefault: () => {}, ...eventProps }
       const results = []
-      if (element.listeners?.[type]) {
-        for (const cb of element.listeners[type]) {
-          results.push(cb({ target: element, preventDefault: () => {}, ...eventProps }))
-        }
+      for (let node = element; node; node = node.parentElement) {
+        for (const cb of node.listeners?.[type] || []) results.push(cb(event))
       }
+      for (const cb of element.ownerDocument?.listeners?.[type] || []) results.push(cb(event))
       return Promise.all(results)
     },
     contains: (other) => other === element || element.children.some((c) => c.contains?.(other)),
@@ -85,13 +86,32 @@ function createMockElement(tag = 'div', attrs = {}) {
     querySelector: (_sel) => null,
     focus: () => {
       element.focused = true
+      const doc = element.ownerDocument
+      if (!doc) return
+      doc.activeElement = element
+      const event = { type: 'focusin', target: element, preventDefault: () => {} }
+      for (let node = element; node; node = node.parentElement) {
+        for (const cb of node.listeners?.focusin || []) cb(event)
+      }
+      for (const cb of doc.listeners?.focusin || []) cb(event)
+    },
+    blur: () => {
+      element.focused = false
+      const doc = element.ownerDocument
+      if (doc && doc.activeElement === element) doc.activeElement = null
     },
     get textContent() {
       return element._text ?? ''
     },
     set textContent(value) {
       element._text = String(value)
-      if (value === '') element.children = []
+      if (value === '') {
+        // The browser forgets the focus and the scroll place when the nodes go.
+        const doc = element.ownerDocument
+        if (doc?.activeElement && element.contains(doc.activeElement)) doc.activeElement = null
+        element.scrollTop = 0
+        element.children = []
+      }
     },
     id: '',
     className: '',
@@ -120,7 +140,7 @@ for (const tag of popupHtml.match(/<[a-zA-Z][^>]*>/g) || []) {
 /**
  * Creates a mock Chrome extension API.
  */
-function createMockChrome(syncStorage, localStorage, listeners, sent, tabs, hello) {
+function createMockChrome(syncStorage, localStorage, sessionStorage, listeners, sent, tabs, hello) {
   const runtime = {
     lastError: undefined,
     onMessage: {
@@ -206,6 +226,30 @@ function createMockChrome(syncStorage, localStorage, listeners, sent, tabs, hell
           if (cb) cb()
         }
       },
+      // The session storage is gone when Chrome restarts; the popup keeps
+      // its place and the worker's view of the last load in it.
+      session: {
+        get: (keys, cb) => {
+          const res = {}
+          if (keys === null || keys === undefined) {
+            Object.assign(res, sessionStorage)
+          } else {
+            const kArray = Array.isArray(keys) ? keys : [keys]
+            for (const k of kArray) {
+              if (sessionStorage[k] !== undefined) res[k] = sessionStorage[k]
+            }
+          }
+          cb(res)
+        },
+        set: (obj, cb) => {
+          Object.assign(sessionStorage, obj)
+          if (cb) cb()
+        },
+        remove: (keys, cb) => {
+          for (const k of [].concat(keys)) delete sessionStorage[k]
+          if (cb) cb()
+        }
+      },
       onChanged: {
         addListener: (cb) => listeners.storage.push(cb)
       }
@@ -228,9 +272,15 @@ function createMockChrome(syncStorage, localStorage, listeners, sent, tabs, hell
 function createMockSelect() {
   const select = createMockElement('select')
   select.value = ''
-  select.options = [{ value: '', textContent: 'All Repositories' }]
-  select.remove = (i) => select.options.splice(i, 1)
-  select.appendChild = (opt) => select.options.push(opt)
+  const list = [{ value: '', textContent: 'All Repositories' }]
+  // Like Chrome's HTMLOptionsCollection: indexed, with a length, iterable,
+  // but without array methods (no map or filter).
+  select.options = new Proxy(list, {
+    get: (target, key) =>
+      typeof key === 'string' && key !== 'length' && key in Array.prototype ? undefined : target[key]
+  })
+  select.remove = (i) => list.splice(i, 1)
+  select.appendChild = (opt) => list.push(opt)
   return select
 }
 
@@ -312,6 +362,7 @@ const ELEMENT_IDS = [
 function setupPopupSandbox({
   sync = {},
   local = {},
+  session = {},
   tabs = [],
   confirm = () => true,
   hello = { protocol: RUN_PROTOCOL }
@@ -319,12 +370,29 @@ function setupPopupSandbox({
   const helloState = { reply: hello }
   const syncStorage = { ...sync }
   const localStorage = { ...local }
+  // The session storage is shared as it is, so two popups can stand for the
+  // same Chrome: one closes, the other opens again.
+  const sessionStorage = session
   const listeners = { storage: [], runtime: [] }
   const sent = []
   const confirms = []
   // What Copy session URL wrote; set clipboard.fail to make the write fail.
   const clipboard = { copied: [], fail: null }
-  const radioStates = { scope: 'all' }
+  // The scope radios of the main view.
+  const scopeRadios = [
+    createMockElement('input', { type: 'radio', name: 'scope', value: 'all' }),
+    createMockElement('input', { type: 'radio', name: 'scope', value: 'current' })
+  ]
+  scopeRadios[0].value = 'all'
+  scopeRadios[1].value = 'current'
+  scopeRadios[0].checked = true
+  const radioStates = {}
+  Object.defineProperty(radioStates, 'scope', {
+    get: () => scopeRadios.find((radio) => radio.checked)?.value || 'all',
+    set: (value) => {
+      for (const radio of scopeRadios) radio.checked = radio.value === value
+    }
+  })
 
   const elements = {}
   for (const id of ELEMENT_IDS) elements[`#${id}`] = createMockElement('div', htmlAttributes[id] || {})
@@ -346,13 +414,23 @@ function setupPopupSandbox({
 
   const documentListeners = {}
   const document = {
+    activeElement: null,
+    listeners: documentListeners,
     querySelector: (sel) => {
-      if (sel === 'input[name="scope"]:checked') return { value: radioStates.scope }
+      if (sel === 'input[name="scope"]:checked') return scopeRadios.find((radio) => radio.checked) || scopeRadios[0]
       if (elements[sel]) return elements[sel]
       return createMockElement()
     },
-    querySelectorAll: (sel) => (sel === '.tip' ? tips : []),
-    createElement: (tag) => createMockElement(tag),
+    querySelectorAll: (sel) => {
+      if (sel === '.tip') return tips
+      if (/name=["']?scope["']?/.test(sel)) return scopeRadios
+      return []
+    },
+    createElement: (tag) => {
+      const element = createMockElement(tag)
+      element.ownerDocument = document
+      return element
+    },
     createDocumentFragment: () => {
       const frag = createMockElement('documentfragment')
       frag.nodeType = 11
@@ -363,7 +441,9 @@ function setupPopupSandbox({
       documentListeners[type].push(cb)
     }
   }
-  const chrome = createMockChrome(syncStorage, localStorage, listeners, sent, tabs, helloState)
+  for (const element of Object.values(elements)) element.ownerDocument = document
+  for (const radio of scopeRadios) radio.ownerDocument = document
+  const chrome = createMockChrome(syncStorage, localStorage, sessionStorage, listeners, sent, tabs, helloState)
 
   const sandbox = {
     chrome,
@@ -407,17 +487,23 @@ function setupPopupSandbox({
   // The check mark of an option: a .chk span, drawn in CSS, with no text.
   const checkMark = (opt) => opt.children.find((c) => c.className === 'chk' || c.classList?.contains('chk'))
   const tick = () => new Promise((r) => setTimeout(r, 0))
+  // A session change, as the worker's write of the view looks to the popup.
+  const sessionChange = (changes) => {
+    for (const listener of listeners.storage) listener(changes, 'session')
+  }
 
   return {
     sandbox,
     elements,
     syncStorage,
     localStorage,
+    sessionStorage,
     listeners,
     sent,
     confirms,
     clipboard,
     radioStates,
+    scopeRadios,
     documentListeners,
     tips,
     load,
@@ -426,6 +512,7 @@ function setupPopupSandbox({
     option,
     checkMark,
     tick,
+    sessionChange,
     helloState
   }
 }
@@ -1509,7 +1596,7 @@ describe('Repository picker', () => {
     }
     env.load()
     assert.deepStrictEqual(
-      env.elements['#repoFilter'].options.map((o) => o.value),
+      Array.from(env.elements['#repoFilter'].options).map((o) => o.value),
       ['', 'a/one', 'b/two']
     )
   })
@@ -1519,7 +1606,7 @@ describe('Repository picker', () => {
     env.load()
     await env.tick()
     assert.deepStrictEqual(
-      env.elements['#repoFilter'].options.map((o) => o.value),
+      Array.from(env.elements['#repoFilter'].options).map((o) => o.value),
       ['', 'owner/scraped']
     )
   })
@@ -1979,22 +2066,123 @@ describe('popup.html', () => {
   })
 })
 
-// The worker's answers to a two-part load: LOAD_ITEMS gives the tasks and
-// schedules, LOAD_ARCHIVED the archived tasks (with their notes).
-function moreReplies(accounts, loadId = 'L1') {
-  return (msg) => {
-    if (msg.action === 'LOAD_ITEMS') {
-      return {
-        loadId,
-        accounts: accounts.map(({ account, tasks, schedules }) => ({ account, tasks, schedules, notes: [] }))
-      }
-    }
-    if (msg.action === 'LOAD_ARCHIVED') {
-      return { loadId, accounts: accounts.map(({ account, archived, notes }) => ({ account, archived, notes })) }
-    }
-    if (msg.action === 'APPLY_ACTION') return { ok: true }
-    return {}
+// The worker's view of a load (SPEC-B): what the popup renders, and what
+// survives the popup closing.
+function moreView(overrides = {}) {
+  return {
+    version: 1,
+    loadId: 'L1',
+    category: 'all',
+    repo: '',
+    items: [],
+    notes: [],
+    cachedAt: null,
+    archived: 'none',
+    loading: null,
+    error: null,
+    outdated: false,
+    rev: 1,
+    updatedAt: Date.now(),
+    ...overrides
   }
+}
+
+// The worker of SPEC-B: it answers a Load, keeps the view the popup reads in
+// the session storage, and lists the archived tasks by itself.
+function installMoreWorker(env, accounts, { cachedAt = null, notes = null } = {}) {
+  let loads = 0
+  const kindOf = { tasks: 'task', schedules: 'schedule', archived: 'archived' }
+  const listsOf = (category) =>
+    category === 'scheduled'
+      ? ['schedules']
+      : category === 'complete'
+        ? ['tasks']
+        : category === 'archive'
+          ? []
+          : ['tasks', 'schedules']
+  const accountNotes = accounts.flatMap((account) => account.notes || [])
+  // What the worker answers for a Load.
+  const lists = (category) =>
+    accounts.map((account) => {
+      const entry = { account: account.account, tasks: [], schedules: [], archived: [], notes: [] }
+      for (const list of listsOf(category)) {
+        entry[list] = (account[list] || []).filter(
+          (item) => list !== 'tasks' || category !== 'complete' || env.sandbox.isCompletedTask(item)
+        )
+      }
+      return entry
+    })
+  const worker = {
+    view: null,
+    // The items of a load, as the worker puts them in the view.
+    items(category) {
+      const items = []
+      for (const account of lists(category)) {
+        for (const list of listsOf(category)) {
+          for (const item of account[list]) items.push({ ...item, account: account.account, kind: kindOf[list] })
+        }
+      }
+      return items
+    },
+    // The view the popup sees; a new one replaces the old.
+    write(view) {
+      worker.view = { version: 1, ...view, rev: (worker.view?.rev ?? 0) + 1, updatedAt: Date.now() }
+      env.sessionStorage.moreView = worker.view
+      env.sessionChange({ moreView: { newValue: worker.view } })
+      return worker.view
+    },
+    // The Load the popup asked for, and the view of its answer.
+    load(category, repo = '', cache = null) {
+      const loadId = `L${++loads}`
+      return worker.write({
+        loadId,
+        category,
+        repo,
+        items: worker.items(category),
+        // The accounts' notes here are the archived listing's: they come with its end.
+        notes: notes ?? [],
+        cachedAt: cache,
+        archived: category === 'archive' ? 'loading' : 'none'
+      })
+    },
+    // The archived listing ends: its tasks join the view.
+    finishArchived(extraNotes = []) {
+      const items = []
+      for (const account of accounts) {
+        for (const item of account.archived || []) {
+          items.push({ ...item, account: account.account, kind: 'archived' })
+        }
+      }
+      return worker.write({
+        ...worker.view,
+        archived: 'done',
+        items: [...worker.view.items, ...items],
+        notes: [...worker.view.notes, ...extraNotes, ...accountNotes]
+      })
+    },
+    // The archived listing failed.
+    failArchived(error) {
+      return worker.write({
+        ...worker.view,
+        archived: 'failed',
+        error: `Could not list the archived tasks: ${error}`
+      })
+    }
+  }
+  env.worker = worker
+  env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+    env.sent.push(msg)
+    if (msg.action === 'HELLO') return cb?.({ protocol: RUN_PROTOCOL })
+    if (msg.action === 'GET_STATE') return cb?.({ status: 'idle' })
+    if (msg.action === 'GET_ALL_SOURCES') return cb?.({ repos: [] })
+    if (msg.action === 'LOAD_ITEMS') {
+      const view = worker.load(msg.category, msg.repo || '', msg.fresh ? null : cachedAt)
+      return cb?.({ loadId: view.loadId, accounts: lists(msg.category) })
+    }
+    if (msg.action === 'APPLY_ACTION') return cb?.({ ok: true })
+    return cb?.({})
+  }
+  return worker
 }
 
 describe('More Actions popup', () => {
@@ -2013,11 +2201,7 @@ describe('More Actions popup', () => {
 
   async function setup() {
     const env = setupPopupSandbox()
-    const reply = moreReplies(accounts)
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      if (cb) cb(reply(msg))
-    }
+    installMoreWorker(env, accounts)
     env.load()
     await env.tick()
     return env
@@ -2117,7 +2301,7 @@ describe('More Actions popup', () => {
 
   it('labels a completed task Jules marks for review "Ready for review"', async () => {
     const env = setupPopupSandbox()
-    const reply = moreReplies([
+    installMoreWorker(env, [
       {
         account: 'u/1',
         tasks: [
@@ -2127,13 +2311,10 @@ describe('More Actions popup', () => {
         schedules: []
       }
     ])
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      if (cb) cb(reply(msg))
-    }
     env.load()
     await env.tick()
     await env.elements['#moreLoad'].dispatchEvent('click')
+    await env.tick()
     assert.deepStrictEqual(
       env.elements['#moreList'].children.map((row) => row.children[1].children[1].textContent),
       ['Task · Ready for review · org/repo · u/1', 'Task · Completed · org/repo · u/1']
@@ -2161,40 +2342,31 @@ describe('More Actions popup edge cases', () => {
     env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
       env.sent.push(msg)
       if (msg.action === 'LOAD_ITEMS') answer = cb
-      if (msg.action === 'LOAD_ARCHIVED') cb({ loadId: msg.loadId, accounts: [] })
+      if (cb && msg.action !== 'LOAD_ITEMS') cb({ status: 'idle' })
     }
     const loading = el['#moreLoad'].dispatchEvent('click')
     await env.tick()
     assert.strictEqual(el['#moreLoad'].textContent, 'Loading…')
     assert.strictEqual(el['#moreLoad'].getAttribute('aria-busy'), 'true')
     assert.strictEqual(el['#moreConfirm'].disabled, true)
+    // The worker says the load failed; the view carries the reason.
+    env.sessionChange({ moreView: { newValue: moreView({ error: 'Listing failed' }) } })
     answer({ error: 'Listing failed' })
     await loading
-    assert.strictEqual(el['#moreStatus'].textContent, 'Listing failed')
+    assert.match(el['#moreStatus'].textContent, /Listing failed/)
     assert.strictEqual(el['#moreLoad'].textContent, 'Load')
     assert.strictEqual(el['#moreList'].children.length, 0)
     const next = el['#moreLoad'].dispatchEvent('click')
     await env.tick()
+    env.sessionChange({ moreView: { newValue: moreView({ rev: 2 }) } })
     answer({ loadId: 'L2', accounts: [] })
     await next
-    assert.strictEqual(el['#moreStatus'].textContent, '0 tasks, 0 schedules')
+    assert.match(el['#moreStatus'].textContent, /0 tasks, 0 schedules/)
     assert.strictEqual(el['#moreSelectAll'].disabled, true)
   })
 
-  // Holds the worker's LOAD_ARCHIVED answers so a test can give them later.
-  function heldArchived(accounts) {
-    const env = setupPopupSandbox()
-    env.held = []
-    let loads = 0
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      if (msg.action === 'LOAD_ITEMS') return cb(moreReplies(accounts, `L${++loads}`)(msg))
-      if (msg.action === 'LOAD_ARCHIVED') return env.held.push({ msg, cb })
-      if (cb) cb({})
-    }
-    return env
-  }
-  // What the worker answers for Archived: nothing until LOAD_ARCHIVED.
+  // What the worker answers for Archived: nothing until the archived listing
+  // is done; the popup only reads the view.
   const archivedOnly = [
     {
       account: 'u/1',
@@ -2206,6 +2378,7 @@ describe('More Actions popup edge cases', () => {
     env.load()
     await env.tick()
     env.elements['#moreCategory'].value = 'archive'
+    await env.elements['#moreCategory'].dispatchEvent('change')
     await env.elements['#moreLoad'].dispatchEvent('click')
     await env.tick()
   }
@@ -2227,24 +2400,19 @@ describe('More Actions popup edge cases', () => {
     assert.match(popupHtml, /id="moreLoad">Load<\/button>\s*<button type="button" class="sb hidden" id="moreRefresh"/)
     const env = setupPopupSandbox()
     const at = Date.now() - 12 * 60000
-    const reply = moreReplies(cacheAccounts)
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      const answer = reply(msg)
-      if (cb) cb(msg.action.startsWith('LOAD_') && !msg.fresh ? { ...answer, cachedAt: at } : answer)
-    }
+    installMoreWorker(env, cacheAccounts, { cachedAt: at })
     env.load()
     await env.tick()
     const el = env.elements
     const loads = () => env.sent.filter((msg) => msg.action.startsWith('LOAD_')).map((msg) => [msg.action, msg.fresh])
     assert.ok(el['#moreRefresh'].classList.contains('hidden'))
     el['#moreCategory'].value = 'archive'
+    await el['#moreCategory'].dispatchEvent('change')
     await el['#moreLoad'].dispatchEvent('click')
     await env.tick()
-    assert.deepStrictEqual(loads(), [
-      ['LOAD_ITEMS', false],
-      ['LOAD_ARCHIVED', false]
-    ])
+    assert.deepStrictEqual(loads(), [['LOAD_ITEMS', false]], 'the popup asks for the archived tasks itself')
+    env.worker.finishArchived()
+    await env.tick()
     assert.strictEqual(
       el['#moreStatus'].textContent,
       '1 archived tasks · from the cache, 12 min old · Archived listing note'
@@ -2254,37 +2422,26 @@ describe('More Actions popup edge cases', () => {
     env.sent.length = 0
     await el['#moreRefresh'].dispatchEvent('click')
     await env.tick()
-    assert.deepStrictEqual(loads(), [
-      ['LOAD_ITEMS', true],
-      ['LOAD_ARCHIVED', true]
-    ])
+    assert.deepStrictEqual(loads(), [['LOAD_ITEMS', true]])
+    env.worker.finishArchived()
+    await env.tick()
     assert.strictEqual(el['#moreStatus'].textContent, '1 archived tasks · Archived listing note')
     assert.ok(el['#moreRefresh'].classList.contains('hidden'), 'a live load needs no Refresh')
   })
 
-  it('calls a cache under a minute old just that, and takes the older of the two parts', async () => {
+  it('calls a cache under a minute old just that, and shows the age the worker kept', async () => {
     const env = setupPopupSandbox()
-    const reply = moreReplies(cacheAccounts)
-    const ages = { LOAD_ITEMS: 20000, LOAD_ARCHIVED: 60000 }
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      if (cb) cb(ages[msg.action] ? { ...reply(msg), cachedAt: Date.now() - ages[msg.action] } : reply(msg))
-    }
+    installMoreWorker(env, cacheAccounts, { cachedAt: Date.now() - 20000 })
     env.load()
     await env.tick()
     const el = env.elements
     await el['#moreLoad'].dispatchEvent('click')
     await env.tick()
     assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules · from the cache, under a minute old')
-    ages.LOAD_ITEMS = 7 * 60000
-    el['#moreCategory'].value = 'archive'
-    await el['#moreLoad'].dispatchEvent('click')
+    // The worker keeps the older of the two parts; the popup shows it.
+    env.worker.write({ ...env.worker.view, cachedAt: Date.now() - 7 * 60000 })
     await env.tick()
-    assert.match(
-      el['#moreStatus'].textContent,
-      /from the cache, 7 min old/,
-      'the older part, not the newer archived one'
-    )
+    assert.match(el['#moreStatus'].textContent, /from the cache, 7 min old/)
   })
 
   it('keeps counting the age of a cached load while the popup stays open, and stops after a live one', async () => {
@@ -2297,12 +2454,7 @@ describe('More Actions popup edge cases', () => {
     const start = 1_800_000_000_000
     env.sandbox.__now = start
     vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
-    const reply = moreReplies(cacheAccounts)
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      const answer = reply(msg)
-      if (cb) cb(msg.action.startsWith('LOAD_') && !msg.fresh ? { ...answer, cachedAt: start - 4 * 60000 } : answer)
-    }
+    installMoreWorker(env, cacheAccounts, { cachedAt: start - 4 * 60000 })
     env.load()
     await env.tick()
     const el = env.elements
@@ -2324,19 +2476,17 @@ describe('More Actions popup edge cases', () => {
     assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules')
   })
 
-  it('offers Refresh when only the archived part came from the cache', async () => {
+  it('offers Refresh when the load came from the cache', async () => {
     const env = setupPopupSandbox()
-    const reply = moreReplies(cacheAccounts)
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      if (!cb) return
-      cb(msg.action === 'LOAD_ARCHIVED' ? { ...reply(msg), cachedAt: Date.now() - 2 * 60000 } : reply(msg))
-    }
+    installMoreWorker(env, cacheAccounts, { cachedAt: Date.now() - 2 * 60000 })
     env.load()
     await env.tick()
     const el = env.elements
     el['#moreCategory'].value = 'archive'
+    await el['#moreCategory'].dispatchEvent('change')
     await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    env.worker.finishArchived()
     await env.tick()
     assert.strictEqual(
       el['#moreStatus'].textContent,
@@ -2345,22 +2495,17 @@ describe('More Actions popup edge cases', () => {
     assert.ok(!el['#moreRefresh'].classList.contains('hidden'))
   })
 
-  it('Archived waits for LOAD_ARCHIVED, with Load free meanwhile', async () => {
-    const env = heldArchived(archivedOnly)
+  it('the worker lists the archived tasks by itself, with Load free meanwhile', async () => {
+    const env = setupPopupSandbox()
+    installMoreWorker(env, archivedOnly)
     await loadArchived(env)
     const el = env.elements
     assert.strictEqual(env.sent.find((msg) => msg.action === 'LOAD_ITEMS').category, 'archive')
     assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks…')
     assert.strictEqual(el['#moreLoad'].disabled, false, 'Load is free again')
     assert.strictEqual(el['#moreLoad'].textContent, 'Load')
-    const [{ msg, cb }] = env.held
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(msg)), {
-      action: 'LOAD_ARCHIVED',
-      protocol: RUN_PROTOCOL,
-      loadId: 'L1',
-      fresh: false
-    })
-    cb(moreReplies(archivedOnly, 'L1')(msg))
+    assert.ok(!env.sent.some((msg) => msg.action === 'LOAD_ARCHIVED'), 'the popup never asks for the archived tasks')
+    env.worker.finishArchived()
     await env.tick()
     assert.strictEqual(el['#moreStatus'].textContent, '1 archived tasks · Archived listing note')
     assert.strictEqual(el['#moreChips'].children.length, 0, 'one category needs no chips')
@@ -2372,7 +2517,8 @@ describe('More Actions popup edge cases', () => {
   })
 
   it('shows how many repos the archived listing has done, for this load only', async () => {
-    const env = heldArchived(archivedOnly)
+    const env = setupPopupSandbox()
+    installMoreWorker(env, archivedOnly)
     await loadArchived(env)
     const el = env.elements
     const progress = (loadId, done, total, area = 'session') => {
@@ -2391,23 +2537,18 @@ describe('More Actions popup edge cases', () => {
     assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks…')
     progress('L1', 200, 390)
     assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks…')
-    env.held[1].cb(moreReplies(archivedOnly, 'L2')(env.held[1].msg))
+    env.worker.finishArchived()
     await env.tick()
     progress('L2', 390, 390)
     assert.strictEqual(el['#moreStatus'].textContent, '1 archived tasks · Archived listing note')
   })
 
-  it("shows the worker's notes about the whole load, for both answers", async () => {
-    const env = heldArchived(archivedOnly)
-    const loadItems = env.sandbox.chrome.runtime.sendMessage
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) =>
-      msg.action === 'LOAD_ITEMS'
-        ? loadItems(msg, (reply) => cb({ ...reply, notes: ['Not kept'] }))
-        : loadItems(msg, cb)
+  it("shows the worker's notes about the whole load", async () => {
+    const env = setupPopupSandbox()
+    installMoreWorker(env, archivedOnly, { notes: ['Not kept'] })
     await loadArchived(env)
     assert.strictEqual(env.elements['#moreStatus'].textContent, 'Listing the archived tasks… · Not kept')
-    const [{ msg, cb }] = env.held
-    cb({ ...moreReplies(archivedOnly, 'L1')(msg), notes: ['Still not kept'] })
+    env.worker.finishArchived(['Still not kept'])
     await env.tick()
     assert.strictEqual(
       env.elements['#moreStatus'].textContent,
@@ -2416,30 +2557,27 @@ describe('More Actions popup edge cases', () => {
   })
 
   it('drops the archived tasks of a load that a newer Load replaced', async () => {
-    const env = heldArchived(archivedOnly)
+    const env = setupPopupSandbox()
+    installMoreWorker(env, archivedOnly)
     await loadArchived(env)
     const el = env.elements
     await el['#moreLoad'].dispatchEvent('click')
     await env.tick()
-    assert.deepStrictEqual(
-      env.held.map(({ msg }) => msg.loadId),
-      ['L1', 'L2']
-    )
-    env.held[0].cb(moreReplies(archivedOnly, 'L1')(env.held[0].msg))
-    await env.tick()
-    assert.strictEqual(el['#moreList'].children.length, 0)
+    assert.strictEqual(el['#moreList'].children.length, 0, 'the new load lists nothing yet')
     assert.strictEqual(el['#moreStatus'].textContent, 'Listing the archived tasks…')
-    env.held[1].cb(moreReplies(archivedOnly, 'L2')(env.held[1].msg))
+    env.worker.finishArchived()
     await env.tick()
     assert.strictEqual(el['#moreList'].children.length, 1)
   })
 
   it('says when the archived tasks could not be listed', async () => {
-    const env = heldArchived(archivedOnly)
+    const env = setupPopupSandbox()
+    installMoreWorker(env, archivedOnly)
     await loadArchived(env)
-    env.held[0].cb({ error: 'Jules gave up' })
+    env.worker.failArchived('Jules gave up')
     await env.tick()
-    assert.strictEqual(env.elements['#moreStatus'].textContent, 'Could not list the archived tasks: Jules gave up')
+    assert.match(env.elements['#moreStatus'].textContent, /Could not list the archived tasks/)
+    assert.match(env.elements['#moreStatus'].textContent, /Jules gave up/)
     assert.strictEqual(env.elements['#moreList'].children.length, 0)
   })
 
@@ -2449,15 +2587,12 @@ describe('More Actions popup edge cases', () => {
       ['complete', { tasks: [{ id: 't', title: 'T', state: 3, repo: 'org/repo' }] }, '1 completed tasks']
     ]) {
       const env = setupPopupSandbox()
-      const reply = moreReplies([{ account: 'u/1', ...account }])
-      env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-        env.sent.push(msg)
-        if (cb) cb(reply(msg))
-      }
+      installMoreWorker(env, [{ account: 'u/1', ...account }])
       env.load()
       await env.tick()
       const el = env.elements
       el['#moreCategory'].value = category
+      await el['#moreCategory'].dispatchEvent('change')
       await el['#moreLoad'].dispatchEvent('click')
       await env.tick()
       assert.strictEqual(env.sent.find((msg) => msg.action === 'LOAD_ITEMS').category, category)
@@ -2496,17 +2631,19 @@ describe('More Actions confirmation choices', () => {
       const account = { account: 'u/1', tasks: [], schedules: [], archived: [], notes: [] }
       account[kind === 'task' ? 'tasks' : kind === 'schedule' ? 'schedules' : 'archived'].push(entry)
       account.schedules.push({ id: 'unfit', title: 'Other', state: 99, repo: 'org/repo' })
-      const reply = moreReplies([account])
-      env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-        env.sent.push(msg)
-        if (cb) cb(msg.action === 'GET_STATE' ? { status: 'idle' } : reply(msg))
-      }
+      installMoreWorker(env, [account])
       env.load()
       await env.tick()
       const el = env.elements
       el['#moreCategory'].value = kind === 'archived' ? 'archive' : 'all'
+      await el['#moreCategory'].dispatchEvent('change')
       await el['#moreLoad'].dispatchEvent('click')
       await env.tick()
+      if (kind === 'archived') {
+        env.worker.finishArchived()
+        await env.tick()
+      }
+      assert.strictEqual(el['#moreList'].children.length, kind === 'archived' ? 1 : 2, 'the chosen item is listed')
       assert.strictEqual(el['#moreConfirm'].disabled, true)
       el['#moreSelectAll'].checked = true
       await el['#moreSelectAll'].dispatchEvent('change')
@@ -2544,16 +2681,17 @@ describe('More Actions options', () => {
   // One load of the category, with these lists for u/1.
   async function loaded(category, lists) {
     const env = setupPopupSandbox()
-    const reply = moreReplies([{ account: 'u/1', tasks: [], schedules: [], archived: [], notes: [], ...lists }])
-    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
-      env.sent.push(msg)
-      if (cb) cb(msg.action === 'GET_STATE' ? { status: 'idle' } : reply(msg))
-    }
+    installMoreWorker(env, [{ account: 'u/1', tasks: [], schedules: [], archived: [], notes: [], ...lists }])
     env.load()
     await env.tick()
     env.elements['#moreCategory'].value = category
+    await env.elements['#moreCategory'].dispatchEvent('change')
     await env.elements['#moreLoad'].dispatchEvent('click')
     await env.tick()
+    if (category === 'archive') {
+      env.worker.finishArchived()
+      await env.tick()
+    }
     return env
   }
   const offered = (env) => env.elements['#moreAction'].children.map((opt) => opt.value).filter(Boolean)
@@ -2650,7 +2788,8 @@ describe('More Actions options', () => {
       'https://jules.google.com/task/done\nhttps://jules.google.com/task/review'
     ])
     assert.ok(!env.sent.some((msg) => msg.action === 'APPLY_ACTION'))
-    assert.strictEqual(el['#moreStatus'].textContent, 'Copied 2 session URLs.')
+    // The message joins the status line, after the counts.
+    assert.match(el['#moreStatus'].textContent, / · Copied 2 session URLs\.$/)
     assert.strictEqual(el['#moreList'].children[0].children[0].checked, true, 'the selection stays')
   })
 
@@ -2660,7 +2799,7 @@ describe('More Actions options', () => {
     await choose(env, 'copyUrl')
     await env.elements['#moreConfirm'].dispatchEvent('click')
     await env.tick()
-    assert.strictEqual(env.elements['#moreStatus'].textContent, 'Could not copy the URLs: Document is not focused.')
+    assert.match(env.elements['#moreStatus'].textContent, / · Could not copy the URLs: Document is not focused\.$/)
   })
 
   it('Delete schedule needs a second click on Confirm', async () => {
@@ -2831,5 +2970,920 @@ describe('More Actions smoke', () => {
     assert.strictEqual(env.elements['#moreLoad'].disabled, false)
     assert.strictEqual(env.elements['#moreConfirm'].disabled, true)
     assert.strictEqual(env.elements['#proceedBtn'].disabled, false)
+  })
+})
+
+// The popup renders the worker's view of the last load (SPEC-B): the list,
+// the counts, the notes and the cache age survive the popup closing.
+describe('More Actions view', () => {
+  const items = [
+    { id: 'run', title: 'Running title', state: 2, repo: 'org/repo', account: 'u/1', kind: 'task' },
+    { id: 'done', title: 'Completed title', state: 3, repo: 'org/repo', account: 'u/1', kind: 'task' },
+    { id: 'sched', title: 'Schedule title', state: 2, repo: 'org/repo', account: 'u/1', kind: 'schedule' }
+  ]
+
+  it("renders the worker's view when the popup opens", async () => {
+    const env = setupPopupSandbox({
+      session: { moreView: moreView({ items, notes: ['A note about the load'] }) }
+    })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#moreStatus'].textContent, '2 tasks, 1 schedules · A note about the load')
+    assert.strictEqual(el['#moreList'].children.length, 3)
+    assert.strictEqual(
+      el['#moreList'].children[0].children[1].children[1].textContent,
+      'Task · In Progress · org/repo · u/1'
+    )
+    assert.deepStrictEqual(
+      el['#moreChips'].children.map((chip) => chip.textContent),
+      ['All (3)', 'Scheduled (1)', 'Completed (1)']
+    )
+  })
+
+  // A list too large for Chrome to keep: the saved view has no items, and the
+  // worker, which still holds them, answers them to the open popup.
+  const tooLarge = 'The list is too large to keep while the popup is closed. Load again.'
+  const partialOf = (view) => ({ ...view, items: [], partial: true, error: tooLarge })
+  // The worker's answers to GET_MORE_VIEW: `answer()` gives the view, or a
+  // promise of it for an answer that comes late.
+  const answerViews = (env, answer) => {
+    const send = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (msg.action !== 'GET_MORE_VIEW') return send(msg, cb)
+      env.sent.push(msg)
+      Promise.resolve(answer()).then((view) => cb?.({ view }))
+    }
+  }
+
+  it('shows a list too large for Chrome to keep, from the worker, while the popup is open', async () => {
+    const full = moreView({ items, unsaved: true })
+    const env = setupPopupSandbox({ session: { moreView: partialOf(full) } })
+    answerViews(env, () => full)
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.ok(env.sent.some((msg) => msg.action === 'GET_MORE_VIEW' && msg.protocol === RUN_PROTOCOL))
+    assert.strictEqual(el['#moreList'].children.length, 3, "the worker's items are listed")
+    assert.doesNotMatch(el['#moreStatus'].textContent, /Load again\./)
+    assert.match(
+      el['#moreStatus'].textContent,
+      /Chrome can't keep a list this large: act on it before the popup closes\./
+    )
+  })
+
+  it('keeps the selection of a list too large to keep through the next write', async () => {
+    let full = moreView({ items, unsaved: true })
+    const env = setupPopupSandbox({ session: { moreView: partialOf(full) } })
+    answerViews(env, () => full)
+    env.load()
+    await env.tick()
+    const el = env.elements
+    const checkbox = el['#moreList'].children[1].children[0]
+    checkbox.checked = true
+    await checkbox.dispatchEvent('change')
+    // A run leaves the list out of date: the worker writes the view again,
+    // and Chrome refuses it again.
+    full = { ...full, outdated: true, updatedAt: full.updatedAt + 1 }
+    env.sessionChange({ moreView: { newValue: partialOf(full) } })
+    await env.tick()
+    assert.strictEqual(el['#moreList'].children.length, 3)
+    assert.strictEqual(el['#moreList'].children[1].children[0].checked, true, 'the selection stays')
+    assert.match(el['#moreStatus'].textContent, /Loaded before the last run/)
+  })
+
+  it('says the list is gone when the worker no longer holds it', async () => {
+    const full = moreView({ items, unsaved: true })
+    const env = setupPopupSandbox({ session: { moreView: partialOf(full) } })
+    let answer = full
+    answerViews(env, () => answer)
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#moreList'].children.length, 3)
+    // The worker restarted: it has only the saved view, without the items.
+    answer = partialOf({ ...full, outdated: true, updatedAt: full.updatedAt + 1 })
+    env.sessionChange({ moreView: { newValue: answer } })
+    await env.tick()
+    assert.strictEqual(el['#moreList'].children.length, 0, 'no item of a list the worker lost stays')
+    assert.match(
+      el['#moreStatus'].textContent,
+      /The list is too large to keep while the popup is closed\. Load again\./
+    )
+    assert.strictEqual(el['#moreSelectAll'].disabled, true)
+  })
+
+  it("never takes the worker's answer over a newer view", async () => {
+    const full = moreView({ items, unsaved: true })
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    let late
+    answerViews(
+      env,
+      () =>
+        new Promise((resolve) => {
+          late = resolve
+        })
+    )
+    env.load()
+    await env.tick()
+    const el = env.elements
+    env.sessionChange({ moreView: { newValue: partialOf({ ...full, updatedAt: full.updatedAt + 1 }) } })
+    await env.tick()
+    // A newer view, which fits, comes before the answer.
+    env.sessionChange({
+      moreView: { newValue: moreView({ items: [items[0]], rev: 2, updatedAt: full.updatedAt + 2 }) }
+    })
+    await env.tick()
+    assert.strictEqual(el['#moreList'].children.length, 1)
+    late({ ...full, updatedAt: full.updatedAt + 1 })
+    await env.tick()
+    assert.strictEqual(el['#moreList'].children.length, 1, 'the late answer is older than the view shown')
+  })
+
+  it('says a failed Load once when the view shows its error', async () => {
+    const env = setupPopupSandbox()
+    env.load()
+    await env.tick()
+    const el = env.elements
+    let reply = { error: 'Listing failed', inView: true }
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      if (msg.action === 'HELLO') return cb?.({ protocol: RUN_PROTOCOL })
+      if (msg.action !== 'LOAD_ITEMS') return cb?.({ status: 'idle' })
+      if (reply.inView) env.sessionChange({ moreView: { newValue: moreView({ error: reply.error }) } })
+      cb?.(reply)
+    }
+    const times = (text) => el['#moreStatus'].textContent.split(text).length - 1
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(times('Listing failed'), 1)
+    // A Load the worker refused before it started is in no view: the popup says it.
+    reply = { error: 'A run is already going. Wait for it to finish.' }
+    await el['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.strictEqual(times('A run is already going'), 1)
+  })
+
+  it('ignores a view of another version', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ version: 2, items }) } })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children.length, 0)
+    assert.doesNotMatch(env.elements['#moreStatus'].textContent, /In Progress/)
+  })
+
+  it('shows the error of a failed load', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ error: 'Listing failed' }) } })
+    env.load()
+    await env.tick()
+    assert.match(env.elements['#moreStatus'].textContent, /Listing failed/)
+  })
+
+  it('shows the outdated note', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ outdated: true }) } })
+    env.load()
+    await env.tick()
+    assert.match(
+      env.elements['#moreStatus'].textContent,
+      /Loaded before the last run; Load again to see it as it is now\./
+    )
+  })
+
+  it('re-renders the list when the worker writes a new view', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items: [items[0]] }) } })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children.length, 1)
+    env.sessionChange({ moreView: { newValue: moreView({ rev: 2, items }) } })
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children.length, 3)
+  })
+
+  it('a view that does not raise the rev does not rebuild the list', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    env.load()
+    await env.tick()
+    const row = env.elements['#moreList'].children[0]
+    env.sessionChange({ moreView: { newValue: moreView({ rev: 1, items }) } })
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children[0], row, 'the list is not rebuilt')
+  })
+
+  it('another session change only redraws the status line', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    env.load()
+    await env.tick()
+    const row = env.elements['#moreList'].children[0]
+    env.sessionChange({ moreArchivedProgress: { newValue: { loadId: 'L1', done: 3, total: 9 } } })
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children[0], row, 'the list is not rebuilt')
+  })
+
+  it('keeps the selection, the scroll position and the focus across a rebuild', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#moreList'].children.length, 3, 'the view is listed')
+    const checkbox = el['#moreList'].children[1].children[0]
+    checkbox.checked = true
+    await checkbox.dispatchEvent('change')
+    el['#moreList'].scrollTop = 120
+    checkbox.focus()
+    env.sessionChange({ moreView: { newValue: moreView({ rev: 2, items: [...items, { ...items[0], id: 'new' }] }) } })
+    await env.tick()
+    const rebuilt = el['#moreList'].children[1].children[0]
+    assert.strictEqual(rebuilt.checked, true, 'the selection stays')
+    assert.strictEqual(el['#moreList'].scrollTop, 120, 'the scroll position stays')
+    assert.strictEqual(rebuilt.focused, true, 'the focus stays on the same item')
+  })
+
+  it('rebuilds the list for a new load even when its items, and so its rev, are the same', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items }) } })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    const checkbox = el['#moreList'].children[1].children[0]
+    checkbox.checked = true
+    await checkbox.dispatchEvent('change')
+    // Load again: the same items come back, under a new load id.
+    env.sessionChange({ moreView: { newValue: moreView({ items, loadId: 'L2' }) } })
+    await env.tick()
+    assert.strictEqual(
+      el['#moreList'].children[1].children[0].checked,
+      false,
+      'a new load starts with nothing selected, and the list shows it'
+    )
+  })
+
+  it('says a live listing stopped while the popup stays open, with no news from the worker', async () => {
+    const timers = []
+    const start = 1_800_000_000_000
+    const env = setupPopupSandbox({
+      session: { moreView: moreView({ category: 'archive', archived: 'loading', updatedAt: start }) }
+    })
+    env.sandbox.setInterval = (fn, ms) => timers.push({ fn, ms, on: true })
+    env.sandbox.clearInterval = (id) => {
+      if (timers[id - 1]) timers[id - 1].on = false
+    }
+    env.sandbox.__now = start
+    vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
+    env.load()
+    await env.tick()
+    assert.doesNotMatch(env.elements['#moreStatus'].textContent, /The listing stopped/)
+    // The worker died: no view and no count come any more.
+    env.sandbox.__now += 11 * 60000
+    for (const timer of timers.filter((t) => t.on)) timer.fn()
+    assert.match(env.elements['#moreStatus'].textContent, /The listing stopped\. Load again\./)
+  })
+
+  // A popup that drives its own clock and the intervals it starts.
+  function clockedPopup(session) {
+    const timers = []
+    const env = setupPopupSandbox({ session })
+    env.sandbox.setInterval = (fn, ms) => timers.push({ fn, ms, on: true })
+    env.sandbox.clearInterval = (id) => {
+      if (timers[id - 1]) timers[id - 1].on = false
+    }
+    env.sandbox.__now = Date.now()
+    vm.runInContext('Date.now = () => globalThis.__now', env.sandbox)
+    env.timers = timers
+    env.wait = (ms) => {
+      env.sandbox.__now += ms
+      for (const timer of timers.filter((t) => t.on)) timer.fn()
+    }
+    return env
+  }
+
+  it('a reopened popup dates a long listing by its last count, not by the view', async () => {
+    const now = Date.now()
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ category: 'archive', archived: 'loading', updatedAt: now - 20 * 60000 }),
+        moreArchivedProgress: { loadId: 'L1', done: 5, total: 10, updatedAt: now - 60000 }
+      }
+    })
+    env.load()
+    await env.tick()
+    const status = env.elements['#moreStatus'].textContent
+    assert.match(status, /5 of 10 repos/)
+    assert.doesNotMatch(status, /The listing stopped/, 'the count moved a minute ago')
+  })
+
+  it("keeps the popup's own message on the status line for 30 seconds", async () => {
+    const env = clockedPopup({ moreView: moreView({ items, cachedAt: Date.now() }) })
+    const send = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      if (msg.action === 'LOAD_ITEMS') return cb?.({ error: 'Jules said no.' })
+      return send(msg, cb)
+    }
+    env.load()
+    await env.tick()
+    await env.elements['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.match(env.elements['#moreStatus'].textContent, /Jules said no\./)
+    env.wait(20000)
+    assert.match(
+      env.elements['#moreStatus'].textContent,
+      /Jules said no\./,
+      'the cache age ticks on, the message stays'
+    )
+    env.wait(11000)
+    assert.doesNotMatch(env.elements['#moreStatus'].textContent, /Jules said no\./, 'and goes after 30 s')
+  })
+
+  it('runs one status timer at a time, and stops it once the view is neither cached nor listing', async () => {
+    const env = clockedPopup({ moreView: moreView({ items, cachedAt: Date.now() }) })
+    env.load()
+    await env.tick()
+    for (const rev of [2, 3, 4]) {
+      env.sessionChange({ moreView: { newValue: moreView({ items, cachedAt: Date.now(), rev }) } })
+      await env.tick()
+    }
+    assert.strictEqual(env.timers.filter((t) => t.ms === 30000).length, 1, 'one timer for every view that moves')
+    env.sessionChange({ moreView: { newValue: moreView({ items, rev: 5 }) } })
+    await env.tick()
+    env.wait(30000)
+    assert.strictEqual(env.timers.filter((t) => t.on).length, 0, 'the timer stops with nothing to move')
+  })
+
+  it('marks the list busy while the worker lists', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ loading: { id: 'L2', category: 'all', repo: '', startedAt: Date.now() } })
+      }
+    })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].getAttribute('aria-busy'), 'true')
+    env.sessionChange({ moreView: { newValue: moreView({ rev: 2, archived: 'loading' }) } })
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].getAttribute('aria-busy'), 'true')
+    env.sessionChange({ moreView: { newValue: moreView({ rev: 3, archived: 'done' }) } })
+    await env.tick()
+    assert.notStrictEqual(env.elements['#moreList'].getAttribute('aria-busy'), 'true')
+  })
+
+  it('keeps Load and Refresh free while the worker lists', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({
+          archived: 'loading',
+          loading: { id: 'L2', category: 'archive', repo: '', startedAt: Date.now() }
+        })
+      }
+    })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#moreLoad'].disabled, false, 'Load is free')
+    assert.strictEqual(el['#moreRefresh'].disabled, false, 'Refresh is free')
+    // A run that goes on locks them, as before.
+    env.sandbox.setRunning('proceed', true)
+    await env.tick()
+    assert.strictEqual(el['#moreLoad'].disabled, true)
+  })
+
+  it('says when a listing stopped', async () => {
+    const old = Date.now() - 11 * 60000
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({
+          updatedAt: old,
+          loading: { id: 'L2', category: 'all', repo: '', startedAt: old }
+        })
+      }
+    })
+    env.load()
+    await env.tick()
+    assert.match(env.elements['#moreStatus'].textContent, /The listing stopped\. Load again\./)
+  })
+
+  it('says when the archived listing stopped', async () => {
+    const old = Date.now() - 11 * 60000
+    const env = setupPopupSandbox({
+      session: { moreView: moreView({ category: 'archive', archived: 'loading', updatedAt: old }) }
+    })
+    env.load()
+    await env.tick()
+    assert.match(env.elements['#moreStatus'].textContent, /The listing stopped\. Load again\./)
+  })
+
+  it('does not call a fresh listing stopped', async () => {
+    const env = setupPopupSandbox({
+      session: { moreView: moreView({ category: 'archive', archived: 'loading' }) }
+    })
+    env.load()
+    await env.tick()
+    assert.doesNotMatch(env.elements['#moreStatus'].textContent, /The listing stopped/)
+  })
+
+  it('never sends LOAD_ARCHIVED', async () => {
+    const env = setupPopupSandbox()
+    installMoreWorker(env, [
+      {
+        account: 'u/1',
+        tasks: [],
+        schedules: [],
+        archived: [{ id: 'old', title: 'Archived title', state: 3, repo: 'org/repo' }],
+        notes: []
+      }
+    ])
+    env.load()
+    await env.tick()
+    env.elements['#moreCategory'].value = 'archive'
+    await env.elements['#moreCategory'].dispatchEvent('change')
+    await env.elements['#moreLoad'].dispatchEvent('click')
+    await env.tick()
+    assert.ok(!env.sent.some((msg) => msg.action === 'LOAD_ARCHIVED'))
+  })
+})
+
+// The popup keeps its place (SPEC-B): the panel, the controls and the choice
+// of the More Actions list survive the popup closing.
+describe('The popup keeps its place', () => {
+  it('never calls array methods on DOM collections, which have none in Chrome', () => {
+    // The mock DOM hands out plain arrays; Chrome's HTMLCollection and
+    // HTMLOptionsCollection have no map, some or filter, so a restore that
+    // uses one throws in the browser and stops halfway.
+    const misuse = popupJs.match(
+      /\.(children|options|childNodes)\.(map|filter|some|every|find|findIndex|flatMap|reduce|includes|indexOf|forEach)\(/g
+    )
+    assert.strictEqual(misuse, null)
+  })
+
+  const accounts = [
+    {
+      account: 'u/1',
+      tasks: [{ id: 'run', title: 'Running title', state: 2, repo: 'org/repo' }],
+      schedules: [],
+      archived: [{ id: 'old', title: 'Archived title', state: 3, repo: 'org/repo' }],
+      notes: []
+    }
+  ]
+  const task = { id: 'run', title: 'Running title', state: 2, repo: 'org/repo', account: 'u/1', kind: 'task' }
+  const schedule = {
+    id: 'sched',
+    title: 'Schedule title',
+    state: 2,
+    repo: 'org/repo',
+    account: 'u/1',
+    kind: 'schedule'
+  }
+  const key = (account, kind, id) => JSON.stringify([account, kind, id])
+
+  // The popup's own memory of where it was.
+  function saved(overrides = {}) {
+    return {
+      version: 1,
+      panel: null,
+      force: false,
+      addMessage: false,
+      scope: 'all',
+      repoFilter: '',
+      customRepo: '',
+      oneSession: false,
+      more: {
+        category: 'all',
+        repoScope: false,
+        repo: '',
+        chip: 'all',
+        action: '',
+        force: false,
+        selected: []
+      },
+      ...overrides
+    }
+  }
+
+  it('saves the controls in the session storage', async () => {
+    const env = setupPopupSandbox()
+    installMoreWorker(env, accounts)
+    env.load()
+    await env.tick()
+    const el = env.elements
+    await el['#moreToggle'].dispatchEvent('click')
+    el['#force'].checked = true
+    await el['#force'].dispatchEvent('change')
+    el['#addMessage'].checked = true
+    await el['#addMessage'].dispatchEvent('change')
+    el['#oneSession'].checked = true
+    await el['#oneSession'].dispatchEvent('change')
+    env.scopeRadios[1].checked = true
+    await env.scopeRadios[1].dispatchEvent('change')
+    el['#repoFilter'].value = 'owner/scraped'
+    await el['#repoFilter'].dispatchEvent('change')
+    el['#moreCategory'].value = 'archive'
+    await el['#moreCategory'].dispatchEvent('change')
+    el['#moreRepoScope'].checked = true
+    await el['#moreRepoScope'].dispatchEvent('change')
+    el['#moreRepo'].value = 'org/repo'
+    await el['#moreRepo'].dispatchEvent('input')
+    el['#moreForce'].checked = true
+    await el['#moreForce'].dispatchEvent('change')
+    const view = env.sessionStorage.popupView
+    assert.ok(view, 'the popup keeps its place in the session storage')
+    assert.strictEqual(view.version, 1)
+    assert.strictEqual(view.panel, 'more')
+    assert.strictEqual(view.force, true)
+    assert.strictEqual(view.addMessage, true)
+    assert.strictEqual(view.oneSession, true)
+    assert.strictEqual(view.scope, 'current')
+    assert.strictEqual(view.repoFilter, 'owner/scraped')
+    assert.strictEqual(view.customRepo, '')
+    assert.strictEqual(view.more.category, 'archive')
+    assert.strictEqual(view.more.repo, 'org/repo')
+    assert.strictEqual(view.more.force, true)
+    // The typed repo wins over the dropdown, as in a run.
+    el['#customRepoInput'].value = 'org/typed'
+    await el['#customRepoInput'].dispatchEvent('input')
+    const typed = env.sessionStorage.popupView
+    assert.strictEqual(typed.repoFilter, '', 'the typed repo wins over the dropdown')
+    assert.strictEqual(typed.customRepo, 'org/typed')
+    assert.ok(
+      !JSON.stringify(env.sessionStorage.popupView).includes('__ALL__'),
+      "the worker's own All Repositories marker is never used here"
+    )
+    // The Items selection stays in the sync storage, not here.
+    env.option('Error (4)').dispatchEvent('click')
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(env.syncStorage.items)), ['state:4'])
+    assert.ok(!('items' in env.sessionStorage.popupView), 'the Items selection is not kept here')
+  })
+
+  it('restores every control when the popup opens again', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ items: [task] }),
+        popupView: saved({
+          panel: 'more',
+          force: true,
+          addMessage: true,
+          scope: 'current',
+          oneSession: true,
+          more: {
+            category: 'archive',
+            repoScope: true,
+            repo: 'org/repo',
+            chip: 'all',
+            action: 'archive',
+            force: true,
+            selected: [key('u/1', 'task', 'run')]
+          }
+        })
+      }
+    })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#morePanel'].classList.contains('hidden'), false, 'the panel is open again')
+    assert.strictEqual(el['#moreToggle'].getAttribute('aria-expanded'), 'true')
+    assert.strictEqual(el['#mainView'].classList.contains('hidden'), true)
+    assert.strictEqual(el['#force'].checked, true)
+    assert.strictEqual(el['#addMessage'].checked, true)
+    assert.strictEqual(el['#message'].disabled, false)
+    assert.strictEqual(env.radioStates.scope, 'current')
+    assert.strictEqual(el['#oneSession'].checked, true)
+    assert.strictEqual(el['#moreCategory'].value, 'archive')
+    assert.strictEqual(el['#moreRepoScope'].checked, true)
+    assert.strictEqual(el['#moreRepo'].value, 'org/repo')
+    assert.strictEqual(el['#moreForce'].checked, true)
+    assert.strictEqual(el['#moreAction'].value, 'archive')
+    assert.strictEqual(el['#moreList'].children.length, 1)
+    assert.strictEqual(el['#moreList'].children[0].children[0].checked, true, 'the selection is kept')
+  })
+
+  it('restores the chip of the More Actions list', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ items: [task, schedule] }),
+        popupView: saved({ panel: 'more', more: { ...saved().more, chip: 'scheduled' } })
+      }
+    })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    const chips = el['#moreChips'].children
+    assert.strictEqual(chips.length, 3)
+    assert.strictEqual(chips[1].getAttribute('aria-pressed'), 'true', 'the Scheduled chip is chosen')
+    assert.strictEqual(el['#moreList'].children.length, 1, 'only the schedules are shown')
+  })
+
+  it('never restores Dry run', async () => {
+    const session = {}
+    const first = setupPopupSandbox({ session })
+    installMoreWorker(first, accounts)
+    first.load()
+    await first.tick()
+    first.elements['#dryRun'].checked = false
+    await first.elements['#dryRun'].dispatchEvent('change')
+    first.elements['#moreDryRun'].checked = true
+    await first.elements['#moreDryRun'].dispatchEvent('change')
+    assert.ok(session.popupView, 'the popup keeps its place in the session storage')
+    const again = setupPopupSandbox({ session })
+    again.load()
+    await again.tick()
+    assert.strictEqual(again.elements['#dryRun'].checked, true, 'the main Dry run starts checked')
+    assert.strictEqual(again.elements['#moreDryRun'].checked, false, 'the More Actions Dry run starts unchecked')
+  })
+
+  it('ignores saved values it cannot use', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ items: [task] }),
+        popupView: {
+          version: 1,
+          panel: 'nope',
+          force: 'yes',
+          addMessage: 'no',
+          scope: 'nope',
+          repoFilter: 42,
+          customRepo: {},
+          oneSession: 'x',
+          more: {
+            category: 'nope',
+            repoScope: 'x',
+            repo: 5,
+            chip: 'nope',
+            action: 'nope',
+            force: 'x',
+            selected: 'nope'
+          }
+        }
+      }
+    })
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#morePanel'].classList.contains('hidden'), true, 'an unknown panel is ignored')
+    assert.strictEqual(el['#force'].checked, false)
+    assert.strictEqual(el['#addMessage'].checked, false)
+    assert.strictEqual(env.radioStates.scope, 'all')
+    assert.strictEqual(el['#repoFilter'].value, '')
+    assert.strictEqual(el['#customRepoInput'].value, '')
+    assert.strictEqual(el['#oneSession'].checked, false)
+    assert.strictEqual(el['#moreCategory'].value, 'all')
+    assert.strictEqual(el['#moreRepoScope'].checked, false)
+    assert.strictEqual(el['#moreRepo'].value, '')
+    assert.strictEqual(el['#moreAction'].value, '')
+    assert.strictEqual(el['#moreForce'].checked, false)
+    assert.strictEqual(el['#moreList'].children.length, 1, 'the view is listed')
+    assert.strictEqual(el['#moreList'].children[0].children[0].checked, false)
+  })
+
+  it('keeps only the selection the view still has', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ items: [task] }),
+        popupView: saved({
+          panel: 'more',
+          more: { ...saved().more, selected: [key('u/1', 'task', 'run'), key('u/1', 'task', 'gone')] }
+        })
+      }
+    })
+    env.load()
+    await env.tick()
+    const rows = env.elements['#moreList'].children
+    assert.strictEqual(rows.length, 1)
+    assert.strictEqual(rows[0].children[0].checked, true)
+  })
+
+  // Holds the popup's read of the session storage, so a test can answer it
+  // later with what the store held when it was asked.
+  function holdSessionRead(env) {
+    const storage = env.sandbox.chrome.storage.session
+    const held = []
+    storage.get = (keys, cb) => {
+      const snapshot = { ...env.sessionStorage }
+      held.push(() => {
+        const res = {}
+        const kArray = Array.isArray(keys) ? keys : [keys]
+        for (const k of kArray) if (snapshot[k] !== undefined) res[k] = snapshot[k]
+        cb(res)
+      })
+    }
+    return () => {
+      assert.ok(held.length, 'the popup reads its place from the session storage')
+      for (const answer of held) answer()
+    }
+  }
+
+  it('a change before the restore answers wins', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ force: false }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    // The user changes a control before the session read answers.
+    env.elements['#force'].checked = true
+    await env.elements['#force'].dispatchEvent('change')
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#force'].checked, true, 'the change of the user wins')
+  })
+
+  it('a running state wins over the restored panel', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ panel: 'more' }) } })
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) => {
+      env.sent.push(msg)
+      if (!cb) return
+      if (msg.action === 'GET_STATE') {
+        return cb({ status: 'running', log: [], progress: {}, options: { action: 'archive' } })
+      }
+      if (msg.action === 'HELLO') return cb({ protocol: RUN_PROTOCOL })
+      cb({ repos: [] })
+    }
+    const answer = holdSessionRead(env)
+    env.load()
+    await env.tick()
+    // The run is already going when the popup's place is restored.
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#morePanel'].classList.contains('hidden'), true, 'the log view wins')
+    assert.strictEqual(env.elements['#mainView'].classList.contains('hidden'), false)
+  })
+
+  it('puts a saved repo filter that is not among the options in the custom repo box', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ repoFilter: 'org/other' }) } })
+    env.load()
+    await env.tick()
+    assert.deepStrictEqual(
+      Array.from(env.elements['#repoFilter'].options).map((option) => option.value),
+      ['', 'owner/scraped']
+    )
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'org/other')
+    assert.strictEqual(env.elements['#repoFilter'].value, '')
+  })
+
+  it('keeps a saved repo filter that is among the options in the dropdown', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ repoFilter: 'owner/scraped' }) } })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#repoFilter'].value, 'owner/scraped')
+    assert.strictEqual(env.elements['#customRepoInput'].value, '')
+  })
+
+  // The dropdown and the custom box are one control: the repo a run uses.
+  it('a repo typed before the restore answers wins over the saved filter', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ repoFilter: 'org/saved' }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    env.elements['#customRepoInput'].value = 'owner/mine'
+    await env.elements['#customRepoInput'].dispatchEvent('input')
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'owner/mine', 'the typed repo stays')
+    assert.strictEqual(env.elements['#repoFilter'].value, '')
+  })
+
+  it('a dropdown repo chosen before the restore answers is not joined by the saved custom repo', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ customRepo: 'org/saved' }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    await env.tick()
+    env.elements['#repoFilter'].value = 'owner/scraped'
+    await env.elements['#repoFilter'].dispatchEvent('change')
+    answer()
+    await env.tick()
+    // A run takes the custom box first: a saved repo there would retarget it.
+    assert.strictEqual(env.elements['#customRepoInput'].value, '', 'the custom box stays empty')
+    assert.strictEqual(env.elements['#repoFilter'].value, 'owner/scraped')
+  })
+
+  it('a More Actions repo typed before the restore answers keeps its repo scope', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ more: { ...saved().more, repoScope: false } }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    env.elements['#moreRepo'].value = 'org/typed'
+    await env.elements['#moreRepo'].dispatchEvent('input')
+    assert.strictEqual(env.elements['#moreRepoScope'].checked, true, 'typing a repo scopes the Load to it')
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreRepoScope'].checked, true, 'the next Load lists that repo, not all of them')
+    assert.strictEqual(env.elements['#moreRepo'].value, 'org/typed')
+  })
+
+  it('a view the worker wrote while the popup opened is not replaced by the older one read', async () => {
+    const env = setupPopupSandbox({ session: { moreView: moreView({ items: [task] }) } })
+    const answer = holdSessionRead(env)
+    env.load()
+    await env.tick()
+    env.sessionChange({ moreView: { newValue: moreView({ items: [task, schedule], loadId: 'L2', rev: 2 }) } })
+    await env.tick()
+    answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#moreList'].children.length, 2, 'the newer view stays')
+  })
+
+  it('a repo typed before the repo list comes in keeps its place', async () => {
+    const env = setupPopupSandbox({ session: { popupView: saved({ repoFilter: 'owner/scraped' }) } })
+    const held = []
+    env.sandbox.chrome.tabs.sendMessage = (_tabId, msg, cb) => {
+      if (msg.action === 'GET_CODEBASES') held.push(() => cb({ codebases: ['owner/scraped'] }))
+      else cb?.()
+    }
+    env.load()
+    await env.tick()
+    assert.ok(held.length, 'the popup asks the tab for its repos')
+    env.elements['#customRepoInput'].value = 'owner/mine'
+    await env.elements['#customRepoInput'].dispatchEvent('input')
+    for (const answer of held) answer()
+    await env.tick()
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'owner/mine', 'the typed repo stays')
+    assert.strictEqual(env.elements['#repoFilter'].value, '')
+  })
+
+  it('restores the custom repo over the dropdown when both were saved', async () => {
+    const env = setupPopupSandbox({
+      session: { popupView: saved({ repoFilter: 'owner/scraped', customRepo: 'org/typed' }) }
+    })
+    env.load()
+    await env.tick()
+    assert.strictEqual(env.elements['#customRepoInput'].value, 'org/typed')
+    assert.strictEqual(env.elements['#repoFilter'].value, '', 'the two are never both set')
+  })
+
+  it('opens only a panel it knows, never a name every object has', async () => {
+    for (const panel of ['constructor', 'toString', '__proto__']) {
+      const env = setupPopupSandbox({ session: { popupView: saved({ panel }) } })
+      const toggled = []
+      for (const id of ['#settingsToggle', '#scheduleToggle', '#moreToggle']) {
+        const toggle = env.elements[id]
+        const setAttribute = toggle.setAttribute.bind(toggle)
+        toggle.setAttribute = (name, value) => {
+          if (name === 'aria-expanded') toggled.push(`${id}=${value}`)
+          return setAttribute(name, value)
+        }
+      }
+      env.load()
+      await env.tick()
+      assert.strictEqual(toggled.join(' '), '', `${panel} is not a panel`)
+    }
+  })
+
+  it('keeps no selection when the view has no items', async () => {
+    const env = setupPopupSandbox({
+      session: {
+        moreView: moreView({ items: [] }),
+        popupView: saved({ panel: 'more', more: { ...saved().more, selected: [key('u/1', 'task', 'run')] } })
+      }
+    })
+    env.load()
+    await env.tick()
+    // Any change saves the place again, with the selection the popup holds.
+    env.elements['#force'].checked = true
+    await env.elements['#force'].dispatchEvent('change')
+    assert.strictEqual(JSON.stringify(env.sessionStorage.popupView.more.selected), '[]')
+  })
+
+  it("restores the selection of a list too large to keep, from the worker's items", async () => {
+    const full = moreView({ items: [task, schedule], unsaved: true })
+    const env = setupPopupSandbox({
+      session: {
+        moreView: { ...full, items: [], partial: true, error: 'too large' },
+        popupView: saved({ panel: 'more', more: { ...saved().more, selected: [key('u/1', 'task', 'run')] } })
+      }
+    })
+    const send = env.sandbox.chrome.runtime.sendMessage
+    env.sandbox.chrome.runtime.sendMessage = (msg, cb) =>
+      msg.action === 'GET_MORE_VIEW' ? Promise.resolve().then(() => cb?.({ view: full })) : send(msg, cb)
+    env.load()
+    await env.tick()
+    const el = env.elements
+    assert.strictEqual(el['#moreList'].children.length, 2)
+    assert.strictEqual(el['#moreList'].children[0].children[0].checked, true, 'the saved selection is restored')
+  })
+
+  it('shows the load and the place of the last popup when it opens again', async () => {
+    const session = {}
+    const first = setupPopupSandbox({ session })
+    installMoreWorker(first, accounts)
+    first.load()
+    await first.tick()
+    const el = first.elements
+    await el['#moreToggle'].dispatchEvent('click')
+    el['#moreCategory'].value = 'archive'
+    await el['#moreCategory'].dispatchEvent('change')
+    await el['#moreLoad'].dispatchEvent('click')
+    await first.tick()
+    first.worker.finishArchived()
+    await first.tick()
+    // The user picks an item and an action; the popup closes.
+    assert.strictEqual(el['#moreList'].children.length, 1, 'the archived task is listed')
+    const checkbox = el['#moreList'].children[0].children[0]
+    checkbox.checked = true
+    await checkbox.dispatchEvent('change')
+    el['#moreAction'].value = 'deleteTask'
+    await el['#moreAction'].dispatchEvent('change')
+    await el['#moreConfirm'].dispatchEvent('click')
+    assert.strictEqual(el['#moreConfirm'].textContent, 'Delete 1 task permanently? Click again')
+
+    // The popup opens again: the same load, the same choice.
+    const again = setupPopupSandbox({ session })
+    again.load()
+    await again.tick()
+    const back = again.elements
+    assert.strictEqual(back['#morePanel'].classList.contains('hidden'), false, 'the panel is open again')
+    assert.strictEqual(back['#moreList'].children.length, 1, 'the archived task is still listed')
+    assert.strictEqual(back['#moreList'].children[0].children[0].checked, true, 'the selection is kept')
+    assert.strictEqual(back['#moreAction'].value, 'deleteTask', 'the action is kept')
+    assert.strictEqual(back['#moreConfirm'].textContent, 'Confirm', 'the armed click is not restored')
   })
 })

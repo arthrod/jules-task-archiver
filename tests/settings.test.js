@@ -319,10 +319,11 @@ describe('applyDiscovery', () => {
 })
 
 describe('More Actions protocol', () => {
-  it('requires protocol 7 and exposes rediscoverable action methods', () => {
-    // 7: START carries `items` (one or more Items) instead of a single `item`,
-    // so an old worker refuses the popup's runs instead of guessing one.
-    assert.strictEqual(RUN_PROTOCOL, 7)
+  it('requires protocol 8 and exposes rediscoverable action methods', () => {
+    // 8: the worker lists the archived tasks of a Load by itself once
+    // LOAD_ITEMS has answered, so an old popup holding a LOAD_ARCHIVED back
+    // must be refused instead of listing the same load twice.
+    assert.strictEqual(RUN_PROTOCOL, 8)
     assert.ok(START_OPTION_KEYS.includes('items'))
     assert.ok(!START_OPTION_KEYS.includes('item'), 'item was replaced by items')
     for (const [method, id] of Object.entries({
