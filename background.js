@@ -2943,6 +2943,178 @@ async function saveMoreLoadOrNote(notes) {
   }
 }
 
+// =============================================================================
+// More Actions view
+// =============================================================================
+
+// The popup-safe view of the load (chrome.storage.session, key `moreView`):
+// what the popup shows of the last load. The worker owns it, so a Load that
+// goes on while the popup is closed is still there when the popup opens
+// again. It never holds the Google account of an item.
+const MORE_VIEW_KEY = 'moreView'
+const MORE_VIEW_VERSION = 1
+// What the popup says when Chrome could not keep the view.
+const MORE_VIEW_TOO_LARGE = 'The list is too large to keep while the popup is closed. Load again.'
+
+let moreView = null
+const moreViewReadyPromise = chrome.storage.session
+  .get(MORE_VIEW_KEY)
+  .then((data) => {
+    moreView = validMoreView(data?.[MORE_VIEW_KEY]) ? data[MORE_VIEW_KEY] : null
+  })
+  .catch(() => {
+    moreView = null
+  })
+
+// A view of another version, or one without items, is not used.
+function validMoreView(view) {
+  return view?.version === MORE_VIEW_VERSION && Array.isArray(view.items) && Array.isArray(view.notes)
+}
+
+// The view as it is now, as a copy to change.
+function moreViewNow() {
+  return moreView ? { ...moreView } : emptyMoreView()
+}
+
+function emptyMoreView() {
+  return {
+    version: MORE_VIEW_VERSION,
+    loadId: null,
+    category: null,
+    repo: '',
+    items: [],
+    notes: [],
+    cachedAt: null,
+    archived: 'none',
+    loading: null,
+    error: null,
+    outdated: false,
+    rev: 0,
+    updatedAt: Date.now()
+  }
+}
+
+// The rev rises when the items or the notes change, so the popup can skip a
+// re-render of the list.
+function moreViewRev(view, items, notes) {
+  const changed =
+    JSON.stringify(view.items ?? []) !== JSON.stringify(items) ||
+    JSON.stringify(view.notes ?? []) !== JSON.stringify(notes)
+  return changed ? (view.rev ?? 0) + 1 : (view.rev ?? 0)
+}
+
+// Writes the view the popup reads. A write Chrome refuses (its quota) leaves
+// a small view without the items: the load itself still answers.
+async function writeMoreView(view) {
+  await moreViewReadyPromise
+  moreView = { ...view, version: MORE_VIEW_VERSION, updatedAt: Date.now() }
+  try {
+    await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView })
+  } catch {
+    moreView = { ...moreView, items: [], error: MORE_VIEW_TOO_LARGE }
+    await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView }).catch(() => {})
+  }
+  return moreView
+}
+
+// A Load starts: its id is minted before the listing, and the items shown
+// stay until the answer.
+async function moreViewLoading(id, category, repo) {
+  const view = moreViewNow()
+  view.loading = { id, category, repo, startedAt: Date.now() }
+  return writeMoreView(view)
+}
+
+// The Load answered: its items, notes and age are the ones shown.
+async function moreViewAnswered(id, category, repo, items, notes, cachedAt) {
+  const view = moreViewNow()
+  // An older Load's answer never overwrites a newer one's view.
+  if (view.loading?.id !== id) return null
+  view.rev = moreViewRev(view, items, notes)
+  view.loadId = id
+  view.category = category
+  view.repo = repo
+  view.items = items
+  view.notes = notes
+  view.cachedAt = cachedAt
+  view.archived = category === 'archive' ? 'loading' : 'none'
+  view.loading = null
+  view.error = null
+  view.outdated = false
+  return writeMoreView(view)
+}
+
+// The Load failed: the items shown stay, and the reason is shown with them.
+async function moreViewFailed(id, message) {
+  const view = moreViewNow()
+  if (view.loading?.id !== id) return null
+  view.loading = null
+  view.error = message
+  return writeMoreView(view)
+}
+
+// The archived listing ended: its tasks join the items shown.
+async function moreViewArchived(loadId, items, notes, cachedAt) {
+  const view = moreViewNow()
+  // A newer Load replaced this one: its tasks are not shown.
+  if (view.loadId !== loadId) return null
+  const all = [...view.items, ...items]
+  const allNotes = [...view.notes, ...notes]
+  view.rev = moreViewRev(view, all, allNotes)
+  view.items = all
+  view.notes = allNotes
+  view.archived = 'done'
+  view.cachedAt = oldestMoreCachedAt(view.cachedAt, cachedAt)
+  return writeMoreView(view)
+}
+
+// The archived listing failed: the items shown stay, with the reason.
+async function moreViewArchivedFailed(loadId, message) {
+  const view = moreViewNow()
+  if (view.loadId !== loadId) return null
+  const notes = [...view.notes, `Could not list the archived tasks: ${message}`]
+  view.rev = moreViewRev(view, view.items, notes)
+  view.notes = notes
+  view.archived = 'failed'
+  view.error = message
+  return writeMoreView(view)
+}
+
+// An action that changed an item takes it out of the view too.
+async function moreViewDropped(keys) {
+  const view = moreViewNow()
+  const items = view.items.filter((item) => !keys.has(moreItemKey(item)))
+  if (items.length === view.items.length) return null
+  view.rev = moreViewRev(view, items, view.notes)
+  view.items = items
+  return writeMoreView(view)
+}
+
+// A run that may change Jules leaves the list shown out of date.
+async function moreViewOutdated() {
+  const view = moreViewNow()
+  if (view.outdated) return null
+  view.outdated = true
+  return writeMoreView(view)
+}
+
+// The age of the oldest part of a load: null when all of it is live.
+function oldestMoreCachedAt(first, second) {
+  const dates = [first, second].filter((at) => Number.isFinite(at))
+  return dates.length ? Math.min(...dates) : null
+}
+
+// The items of a load as the popup sees them: without the Google account.
+function morePopupItems(items) {
+  return items.map(({ user: _user, ...item }) => item)
+}
+
+// The notes of a load as the popup shows them: the load's own and each
+// account's.
+function moreLoadNotes(accounts, notes = []) {
+  return [...notes, ...accounts.flatMap((account) => account.notes || [])]
+}
+
 // `fresh` is Refresh: list again past the cache (see cachedMoreRead).
 const MORE_MESSAGE_KEYS = {
   LOAD_ITEMS: ['action', 'protocol', 'repo', 'category', 'fresh'],
@@ -3184,10 +3356,12 @@ async function dropMoreCache(user, operation, items) {
 }
 
 // A run can change any list of any account.
-function clearMoreCache() {
+async function clearMoreCache() {
   for (const pending of moreCacheReads) pending.dropped = true
   moreCachePromise = Promise.resolve(new Map())
-  return chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
+  // The list the popup shows is from before that run.
+  await moreViewOutdated()
+  await chrome.storage.local.remove(MORE_CACHE_KEY).catch(() => {})
 }
 
 // Every archived task of the account, one repo at a time: Jules
@@ -3378,12 +3552,16 @@ function moreItemsOf(accounts, lists) {
   )
 }
 
-// A load answers with the lists of its category; LOAD_ARCHIVED adds the
-// archived tasks to it. `cachedAt` dates the oldest cached list it used
-// (null: all live).
+// A load answers with the lists of its category; the archived tasks of an
+// Archived load come later, listed by the worker itself. `cachedAt` dates the
+// oldest cached list it used (null: all live).
 async function loadMoreItems(repo, category, fresh = false) {
   startKeepAlive()
   resetRunLimits()
+  // The id is minted before the listing, so the view can name the Load that
+  // is going while the items shown are still the old load's.
+  const id = crypto.randomUUID()
+  await moreViewLoading(id, category, repo)
   try {
     const { lists, keep } = MORE_LOAD_CATEGORIES[category]
     const cache = { fresh, cachedAt: null }
@@ -3391,16 +3569,20 @@ async function loadMoreItems(repo, category, fresh = false) {
     await saveMoreCache()
     // The new load replaces the old one before its save starts: an older
     // load's archived answer arriving meanwhile is then stale.
-    const id = crypto.randomUUID()
     moreLoadId = id
     moreLoadRepo = repo
     moreArchivedFor = null
     moreArchivedDone = false
-    moreItems = new Map(moreItemsOf(accounts, lists).map((item) => [moreItemKey(item), item]))
+    const items = moreItemsOf(accounts, lists)
+    moreItems = new Map(items.map((item) => [moreItemKey(item), item]))
     moreItemsError = null
     const notes = []
     await saveMoreLoadOrNote(notes)
+    await moreViewAnswered(id, category, repo, morePopupItems(items), moreLoadNotes(accounts, notes), cache.cachedAt)
     return { loadId: id, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
+  } catch (e) {
+    await moreViewFailed(id, e.message)
+    throw e
   } finally {
     stopKeepAlive()
   }
@@ -3421,14 +3603,17 @@ async function loadMoreArchived(loadId, fresh = false) {
     // What was listed is kept even when a newer load replaced this one.
     await saveMoreCache()
     if (loadId !== moreLoadId) throw replaced()
-    for (const item of moreItemsOf(accounts, ['archived'])) moreItems.set(moreItemKey(item), item)
+    const items = moreItemsOf(accounts, ['archived'])
+    for (const item of items) moreItems.set(moreItemKey(item), item)
     moreArchivedDone = true
     const notes = []
     await saveMoreLoadOrNote(notes)
+    await moreViewArchived(loadId, morePopupItems(items), moreLoadNotes(accounts, notes), cache.cachedAt)
     return { loadId, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
   } catch (e) {
     // Nothing was listed (no Jules tab, say): the same load may try again.
     if (moreArchivedFor === loadId && !moreArchivedDone) moreArchivedFor = null
+    await moreViewArchivedFailed(loadId, e.message)
     throw e
   } finally {
     progress.finish()
@@ -3526,6 +3711,8 @@ async function startMoreOperation(msg) {
     if (moreItemsError) throw new Error(`Could not restore the last load: ${moreItemsError}. Load items again.`)
     const groups = new Map()
     const seen = new Set()
+    // The items an action changed leave the view the popup shows, too.
+    const dropped = new Set()
     for (const selection of msg.items) {
       const key = moreItemKey(selection)
       const item = moreItems.get(key)
@@ -3605,7 +3792,10 @@ async function startMoreOperation(msg) {
             addLog(
               `${msg.dryRun ? 'DRY RUN - would ' : ''}${MORE_ACTIONS[msg.operation].label} [${account}] [${item.id}] ${item.title}`
             )
-            if (!msg.dryRun) moreItems.delete(moreItemKey(item))
+            if (!msg.dryRun) {
+              moreItems.delete(moreItemKey(item))
+              dropped.add(moreItemKey(item))
+            }
           }
           count = acted.length
           state.progress.archived += count
@@ -3620,7 +3810,10 @@ async function startMoreOperation(msg) {
         }
       })
     )
-    if (!msg.dryRun) await saveMoreLoad()
+    if (!msg.dryRun) {
+      await saveMoreLoad()
+      await moreViewDropped(dropped)
+    }
     finalizeOperation(results, options)
   } catch (e) {
     handleOperationError(e)
@@ -3818,6 +4011,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           (response) => {
             startPending = false
             sendResponse(response)
+            // The worker lists the archived tasks of an Archived load by
+            // itself: the popup may be closed by then, and the listing takes
+            // minutes on a large account.
+            if (msg.action === 'LOAD_ITEMS' && msg.category === 'archive') {
+              loadMoreArchived(response.loadId, msg.fresh === true).catch(() => {})
+            }
           },
           (e) => {
             startPending = false
