@@ -3006,17 +3006,24 @@ function moreViewRev(view, items, notes) {
   return changed ? (view.rev ?? 0) + 1 : (view.rev ?? 0)
 }
 
-// Writes the view the popup reads. A write Chrome refuses (its quota) leaves
-// a small view without the items: the load itself still answers.
+// Writes the view the popup reads. A write Chrome refuses (its quota) saves a
+// small view without the items (`partial`) and the error: the worker still
+// holds them (`unsaved`) and answers them to an open popup (GET_MORE_VIEW); a
+// worker that restarted holds the small view only.
 async function writeMoreView(view) {
-  moreView = { ...view, version: MORE_VIEW_VERSION, updatedAt: Date.now() }
+  const { partial: _partial, unsaved: _unsaved, ...rest } = view
+  // Dated after the last write, so the popup can tell the newer of two views.
+  const updatedAt = Math.max(Date.now(), (moreView?.updatedAt ?? 0) + 1)
+  const written = { ...rest, version: MORE_VIEW_VERSION, updatedAt }
+  moreView = written
   try {
-    await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView })
+    await chrome.storage.session.set({ [MORE_VIEW_KEY]: written })
   } catch {
-    // The items shown change, so the rev rises: the popup rebuilds its list.
-    const rev = moreView.items?.length ? (moreView.rev ?? 0) + 1 : moreView.rev
-    moreView = { ...moreView, items: [], error: MORE_VIEW_TOO_LARGE, rev }
-    await chrome.storage.session.set({ [MORE_VIEW_KEY]: moreView }).catch(() => {})
+    // A newer write is on its way and saves its own view.
+    if (moreView !== written) return written
+    moreView = { ...written, unsaved: true }
+    const small = { ...written, items: [], partial: true, error: MORE_VIEW_TOO_LARGE }
+    await chrome.storage.session.set({ [MORE_VIEW_KEY]: small }).catch(() => {})
   }
   return moreView
 }
@@ -3084,11 +3091,9 @@ async function moreViewArchivedFailed(loadId, message) {
   await moreViewReadyPromise
   const view = moreViewNow()
   if (view.loadId !== loadId) return null
-  const notes = [...view.notes, `Could not list the archived tasks: ${message}`]
-  view.rev = moreViewRev(view, view.items, notes)
-  view.notes = notes
   view.archived = 'failed'
-  view.error = message
+  // Said once, as the error: a new Load clears it.
+  view.error = `Could not list the archived tasks: ${message}`
   return writeMoreView(view)
 }
 
@@ -3133,7 +3138,8 @@ function moreLoadNotes(accounts, notes = []) {
 const MORE_MESSAGE_KEYS = {
   LOAD_ITEMS: ['action', 'protocol', 'repo', 'category', 'fresh'],
   LOAD_ARCHIVED: ['action', 'protocol', 'loadId', 'fresh'],
-  APPLY_ACTION: ['action', 'protocol', 'operation', 'dryRun', 'force', 'items']
+  APPLY_ACTION: ['action', 'protocol', 'operation', 'dryRun', 'force', 'items'],
+  GET_MORE_VIEW: ['action', 'protocol']
 }
 
 function moreMessageProblem(msg) {
@@ -3151,7 +3157,7 @@ function moreMessageProblem(msg) {
     if (!Object.hasOwn(MORE_LOAD_CATEGORIES, msg.category)) return `Unknown load category "${msg.category}".`
   } else if (msg.action === 'LOAD_ARCHIVED') {
     if (typeof msg.loadId !== 'string') return 'Invalid load id.'
-  } else {
+  } else if (msg.action === 'APPLY_ACTION') {
     if (!Object.hasOwn(MORE_ACTIONS, msg.operation)) return `Unknown action "${msg.operation}"`
     if (MORE_ACTIONS[msg.operation].local) return `${MORE_ACTIONS[msg.operation].label} runs in the popup.`
     if (typeof msg.dryRun !== 'boolean' || typeof msg.force !== 'boolean' || !Array.isArray(msg.items)) {
@@ -3598,8 +3604,9 @@ async function loadMoreItems(repo, category, fresh = false) {
     await moreViewAnswered(id, category, repo, morePopupItems(items), moreLoadNotes(accounts, notes), cache.cachedAt)
     return { loadId: id, accounts: accounts.map(popupMoreAccount), notes, cachedAt: cache.cachedAt }
   } catch (e) {
-    await moreViewFailed(id, e.message)
-    throw e
+    // The view shows the reason, so the popup need not say it again.
+    const shown = await moreViewFailed(id, e.message)
+    throw Object.assign(new Error(e.message), shown ? { inView: true } : {})
   } finally {
     stopKeepAlive()
   }
@@ -4040,9 +4047,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           },
           (e) => {
             startPending = false
-            sendResponse({ error: e.message })
+            sendResponse(e.inView ? { error: e.message, inView: true } : { error: e.message })
           }
         )
+      return true
+    }
+
+    // The view as the worker holds it: an open popup asks for the items of a
+    // view Chrome could not keep (`partial`). Read-only, so a run may go on.
+    case 'GET_MORE_VIEW': {
+      if (_sender.tab) {
+        sendResponse({ error: 'Security Error: Unauthorized action from content script' })
+        break
+      }
+      const problem = moreMessageProblem(msg)
+      if (problem) {
+        sendResponse({ error: problem })
+        break
+      }
+      moreViewReadyPromise.then(() => sendResponse({ view: moreView }))
       return true
     }
 

@@ -105,6 +105,11 @@ let moreProgressChanged = false
 let moreCachedAt = null
 // The version of the worker's view of the load (background.js `moreView`).
 const MORE_VIEW_VERSION = 1
+// The newest view the popup has had (its `updatedAt`): an older one, or the
+// worker's answer about an older one, is not shown over it.
+let moreViewSeenAt = Number.NEGATIVE_INFINITY
+// What the popup says of a list Chrome can't keep (background.js `unsaved`).
+const MORE_VIEW_UNSAVED = "Chrome can't keep a list this large: act on it before the popup closes."
 // The scope of a run: every Jules tab, or the one that is open.
 let scopeValue = 'all'
 // A saved repository filter, applied when the dropdown knows its options.
@@ -1367,6 +1372,7 @@ function renderMoreStatus() {
   // A listing that stopped must not lock the panel: Load stays free.
   if (stale) parts.push('The listing stopped. Load again.')
   if (moreView?.error) parts.push(moreView.error)
+  if (moreView?.unsaved && !moreView.partial) parts.push(MORE_VIEW_UNSAVED)
   if (moreView?.outdated) parts.push('Loaded before the last run; Load again to see it as it is now.')
   moreStatus.textContent = parts.filter(Boolean).join(' · ')
   updateMoreBusy()
@@ -1451,12 +1457,44 @@ function setMoreView(view) {
 }
 
 // The worker wrote the view: the list is rebuilt when its items changed or a
-// new load cleared the selection, and the status line follows every change.
-function applyMoreView(view) {
-  const changed = view?.rev !== moreView?.rev || view?.loadId !== moreView?.loadId
+// new load cleared the selection (or `rebuild` says so), and the status line
+// follows every change.
+function applyMoreView(view, rebuild = false) {
+  const changed = rebuild || view?.rev !== moreView?.rev || view?.loadId !== moreView?.loadId
   setMoreView(view)
   if (changed) renderMoreItems()
   renderMoreStatus()
+}
+
+// A view the worker saved. One Chrome could not keep (`partial`) holds no
+// items: the worker still does, so the popup asks for them.
+function takeMoreView(view) {
+  if (view.updatedAt < moreViewSeenAt) return
+  seeMoreView(view)
+  if (!view.partial) return applyMoreView(view)
+  return askMoreView(view)
+}
+
+function seeMoreView(view) {
+  if (Number.isFinite(view.updatedAt)) moreViewSeenAt = Math.max(moreViewSeenAt, view.updatedAt)
+}
+
+async function askMoreView(saved) {
+  const view = await workerMoreView(saved)
+  // A newer view came meanwhile: that one is shown.
+  if (saved.updatedAt < moreViewSeenAt) return
+  seeMoreView(view)
+  // Without the worker's items, the small view empties the list.
+  applyMoreView(view, view === saved)
+}
+
+// The worker's view for a saved one without items: the saved one when the
+// worker no longer holds the items (it restarted) or does not answer.
+async function workerMoreView(saved) {
+  const reply = await sendMore({ action: 'GET_MORE_VIEW', protocol: RUN_PROTOCOL })
+  const view = reply?.view
+  if (!validMoreView(view) || view.partial || !(view.updatedAt >= saved.updatedAt)) return saved
+  return view
 }
 
 function sendMore(msg) {
@@ -1490,7 +1528,8 @@ async function loadMore(fresh) {
       category,
       fresh
     })
-    if (response?.error) throw new Error(response.error)
+    // The view shows a failure of the Load itself (`inView`).
+    if (response?.error && !response.inView) throw new Error(response.error)
   } catch (e) {
     noteMore(e.message)
   } finally {
@@ -1726,11 +1765,17 @@ function restoreMoreAction(action) {
 
 // The worker's view of the last load and the popup's own place, read when
 // the popup opens.
-chrome.storage.session.get(['moreView', 'moreArchivedProgress', 'popupView'], (data) => {
+chrome.storage.session.get(['moreView', 'moreArchivedProgress', 'popupView'], async (data) => {
+  // A view Chrome could not keep holds no items: the worker's answer does,
+  // and comes before the saved selection is restored.
+  const stored = data?.moreView
+  const view = validMoreView(stored) && stored.partial ? await workerMoreView(stored) : stored
   // A view or a count that came through onChanged meanwhile is newer than
   // this read: it stays.
-  const view = data?.moreView
-  if (!moreViewChanged && validMoreView(view)) setMoreView(view)
+  if (!moreViewChanged && validMoreView(view)) {
+    seeMoreView(view)
+    setMoreView(view)
+  }
   const progress = data?.moreArchivedProgress
   if (!moreProgressChanged && progress && progress.loadId === moreView?.loadId && moreArchivedState() === 'loading') {
     moreArchivedRepos = { done: progress.done, total: progress.total }
@@ -1802,7 +1847,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   // A view of another version is ignored.
   if (view && validMoreView(view)) {
     moreViewChanged = true
-    applyMoreView(view)
+    takeMoreView(view)
   }
   const progress = changes.moreArchivedProgress?.newValue
   if (!progress) return
